@@ -3,7 +3,7 @@ from brokers.deriv_rest import DerivREST
 # Dashboard response model
 from typing import Optional
 from fastapi import status
-from users import User
+from user_models import User
 from pydantic import BaseModel
 
 class DashboardResponse(BaseModel):
@@ -45,7 +45,7 @@ from pydantic import BaseModel
 import asyncio
 
 from brokers.deriv_trading_service import DerivTradingService
-from users import router as users_router, get_current_user
+from user_models import router as users_router, get_current_user
 
 
 app = FastAPI()
