@@ -1,3 +1,5 @@
+# Logging level for the application
+LOG_LEVEL = "INFO"
 # Global settings for the trading bot
 
 PAIR = 'XAUUSD'
