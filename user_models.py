@@ -23,7 +23,7 @@ security = HTTPBearer()
 router = APIRouter()
 
 # --- SQLite Setup ---
-DB_PATH = "users.db"
+DB_PATH = "/tmp/users.db"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
