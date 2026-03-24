@@ -1,6 +1,3 @@
-@app.get("/ping")
-async def ping():
-    return {"status": "ok"}
 
 
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -14,6 +11,11 @@ from user_models import User, router as users_router, get_current_user
 # Instantiate FastAPI app before any route decorators
 app = FastAPI()
 app.include_router(users_router)
+
+# Move /ping route below app instantiation
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 class DashboardResponse(BaseModel):
     username: str
