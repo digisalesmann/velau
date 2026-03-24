@@ -1,5 +1,7 @@
 python-jose
-passlib
+passlib[bcrypt]
 fastapi
 uvicorn[standard]
 requests
+bcrypt
+python-multipart

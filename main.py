@@ -2,9 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-import traceback
 
-# Safely import broker modules — don't crash if they fail
+# Safely import broker modules
 try:
     from brokers.deriv_rest import DerivREST
     from brokers.deriv_trading_service import DerivTradingService
@@ -18,6 +17,11 @@ from user_models import User, router as users_router, get_current_user
 app = FastAPI()
 app.include_router(users_router)
 
+
+# Health check — Render hits this to confirm the app is up
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 @app.get("/ping")
 async def ping():
@@ -35,7 +39,6 @@ class DashboardResponse(BaseModel):
 @app.get("/dashboard", response_model=DashboardResponse, status_code=status.HTTP_200_OK)
 async def get_dashboard(user=Depends(get_current_user)):
     if not BROKERS_AVAILABLE:
-        # Return placeholder data if broker modules aren't available
         return DashboardResponse(
             username=user.username,
             bot_status="inactive",
@@ -81,7 +84,6 @@ class TradeRequest(BaseModel):
 async def authenticate():
     if not BROKERS_AVAILABLE:
         return AuthResponse(success=False, message="Broker modules not available")
-    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
         auth_response = await service.authenticate()
@@ -95,7 +97,6 @@ async def authenticate():
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     if not BROKERS_AVAILABLE:
         raise HTTPException(status_code=503, detail="Broker modules not available")
-    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
         await service.authenticate()
@@ -110,7 +111,6 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     if not BROKERS_AVAILABLE:
         raise HTTPException(status_code=503, detail="Broker modules not available")
-    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
         await service.authenticate()
