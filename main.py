@@ -1,3 +1,6 @@
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 
 from fastapi import FastAPI, HTTPException, Depends, status
