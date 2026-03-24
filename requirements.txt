@@ -1,7 +1,7 @@
 python-jose
-passlib[bcrypt]
+passlib[argon2]
 fastapi
 uvicorn[standard]
 requests
-bcrypt
+argon2-cffi
 python-multipart
