@@ -1,31 +1,20 @@
 from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-
-# Safely import broker modules
-try:
-    from brokers.deriv_rest import DerivREST
-    from brokers.deriv_trading_service import DerivTradingService
-    BROKERS_AVAILABLE = True
-except Exception as e:
-    print(f"WARNING: Broker modules failed to import: {e}")
-    BROKERS_AVAILABLE = False
-
 from user_models import User, router as users_router, get_current_user
 
 app = FastAPI()
 app.include_router(users_router)
 
 
-# Health check — Render hits this to confirm the app is up
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
+
 @app.get("/ping")
 async def ping():
-    return {"status": "ok", "brokers_available": BROKERS_AVAILABLE}
+    return {"status": "ok"}
 
 
 class DashboardResponse(BaseModel):
@@ -36,37 +25,24 @@ class DashboardResponse(BaseModel):
     account_id: Optional[str] = None
 
 
-@app.get("/dashboard", response_model=DashboardResponse, status_code=status.HTTP_200_OK)
+@app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
-    if not BROKERS_AVAILABLE:
-        return DashboardResponse(
-            username=user.username,
-            bot_status="inactive",
-            balance=0.0,
-            currency="USD",
-            account_id=None,
-        )
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService()
     try:
-        deriv = DerivREST()
-        account_info = deriv.get_account_info()
-        balance = float(account_info.get("balance", 0))
-        currency = account_info.get("currency", "USD")
-        account_id = account_info.get("account_id")
+        await service.authenticate()
+        account_info = await service.get_account_info()
         return DashboardResponse(
             username=user.username,
             bot_status="active",
-            balance=balance,
-            currency=currency,
-            account_id=account_id,
+            balance=account_info.get("balance", 0.0),
+            currency=account_info.get("currency", "USD"),
+            account_id=account_info.get("account_id"),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Dashboard error: {e}")
-
-
-class AuthResponse(BaseModel):
-    success: bool
-    message: str
-    details: dict = None
+    finally:
+        await service.close()
 
 
 class TickRequest(BaseModel):
@@ -80,47 +56,52 @@ class TradeRequest(BaseModel):
     symbol: str = "frxXAUUSD"
 
 
+class AuthResponse(BaseModel):
+    success: bool
+    message: str
+    details: dict = None
+
+
 @app.post("/auth", response_model=AuthResponse)
 async def authenticate():
-    if not BROKERS_AVAILABLE:
-        return AuthResponse(success=False, message="Broker modules not available")
+    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
-        auth_response = await service.authenticate()
+        result = await service.authenticate()
         await service.close()
-        return AuthResponse(success=True, message="Authenticated", details=auth_response)
+        return AuthResponse(success=True, message="Authenticated", details=result)
     except Exception as e:
         return AuthResponse(success=False, message=str(e))
 
 
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
-    if not BROKERS_AVAILABLE:
-        raise HTTPException(status_code=503, detail="Broker modules not available")
+    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
         await service.authenticate()
         ticks = await service.subscribe_ticks(symbol=req.symbol)
-        await service.close()
         return ticks
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await service.close()
 
 
 @app.post("/trade")
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
-    if not BROKERS_AVAILABLE:
-        raise HTTPException(status_code=503, detail="Broker modules not available")
+    from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService()
     try:
         await service.authenticate()
-        trade_result = await service.place_order(
+        result = await service.place_order(
             contract_type=req.contract_type,
             amount=req.amount,
             duration=req.duration,
             symbol=req.symbol,
         )
-        await service.close()
-        return trade_result
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await service.close()

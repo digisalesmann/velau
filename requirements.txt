@@ -5,3 +5,4 @@ uvicorn[standard]
 requests
 argon2-cffi
 python-multipart
+websockets
