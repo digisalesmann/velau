@@ -5,14 +5,14 @@ Auth flow: connect → send {"authorize": token} → use session.
 """
 import logging
 from brokers.deriv_ws import DerivWebSocket
-from config import settings
+import config
 
 logger = logging.getLogger("DerivTradingService")
 
 
 class DerivTradingService:
     def __init__(self, app_id: str = None, token: str = None):
-        self.token = token or settings.DERIV_TOKEN
+        self.token = token or config.DERIV_TOKEN
         self.ws = DerivWebSocket()
         self._authorized = False
 
