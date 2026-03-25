@@ -12,7 +12,7 @@ logger = logging.getLogger("DerivTradingService")
 
 class DerivTradingService:
     def __init__(self, app_id: str = None, token: str = None):
-        self.token = token or settings.DERIV_API_TOKEN
+        self.token = token or settings.DERIV_TOKEN
         self.ws = DerivWebSocket()
         self._authorized = False
 
