@@ -13,3 +13,4 @@ MT5_SERVER = os.getenv('MT5_SERVER', '')
 # Deriv credentials — read from environment variables
 DERIV_APP_ID = os.getenv('DERIV_APP_ID', '')
 DERIV_API_TOKEN = os.getenv('DERIV_API_TOKEN', '')
+DERIV_TOKEN = os.getenv('DERIV_API_TOKEN', '')  # alias used by deriv_rest.py

@@ -1,0 +1,134 @@
+"""
+Deriv trading service — production implementation.
+Flow: REST auth → get account ID → generate OTP → connect WebSocket with OTP URL.
+"""
+import logging
+from brokers.deriv_rest import DerivREST
+from brokers.deriv_ws import DerivWebSocket
+from config import settings
+
+logger = logging.getLogger("DerivTradingService")
+
+
+class DerivTradingService:
+    def __init__(self, app_id: str = None, token: str = None):
+        self.rest = DerivREST(app_id, token)
+        self.ws = None
+        self.account_id = None
+        self.account_type = "demo"  # or "real"
+        self._authorized = False
+
+    async def authenticate(self) -> dict:
+        """
+        Full auth flow:
+        1. REST: get account info → account_id
+        2. REST: generate OTP → WebSocket URL
+        3. WebSocket: connect using OTP URL
+        """
+        # Step 1: Get account info
+        info = self.rest.get_account_info()
+        self.account_id = info.get("id") or info.get("account_id")
+        if not self.account_id:
+            raise Exception(f"Account ID not found in response: {info}")
+
+        # Determine account type from loginid prefix
+        loginid = info.get("loginid", "")
+        self.account_type = "real" if loginid.startswith("CR") else "demo"
+        logger.info(f"Account: {loginid}, type: {self.account_type}")
+
+        # Step 2: Generate OTP
+        otp_resp = self.rest.generate_otp(self.account_id)
+
+        # The OTP response contains a ready-to-use WebSocket URL
+        ws_url = otp_resp.get("url")
+        if not ws_url:
+            # Fallback: build URL manually from OTP
+            otp = otp_resp.get("otp")
+            if not otp:
+                raise Exception(f"No OTP or URL in response: {otp_resp}")
+            ws_url = f"wss://api.derivws.com/trading/v1/options/ws/{self.account_type}?otp={otp}"
+
+        logger.info(f"Connecting WebSocket: {ws_url}")
+
+        # Step 3: Connect WebSocket
+        self.ws = DerivWebSocket(ws_url)
+        await self.ws.connect()
+        self._authorized = True
+
+        return {"account_id": self.account_id, "ws_url": ws_url, **info}
+
+    async def get_account_info(self) -> dict:
+        """Get balance via WebSocket after auth."""
+        if not self._authorized:
+            await self.authenticate()
+
+        await self.ws.send({"balance": 1, "subscribe": 0})
+        response = await self.ws.receive()
+
+        if response.get("error"):
+            raise Exception(response["error"].get("message", "Balance fetch failed"))
+
+        balance_data = response.get("balance", {})
+        return {
+            "balance": balance_data.get("balance", 0.0),
+            "currency": balance_data.get("currency", "USD"),
+            "account_id": self.account_id,
+        }
+
+    async def subscribe_ticks(self, symbol: str = "frxXAUUSD") -> dict:
+        """Get latest tick snapshot."""
+        if not self._authorized:
+            await self.authenticate()
+
+        await self.ws.send({"ticks": symbol, "subscribe": 0})
+        response = await self.ws.receive()
+
+        if response.get("error"):
+            raise Exception(response["error"].get("message", "Tick fetch failed"))
+
+        return response
+
+    async def place_order(
+        self,
+        contract_type: str,
+        amount: float,
+        duration: int,
+        symbol: str = "frxXAUUSD",
+    ) -> dict:
+        """Two-step: proposal → buy."""
+        if not self._authorized:
+            await self.authenticate()
+
+        # Step 1: Get proposal
+        await self.ws.send({
+            "proposal": 1,
+            "amount": amount,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": duration,
+            "duration_unit": "m",
+            "symbol": symbol,
+        })
+        proposal = await self.ws.receive()
+
+        if proposal.get("error"):
+            raise Exception(proposal["error"].get("message", "Proposal failed"))
+
+        proposal_id = proposal.get("proposal", {}).get("id")
+        if not proposal_id:
+            raise Exception("No proposal ID returned")
+
+        # Step 2: Buy
+        await self.ws.send({"buy": proposal_id, "price": amount})
+        result = await self.ws.receive()
+
+        if result.get("error"):
+            raise Exception(result["error"].get("message", "Order failed"))
+
+        return result
+
+    async def close(self):
+        if self.ws:
+            await self.ws.close()
+        self._authorized = False
