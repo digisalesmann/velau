@@ -20,8 +20,11 @@ class XAUMasterStrategy:
         """
         Fetches the last 200 candles to calculate accurate indicators.
         """
-        raw_candles = await service.get_candles(self.symbol, count=200, granularity=300) # 5-min candles
+        raw_candles = await service.get_candles(self.symbol, count=250, granularity=300) # Increased to 250 for EMA padding
         
+        if not raw_candles:
+            return pd.DataFrame()
+
         # Convert the raw JSON list into a Pandas DataFrame
         df = pd.DataFrame(raw_candles)
         # Ensure correct data types
@@ -35,6 +38,9 @@ class XAUMasterStrategy:
         """
         Calculates Trend (EMA), Momentum (RSI), and Volatility (ATR) using 'ta'
         """
+        if df.empty or len(df) < 200:
+            return pd.DataFrame()
+
         # 1. Trend: 200 Exponential Moving Average
         df['EMA_200'] = EMAIndicator(close=df['close'], window=200).ema_indicator()
         
@@ -63,6 +69,11 @@ class XAUMasterStrategy:
             df = await self.get_recent_candles(service)
             df = self.analyze_technicals(df)
             
+            # --- SAFETY CHECK: Fixes the 'out-of-bounds' error ---
+            if df.empty:
+                print(f"⏳ [{datetime.now()}] Not enough market data yet (EMA 200 requires more history). Skipping...")
+                return
+
             # Get the most recently closed candle
             current = df.iloc[-1]
             current_price = current['close']
@@ -70,7 +81,7 @@ class XAUMasterStrategy:
             rsi_14 = current['RSI_14']
             atr_14 = current['ATRr_14']
 
-            print(f"📊 Stats | Price: {current_price} | RSI: {round(rsi_14, 2)} | Bias: {market_bias}")
+            print(f"📊 Stats | Price: {current_price} | RSI: {round(rsi_14, 2)} | ATR: {round(atr_14, 2)} | Bias: {market_bias}")
 
             # --- RISK MANAGEMENT OVERRIDE ---
             MAX_SAFE_ATR = 2.5 
