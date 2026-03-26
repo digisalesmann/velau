@@ -10,7 +10,7 @@ from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 
 # Import the new Strategy Engine
-from strategy_engine import XAUMasterStrategy
+from core.strategy_engine import XAUMasterStrategy
 
 # 1. INITIALIZE THE MASTER BOT
 trading_bot = XAUMasterStrategy()
