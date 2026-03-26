@@ -3,9 +3,38 @@ from pydantic import BaseModel
 from typing import Optional, List
 from user_models import User, router as users_router, get_current_user
 
+# Import for news endpoint
+from news.news_pipeline import get_news_and_sentiment
+
+# 1. INITIALIZE APP FIRST
 app = FastAPI()
 app.include_router(users_router)
 
+
+# 2. DEFINE ALL PYDANTIC MODELS
+class NewsResponse(BaseModel):
+    articles: list
+    sentiment: dict
+
+class DashboardResponse(BaseModel):
+    username: str
+    bot_status: str
+    balance: float
+    currency: str = "USD"
+    account_id: Optional[str] = None
+
+class TickRequest(BaseModel):
+    symbol: str = "frxXAUUSD"
+
+class TradeRequest(BaseModel):
+    contract_type: Optional[str] = None
+    amount: Optional[float] = None
+    duration: Optional[int] = None
+    symbol: str = "frxXAUUSD"
+    action: Optional[str] = "buy" 
+
+
+# 3. DEFINE ALL ENDPOINTS / ROUTES
 @app.get("/")
 async def root():
     return {"status": "ok"}
@@ -14,12 +43,13 @@ async def root():
 async def ping():
     return {"status": "ok"}
 
-class DashboardResponse(BaseModel):
-    username: str
-    bot_status: str
-    balance: float
-    currency: str = "USD"
-    account_id: Optional[str] = None
+@app.get("/news", response_model=NewsResponse)
+async def get_news():
+    try:
+        articles, sentiment = get_news_and_sentiment()
+        return NewsResponse(articles=articles, sentiment=sentiment)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"News error: {e}")
 
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
@@ -52,17 +82,6 @@ async def get_history(user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
-
-class TickRequest(BaseModel):
-    symbol: str = "frxXAUUSD"
-
-# FIXED: Optional fields to allow 'close' action without validation failure
-class TradeRequest(BaseModel):
-    contract_type: Optional[str] = None
-    amount: Optional[float] = None
-    duration: Optional[int] = None
-    symbol: str = "frxXAUUSD"
-    action: Optional[str] = "buy" 
 
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
