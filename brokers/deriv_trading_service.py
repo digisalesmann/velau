@@ -46,6 +46,29 @@ class DerivTradingService:
             raise Exception(response["error"].get("message", "Tick fetch failed"))
         return response
 
+    # --- NEW: Fetch Historical Candles for the Strategy Engine ---
+    async def get_candles(self, symbol: str = "frxXAUUSD", count: int = 200, granularity: int = 300) -> list:
+        """
+        granularity=300 means 5-minute candles.
+        count=200 fetches enough history to calculate the 200 EMA.
+        """
+        if not self._authorized:
+            await self.authenticate()
+            
+        await self.ws.send({
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": count,
+            "end": "latest",
+            "style": "candles",
+            "granularity": granularity
+        })
+        response = await self.ws.receive()
+        if response.get("error"):
+            raise Exception(response["error"].get("message", "Candle fetch failed"))
+            
+        return response.get("candles", [])
+
     async def get_statement(self) -> dict:
         if not self._authorized:
             await self.authenticate()

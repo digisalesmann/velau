@@ -1,17 +1,38 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel
 from typing import Optional, List
+import asyncio
+from contextlib import asynccontextmanager
+
 from user_models import User, router as users_router, get_current_user
 
 # Import for news endpoint
 from news.news_pipeline import get_news_and_sentiment
 
-# 1. INITIALIZE APP FIRST
-app = FastAPI()
+# Import the new Strategy Engine
+from strategy_engine import XAUMasterStrategy
+
+# 1. INITIALIZE THE MASTER BOT
+trading_bot = XAUMasterStrategy()
+
+# 2. LIFESPAN MANAGER (Starts the bot in the background on boot)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Start the autonomous scanning loop
+    bot_task = asyncio.create_task(trading_bot.start_bot_loop())
+    print("🚀 AI Trading Bot Engine Started in Background!")
+    yield
+    # Clean shutdown
+    trading_bot.is_running = False
+    bot_task.cancel()
+    print("🛑 AI Trading Bot Engine Stopped.")
+
+# 3. INITIALIZE APP WITH LIFESPAN
+app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
 
 
-# 2. DEFINE ALL PYDANTIC MODELS
+# 4. DEFINE ALL PYDANTIC MODELS
 class NewsResponse(BaseModel):
     articles: list
     sentiment: dict
@@ -34,10 +55,10 @@ class TradeRequest(BaseModel):
     action: Optional[str] = "buy" 
 
 
-# 3. DEFINE ALL ENDPOINTS / ROUTES
+# 5. DEFINE ALL ENDPOINTS / ROUTES
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "bot_running": trading_bot.is_running}
 
 @app.get("/ping")
 async def ping():
@@ -60,7 +81,7 @@ async def get_dashboard(user=Depends(get_current_user)):
         account_info = await service.get_account_info()
         return DashboardResponse(
             username=user.username,
-            bot_status="active",
+            bot_status="active" if trading_bot.is_running else "paused",
             balance=account_info.get("balance", 0.0),
             currency=account_info.get("currency", "USD"),
             account_id=account_info.get("account_id"),
@@ -105,8 +126,6 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         
         # Branching logic for action types
         if req.action == "close":
-            # For Deriv, we normally sell a contract_id. 
-            # This is the endpoint bridge for your "Close Position" button.
             return {"status": "success", "message": f"Position on {req.symbol} closed."}
             
         result = await service.place_order(

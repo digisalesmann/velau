@@ -6,3 +6,7 @@ requests
 argon2-cffi
 python-multipart
 websockets
+pydantic
+vaderSentiment
+pandas
+ta
