@@ -42,18 +42,31 @@ def get_db():
 
 def init_db():
     conn = get_db()
+    # Users Table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             hashed_password TEXT NOT NULL
         )
     """)
+    # Signals Table - The Bot's "Internal Monologue"
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            type TEXT,
+            price REAL,
+            rsi REAL,
+            bias TEXT,
+            reason TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
-    print("DB initialized successfully")
+    print("DB initialized successfully with Signals table")
 
 init_db()
-
 
 # --- Models ---
 class User(BaseModel):
@@ -67,7 +80,6 @@ class UserIn(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
-
 
 # --- Helpers ---
 def verify_password(plain_password, hashed_password):
@@ -109,7 +121,6 @@ def user_exists_in_db(username: str) -> bool:
     conn.close()
     return row is not None
 
-
 # --- Auth dependency ---
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     credentials_exception = HTTPException(
@@ -133,7 +144,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise credentials_exception
     return user
 
-
 # --- Routes ---
 @router.post("/register", response_model=Token)
 async def register(user_in: UserIn):
@@ -149,7 +159,6 @@ async def register(user_in: UserIn):
     except Exception as e:
         import traceback
         raise HTTPException(status_code=500, detail=f"Register error: {traceback.format_exc()}")
-
 
 @router.post("/login", response_model=Token)
 async def login(user_in: UserIn):

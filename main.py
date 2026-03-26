@@ -2,9 +2,10 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 
-from user_models import User, router as users_router, get_current_user
+from user_models import User, router as users_router, get_current_user, DB_PATH
 
 # Import for news endpoint
 from news.news_pipeline import get_news_and_sentiment
@@ -52,7 +53,7 @@ class TradeRequest(BaseModel):
     amount: Optional[float] = None
     duration: Optional[int] = None
     symbol: str = "frxXAUUSD"
-    action: Optional[str] = "buy" 
+    action: Optional[str] = "buy"
 
 
 # 5. DEFINE ALL ENDPOINTS / ROUTES
@@ -123,11 +124,11 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     service = DerivTradingService()
     try:
         await service.authenticate()
-        
+
         # Branching logic for action types
         if req.action == "close":
             return {"status": "success", "message": f"Position on {req.symbol} closed."}
-            
+
         result = await service.place_order(
             contract_type=req.contract_type,
             amount=req.amount,
@@ -139,3 +140,17 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
+
+@app.get("/signals")
+async def get_signals(user=Depends(get_current_user)):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Fetch the 30 most recent signals
+        cursor.execute("SELECT * FROM signals ORDER BY timestamp DESC LIMIT 30")
+        signals = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return {"signals": signals}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
