@@ -1,20 +1,14 @@
 """
 Deriv trading service — production WebSocket-only implementation.
-Deriv has no REST API. All operations go through WebSocket.
-Auth flow: connect → send {"authorize": token} → use session.
 """
 import logging
 from brokers.deriv_ws import DerivWebSocket
-
-# FIX: Explicitly import the variable from your root config.py file
 from env_config import DERIV_TOKEN
 
 logger = logging.getLogger("DerivTradingService")
 
-
 class DerivTradingService:
     def __init__(self, app_id: str = None, token: str = None):
-        # FIX: Assign the directly imported variable
         self.token = token or DERIV_TOKEN
         self.ws = DerivWebSocket()
         self._authorized = False
@@ -22,8 +16,6 @@ class DerivTradingService:
     async def authenticate(self):
         """Connect to Deriv WebSocket and authorize with API token."""
         await self.ws.connect()
-
-        # Deriv auth is simply sending the token — no REST, no OTP
         await self.ws.send({"authorize": self.token})
         response = await self.ws.receive()
 
@@ -41,7 +33,8 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
 
-        await self.ws.send({"balance": 1, "subscribe": 0})
+        # Balance request also simplified for validation safety
+        await self.ws.send({"balance": 1})
         response = await self.ws.receive()
 
         if response.get("error"):
@@ -55,11 +48,12 @@ class DerivTradingService:
         }
 
     async def subscribe_ticks(self, symbol: str = "frxXAUUSD") -> dict:
-        """Get latest tick for a symbol (single snapshot, no persistent subscription)."""
+        """Get latest tick for a symbol (single snapshot)."""
         if not self._authorized:
             await self.authenticate()
 
-        await self.ws.send({"ticks": symbol, "subscribe": 0})
+        # FIX: Removed "subscribe": 0 to satisfy Deriv's strict validation
+        await self.ws.send({"ticks": symbol})
         response = await self.ws.receive()
 
         if response.get("error"):
@@ -67,18 +61,11 @@ class DerivTradingService:
 
         return response
 
-    async def place_order(
-        self,
-        contract_type: str,
-        amount: float,
-        duration: int,
-        symbol: str = "frxXAUUSD",
-    ) -> dict:
+    async def place_order(self, contract_type: str, amount: float, duration: int, symbol: str = "frxXAUUSD") -> dict:
         """Buy a contract on Deriv."""
         if not self._authorized:
             await self.authenticate()
 
-        # Step 1: Get a price proposal first
         await self.ws.send({
             "proposal": 1,
             "amount": amount,
@@ -95,10 +82,6 @@ class DerivTradingService:
             raise Exception(proposal["error"].get("message", "Proposal failed"))
 
         proposal_id = proposal.get("proposal", {}).get("id")
-        if not proposal_id:
-            raise Exception("No proposal ID returned from Deriv")
-
-        # Step 2: Buy the proposal
         await self.ws.send({"buy": proposal_id, "price": amount})
         result = await self.ws.receive()
 
@@ -108,5 +91,6 @@ class DerivTradingService:
         return result
 
     async def close(self):
-        await self.ws.close()
+        if self.ws:
+            await self.ws.close()
         self._authorized = False
