@@ -7,7 +7,7 @@ import logging
 from brokers.deriv_ws import DerivWebSocket
 
 # FIX: Explicitly import the variable from your root config.py file
-from config import DERIV_TOKEN
+from env_config import DERIV_TOKEN
 
 logger = logging.getLogger("DerivTradingService")
 
