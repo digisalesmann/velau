@@ -1,21 +1,18 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from user_models import User, router as users_router, get_current_user
 
 app = FastAPI()
 app.include_router(users_router)
 
-
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
-
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
-
 
 class DashboardResponse(BaseModel):
     username: str
@@ -23,7 +20,6 @@ class DashboardResponse(BaseModel):
     balance: float
     currency: str = "USD"
     account_id: Optional[str] = None
-
 
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
@@ -44,10 +40,21 @@ async def get_dashboard(user=Depends(get_current_user)):
     finally:
         await service.close()
 
+@app.get("/dashboard/history")
+async def get_history(user=Depends(get_current_user)):
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService()
+    try:
+        await service.authenticate()
+        history = await service.get_statement()
+        return history
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await service.close()
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
-
 
 class TradeRequest(BaseModel):
     contract_type: str
@@ -55,12 +62,10 @@ class TradeRequest(BaseModel):
     duration: int
     symbol: str = "frxXAUUSD"
 
-
 class AuthResponse(BaseModel):
     success: bool
     message: str
     details: dict = None
-
 
 @app.post("/auth", response_model=AuthResponse)
 async def authenticate():
@@ -72,7 +77,6 @@ async def authenticate():
         return AuthResponse(success=True, message="Authenticated", details=result)
     except Exception as e:
         return AuthResponse(success=False, message=str(e))
-
 
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
@@ -86,7 +90,6 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
-
 
 @app.post("/trade")
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
