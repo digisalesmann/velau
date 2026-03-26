@@ -1,0 +1,10 @@
+# Add these dependencies to your pubspec.yaml for Firebase Auth integration
+
+dependencies:
+  firebase_core: ^3.0.0
+  firebase_auth: ^5.0.0
+
+# After adding, run:
+# flutter pub add firebase_core
+# flutter pub add firebase_auth
+# flutterfire configure (if not already done)

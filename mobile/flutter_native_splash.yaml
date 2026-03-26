@@ -1,0 +1,7 @@
+flutter_native_splash:
+  color: "#ffffff"
+  image: assets/velau.png
+  android: true
+  ios: false
+  web: false
+  android_gravity: center

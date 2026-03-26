@@ -1,0 +1,7 @@
+# flutter_launcher_icons configuration
+flutter_icons:
+  android: true
+  ios: false
+  image_path: "velau.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "velau.png"

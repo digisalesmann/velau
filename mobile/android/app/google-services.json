@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "319594282130",
+    "project_id": "velau-87edd",
+    "storage_bucket": "velau-87edd.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:319594282130:android:8dedb67ae03e8ab4517a4b",
+        "android_client_info": {
+          "package_name": "com.velau.mobile"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "319594282130-4po4h92ji06g36qpji69tcvkcp6l1o6g.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.velau.mobile",
+            "certificate_hash": "21e03ac510f715aa4c408a040d6cd89aa685f6c6"
+          }
+        },
+        {
+          "client_id": "319594282130-8sj1bgk25bpilu5d6reg0t07it8mkkup.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCO9rb8XgAUAR_9b5q40xlXe_q1gTcnw_E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "319594282130-8sj1bgk25bpilu5d6reg0t07it8mkkup.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
