@@ -7,20 +7,23 @@ from ta.volatility import AverageTrueRange
 
 from datetime import datetime
 from news.news_pipeline import get_news_and_sentiment
-
-# Import your existing Deriv service
 from brokers.deriv_trading_service import DerivTradingService
 
 
 class XAUMasterStrategy:
     def __init__(self):
         self.symbol = "frxXAUUSD"
-        self.trade_amount = 10.0  # Base stake amount in USD
+        self.trade_amount = 10.0
         self.is_running = False
-        self.db_path = "/tmp/users.db"  # Ensure this matches user_models.py path
+        self.db_path = "/tmp/users.db"
 
-    def save_signal(self, signal_type, price, rsi, bias, reason):
-        """Writes bot analysis to the DB so the Mobile App can display it."""
+        # --- FIXED: Gold (XAU/USD) on M5 has a natural ATR of 5–20+
+        # 2.5 was designed for forex pairs like EUR/USD, not Gold.
+        # 18.0 blocks only genuinely extreme volatility spikes.
+        self.MAX_SAFE_ATR = 18.0
+
+    def save_signal(self, signal_type, price, rsi, bias, reason, atr=0.0):
+        """Writes bot analysis to DB so the Mobile App can display it."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -37,14 +40,10 @@ class XAUMasterStrategy:
             print(f"❌ DB Signal Error: {e}")
 
     async def get_recent_candles(self, service):
-        """
-        Fetches the last 250 candles to calculate accurate indicators.
-        Extra padding ensures EMA 200 has sufficient history.
-        """
+        """Fetches last 250 candles for accurate indicator calculation."""
         raw_candles = await service.get_candles(
             self.symbol, count=250, granularity=300
         )
-
         if not raw_candles:
             return pd.DataFrame()
 
@@ -56,24 +55,25 @@ class XAUMasterStrategy:
         return df
 
     def analyze_technicals(self, df):
-        """
-        Calculates Trend (EMA 200), Momentum (RSI 14), and Volatility (ATR 14).
-        """
+        """Calculates EMA 200, RSI 14, ATR 14."""
         if df.empty or len(df) < 200:
             return pd.DataFrame()
 
-        # 1. Trend: 200-period Exponential Moving Average
-        df["EMA_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+        df["EMA_200"] = EMAIndicator(
+            close=df["close"], window=200
+        ).ema_indicator()
 
-        # 2. Momentum: 14-period Relative Strength Index
-        df["RSI_14"] = RSIIndicator(close=df["close"], window=14).rsi()
+        df["RSI_14"] = RSIIndicator(
+            close=df["close"], window=14
+        ).rsi()
 
-        # 3. Volatility: 14-period Average True Range
         df["ATRr_14"] = AverageTrueRange(
-            high=df["high"], low=df["low"], close=df["close"], window=14
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=14,
         ).average_true_range()
 
-        # Drop rows without enough history to populate EMA 200
         df.dropna(inplace=True)
         return df
 
@@ -87,16 +87,16 @@ class XAUMasterStrategy:
             _, sentiment_data = get_news_and_sentiment()
             market_bias = sentiment_data.get("overall", "Neutral")
 
-            # --- PILLAR 2: TECHNICALS & VOLATILITY ---
+            # --- PILLAR 2: TECHNICALS ---
             df = await self.get_recent_candles(service)
             df = self.analyze_technicals(df)
 
-            # --- SAFETY CHECK: Not enough candle history yet ---
             if df.empty:
                 self.save_signal(
-                    "NEUTRAL", 0, 0, market_bias, "Collecting historical data..."
+                    "NEUTRAL", 0, 0, market_bias,
+                    "Collecting historical data..."
                 )
-                print("⏳ Not enough market data yet (EMA 200 requires more history). Skipping...")
+                print("⏳ Not enough market data yet. Skipping...")
                 return
 
             current = df.iloc[-1]
@@ -107,49 +107,75 @@ class XAUMasterStrategy:
 
             print(
                 f"📊 Stats | Price: {price} | RSI: {round(rsi, 2)} "
-                f"| ATR: {round(atr, 2)} | Bias: {market_bias}"
+                f"| ATR: {round(atr, 2)} | Bias: {market_bias} "
+                f"| EMA200: {round(ema_200, 2)}"
             )
 
-            # --- RISK MANAGEMENT OVERRIDE ---
-            MAX_SAFE_ATR = 2.5
-            if atr > MAX_SAFE_ATR:
-                reason = f"Volatility too high (ATR {round(atr, 2)} > {MAX_SAFE_ATR})"
+            # --- RISK MANAGEMENT: Only abort on extreme Gold volatility ---
+            if atr > self.MAX_SAFE_ATR:
+                reason = (
+                    f"Extreme volatility (ATR {round(atr, 2)} > "
+                    f"{self.MAX_SAFE_ATR}). Standing by."
+                )
                 self.save_signal("NEUTRAL", price, rsi, market_bias, reason)
-                print(f"⚠️ {reason}. Aborting trade cycle.")
+                print(f"⚠️ {reason}")
                 return
 
             # --- DECISION LOGIC ---
-            if price > ema_200 and rsi < 35 and market_bias != "Bearish":
-                reason = "Trend Up + Oversold + Positive Sentiment"
+            if (
+                price > ema_200
+                and rsi < 35
+                and market_bias != "Bearish"
+            ):
+                reason = "Trend Up + Oversold RSI + Bullish Sentiment"
                 self.save_signal("BUY", price, rsi, market_bias, reason)
                 print("🟢 CONFLUENCE MET: Executing LONG (CALL) Order!")
-                await service.place_order("CALL", self.trade_amount, 3, self.symbol)
+                result = await service.place_order(
+                    "CALL", self.trade_amount, 3, self.symbol
+                )
+                print(f"✅ Trade Result: {result}")
 
-            elif price < ema_200 and rsi > 65 and market_bias != "Bullish":
-                reason = "Trend Down + Overbought + Negative Sentiment"
+            elif (
+                price < ema_200
+                and rsi > 65
+                and market_bias != "Bullish"
+            ):
+                reason = "Trend Down + Overbought RSI + Bearish Sentiment"
                 self.save_signal("SELL", price, rsi, market_bias, reason)
                 print("🔴 CONFLUENCE MET: Executing SHORT (PUT) Order!")
-                await service.place_order("PUT", self.trade_amount, 3, self.symbol)
+                result = await service.place_order(
+                    "PUT", self.trade_amount, 3, self.symbol
+                )
+                print(f"✅ Trade Result: {result}")
 
             else:
-                # Build a specific reason so the mobile app can surface it
-                if rsi > 65:
-                    reason = "RSI Overbought, but Trend is Up (Waiting for drop)"
-                elif rsi < 35:
-                    reason = "RSI Oversold, but Trend is Down (Dangerous)"
+                # Specific reason for the mobile app to surface
+                if price < ema_200 and rsi < 35:
+                    reason = "RSI Oversold but below EMA 200 — too risky"
+                elif price > ema_200 and rsi > 65:
+                    reason = "RSI Overbought but above EMA 200 — waiting for pullback"
+                elif market_bias == "Bearish" and price > ema_200:
+                    reason = "Price above EMA 200 but sentiment is Bearish — conflicting"
+                elif market_bias == "Bullish" and price < ema_200:
+                    reason = "Bullish sentiment but price below EMA 200 — conflicting"
                 else:
-                    reason = "Waiting for RSI/Trend alignment"
+                    reason = (
+                        f"Waiting for RSI extremes "
+                        f"(RSI: {round(rsi, 1)}, need <35 or >65)"
+                    )
 
                 self.save_signal("NEUTRAL", price, rsi, market_bias, reason)
                 print(f"⏳ Neutral: {reason}")
 
         except Exception as e:
+            import traceback
             print(f"❌ Strategy Error: {e}")
+            traceback.print_exc()
         finally:
             await service.close()
 
     async def start_bot_loop(self):
-        """Runs the strategy continuously every 5 minutes."""
+        """Runs the strategy every 5 minutes."""
         self.is_running = True
         while self.is_running:
             await self.execute_trade_cycle()
