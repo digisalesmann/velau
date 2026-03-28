@@ -17,13 +17,15 @@ class XAUMasterStrategy:
         self.is_running = False
         self.db_path = "/tmp/users.db"
 
-        # --- FIXED: Gold (XAU/USD) on M5 has a natural ATR of 5–20+
-        # 2.5 was designed for forex pairs like EUR/USD, not Gold.
-        # 18.0 blocks only genuinely extreme volatility spikes.
+        # Gold M5 natural ATR range is 5–20+
+        # Only abort on genuinely extreme spikes
         self.MAX_SAFE_ATR = 18.0
 
-    def save_signal(self, signal_type, price, rsi, bias, reason, atr=0.0):
-        """Writes bot analysis to DB so the Mobile App can display it."""
+        # Minimum duration Deriv accepts for frxXAUUSD binary options
+        self.TRADE_DURATION = 5  # minutes
+
+    def save_signal(self, signal_type, price, rsi, bias, reason):
+        """Writes bot analysis to DB so the mobile app can display it."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -40,7 +42,7 @@ class XAUMasterStrategy:
             print(f"❌ DB Signal Error: {e}")
 
     async def get_recent_candles(self, service):
-        """Fetches last 250 candles for accurate indicator calculation."""
+        """Fetches last 250 M5 candles for accurate indicator calculation."""
         raw_candles = await service.get_candles(
             self.symbol, count=250, granularity=300
         )
@@ -49,9 +51,9 @@ class XAUMasterStrategy:
 
         df = pd.DataFrame(raw_candles)
         df["close"] = df["close"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["open"] = df["open"].astype(float)
+        df["high"]  = df["high"].astype(float)
+        df["low"]   = df["low"].astype(float)
+        df["open"]  = df["open"].astype(float)
         return df
 
     def analyze_technicals(self, df):
@@ -94,7 +96,7 @@ class XAUMasterStrategy:
             if df.empty:
                 self.save_signal(
                     "NEUTRAL", 0, 0, market_bias,
-                    "Collecting historical data..."
+                    "Collecting historical data...",
                 )
                 print("⏳ Not enough market data yet. Skipping...")
                 return
@@ -111,7 +113,7 @@ class XAUMasterStrategy:
                 f"| EMA200: {round(ema_200, 2)}"
             )
 
-            # --- RISK MANAGEMENT: Only abort on extreme Gold volatility ---
+            # --- RISK MANAGEMENT ---
             if atr > self.MAX_SAFE_ATR:
                 reason = (
                     f"Extreme volatility (ATR {round(atr, 2)} > "
@@ -131,7 +133,7 @@ class XAUMasterStrategy:
                 self.save_signal("BUY", price, rsi, market_bias, reason)
                 print("🟢 CONFLUENCE MET: Executing LONG (CALL) Order!")
                 result = await service.place_order(
-                    "CALL", self.trade_amount, 3, self.symbol
+                    "CALL", self.trade_amount, self.TRADE_DURATION, self.symbol
                 )
                 print(f"✅ Trade Result: {result}")
 
@@ -144,16 +146,16 @@ class XAUMasterStrategy:
                 self.save_signal("SELL", price, rsi, market_bias, reason)
                 print("🔴 CONFLUENCE MET: Executing SHORT (PUT) Order!")
                 result = await service.place_order(
-                    "PUT", self.trade_amount, 3, self.symbol
+                    "PUT", self.trade_amount, self.TRADE_DURATION, self.symbol
                 )
                 print(f"✅ Trade Result: {result}")
 
             else:
-                # Specific reason for the mobile app to surface
+                # Descriptive reason so mobile app can surface it clearly
                 if price < ema_200 and rsi < 35:
-                    reason = "RSI Oversold but below EMA 200 — too risky"
+                    reason = "RSI Oversold but price below EMA 200 — too risky"
                 elif price > ema_200 and rsi > 65:
-                    reason = "RSI Overbought but above EMA 200 — waiting for pullback"
+                    reason = "RSI Overbought but price above EMA 200 — waiting for pullback"
                 elif market_bias == "Bearish" and price > ema_200:
                     reason = "Price above EMA 200 but sentiment is Bearish — conflicting"
                 elif market_bias == "Bullish" and price < ema_200:
