@@ -14,11 +14,7 @@ class DerivTradingService:
 
     async def authenticate(self):
         await self.ws.connect()
-
-        # Small delay — prevents Deriv's rate limiter from rejecting
-        # rapid reconnects (common on Render's free tier cold starts)
         await asyncio.sleep(0.5)
-
         await self.ws.send({"authorize": self.token})
         response = await self.ws.receive()
 
@@ -29,7 +25,10 @@ class DerivTradingService:
             raise Exception(f"Deriv auth failed [{error_code}]: {error_msg}")
 
         self._authorized = True
-        logger.info(f"✅ Deriv auth success: {response.get('authorize', {}).get('loginid')}")
+        logger.info(
+            f"✅ Deriv auth success: "
+            f"{response.get('authorize', {}).get('loginid')}"
+        )
         return response
 
     async def get_account_info(self) -> dict:
@@ -38,7 +37,9 @@ class DerivTradingService:
         await self.ws.send({"balance": 1})
         response = await self.ws.receive()
         if response.get("error"):
-            raise Exception(response["error"].get("message", "Balance fetch failed"))
+            raise Exception(
+                response["error"].get("message", "Balance fetch failed")
+            )
         balance_data = response.get("balance", {})
         return {
             "balance": balance_data.get("balance", 0.0),
@@ -52,7 +53,9 @@ class DerivTradingService:
         await self.ws.send({"ticks": symbol})
         response = await self.ws.receive()
         if response.get("error"):
-            raise Exception(response["error"].get("message", "Tick fetch failed"))
+            raise Exception(
+                response["error"].get("message", "Tick fetch failed")
+            )
         return response
 
     async def get_candles(
@@ -64,7 +67,6 @@ class DerivTradingService:
         """granularity=300 = 5-minute candles."""
         if not self._authorized:
             await self.authenticate()
-
         await self.ws.send({
             "ticks_history": symbol,
             "adjust_start_time": 1,
@@ -75,8 +77,41 @@ class DerivTradingService:
         })
         response = await self.ws.receive()
         if response.get("error"):
-            raise Exception(response["error"].get("message", "Candle fetch failed"))
+            raise Exception(
+                response["error"].get("message", "Candle fetch failed")
+            )
         return response.get("candles", [])
+
+    async def get_available_symbols(self) -> list:
+        """Returns all symbols tradeable on this account.
+        Hit GET /symbols after deploy to see what your VRW account supports.
+        """
+        if not self._authorized:
+            await self.authenticate()
+        await self.ws.send({
+            "active_symbols": "brief",
+            "product_type": "basic",
+        })
+        response = await self.ws.receive()
+        if response.get("error"):
+            raise Exception(
+                response["error"].get("message", "Symbol fetch failed")
+            )
+        symbols = response.get("active_symbols", [])
+        # Return symbols that contain XAU or frx (forex/gold) for easy filtering
+        relevant = [
+            {
+                "symbol": s.get("symbol"),
+                "display_name": s.get("display_name"),
+                "is_open": s.get("exchange_is_open"),
+            }
+            for s in symbols
+            if "XAU" in s.get("symbol", "").upper()
+            or "frx" in s.get("symbol", "")
+            or "R_" in s.get("symbol", "")
+            or "1HZ" in s.get("symbol", "")
+        ]
+        return relevant
 
     async def get_statement(self) -> dict:
         if not self._authorized:
@@ -84,7 +119,9 @@ class DerivTradingService:
         await self.ws.send({"statement": 1, "description": 1, "limit": 50})
         response = await self.ws.receive()
         if response.get("error"):
-            raise Exception(response["error"].get("message", "History fetch failed"))
+            raise Exception(
+                response["error"].get("message", "History fetch failed")
+            )
         trades = []
         for tx in response.get("statement", {}).get("transactions", []):
             trades.append({
@@ -106,22 +143,15 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
 
-        # --- FIXED: Deriv rejects durations outside their allowed range.
-        # For frxXAUUSD binary options, minimum is 5 minutes.
-        # Clamp to valid range: 5–60 minutes.
-        VALID_MIN_DURATION = 5
-        VALID_MAX_DURATION = 60
-        safe_duration = max(VALID_MIN_DURATION, min(duration, VALID_MAX_DURATION))
-
-        if safe_duration != duration:
-            logger.warning(
-                f"Duration {duration}m clamped to {safe_duration}m "
-                f"(Deriv allows {VALID_MIN_DURATION}–{VALID_MAX_DURATION}m for {symbol})"
-            )
+        # VRW demo accounts use tick-based duration.
+        # "t" (ticks) is universally supported across all Deriv demo account types.
+        # "m" (minutes) requires a real Options/Financial account.
+        DURATION_UNIT = "t"
+        TICK_DURATION = 5  # 5 ticks — minimum allowed
 
         logger.info(
             f"📤 Sending proposal | type={contract_type} "
-            f"amount={amount} duration={safe_duration}m symbol={symbol}"
+            f"amount={amount} duration={TICK_DURATION}t symbol={symbol}"
         )
 
         await self.ws.send({
@@ -130,8 +160,8 @@ class DerivTradingService:
             "basis": "stake",
             "contract_type": contract_type,
             "currency": "USD",
-            "duration": safe_duration,
-            "duration_unit": "m",
+            "duration": TICK_DURATION,
+            "duration_unit": DURATION_UNIT,
             "symbol": symbol,
         })
         proposal = await self.ws.receive()
@@ -140,11 +170,25 @@ class DerivTradingService:
             error_msg = proposal["error"].get("message", "Proposal failed")
             error_code = proposal["error"].get("code", "")
             logger.error(f"Proposal error [{error_code}]: {error_msg}")
+
+            if error_code == "PermissionDenied":
+                raise Exception(
+                    "PermissionDenied: Your API token does not have permission "
+                    "to trade binary options. Please generate a new token from "
+                    "your Deriv Options account at app.deriv.com."
+                )
+            if error_code == "AuthorizationRequired":
+                raise Exception(
+                    "AuthorizationRequired: Token is invalid or expired. "
+                    "Please reconnect your Deriv API in Account settings."
+                )
             raise Exception(f"Proposal error [{error_code}]: {error_msg}")
 
         proposal_id = proposal.get("proposal", {}).get("id")
         if not proposal_id:
-            raise Exception("Proposal returned no ID — cannot place order.")
+            raise Exception(
+                "Proposal returned no ID — cannot place order."
+            )
 
         logger.info(f"📋 Proposal accepted: id={proposal_id}")
 
@@ -155,10 +199,23 @@ class DerivTradingService:
             error_msg = result["error"].get("message", "Order failed")
             error_code = result["error"].get("code", "")
             logger.error(f"Buy error [{error_code}]: {error_msg}")
+
+            if error_code == "PermissionDenied":
+                raise Exception(
+                    "PermissionDenied: Your Deriv account type cannot place "
+                    "binary option orders. Visit app.deriv.com → Trader's Hub "
+                    "→ Options to create an Options account and generate a "
+                    "new API token."
+                )
+            if error_code == "AuthorizationRequired":
+                raise Exception(
+                    "AuthorizationRequired: Token expired or missing Trade "
+                    "scope. Regenerate your API token with Trade permission."
+                )
             raise Exception(f"Order error [{error_code}]: {error_msg}")
 
         contract_id = result.get("buy", {}).get("contract_id")
-        logger.info(f"✅ Order placed successfully: contract_id={contract_id}")
+        logger.info(f"✅ Order placed: contract_id={contract_id}")
         return result
 
     async def close(self):

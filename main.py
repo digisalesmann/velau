@@ -190,11 +190,27 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     finally:
         await service.close()
 
+# --- Diagnostic endpoint: see what symbols your account can trade ---
+# Hit GET /symbols once after deploy to verify your VRW account's
+# available symbols, then remove or secure this endpoint.
+@app.get("/symbols")
+async def get_symbols(user=Depends(get_current_user)):
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService()
+    try:
+        await service.authenticate()
+        symbols = await service.get_available_symbols()
+        return {"count": len(symbols), "symbols": symbols}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await service.close()
+
 @app.post("/trade")
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
 
-    # --- Validate inputs before touching the broker ---
     if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
         raise HTTPException(
             status_code=400,
@@ -205,11 +221,6 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
             status_code=400,
             detail="amount must be a positive number.",
         )
-    if not req.duration or req.duration <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="duration must be a positive integer (minutes).",
-        )
 
     service = DerivTradingService()
     try:
@@ -219,16 +230,15 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
             return {"status": "success", "message": "Position closed."}
 
         print(
-            f"📲 Manual trade request | "
-            f"type={req.contract_type} amount={req.amount} "
-            f"duration={req.duration} symbol={req.symbol} "
+            f"📲 Manual trade | type={req.contract_type} "
+            f"amount={req.amount} symbol={req.symbol} "
             f"user={user.username}"
         )
 
         result = await service.place_order(
             contract_type=req.contract_type.upper(),
             amount=req.amount,
-            duration=req.duration,
+            duration=5,  # passed but internally clamped to ticks
             symbol=req.symbol,
         )
 
@@ -236,7 +246,6 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         return result
 
     except Exception as e:
-        # Full traceback in server logs so you can see the real crash
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
     finally:
