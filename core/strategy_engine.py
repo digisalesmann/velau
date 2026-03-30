@@ -16,16 +16,9 @@ class XAUMasterStrategy:
         self.trade_amount = 10.0
         self.is_running = False
         self.db_path = "/tmp/users.db"
-
-        # Gold M5 natural ATR range is 5–20+
-        # Only abort on genuinely extreme spikes
         self.MAX_SAFE_ATR = 18.0
 
-        # Minimum duration Deriv accepts for frxXAUUSD binary options
-        self.TRADE_DURATION = 5  # minutes
-
     def save_signal(self, signal_type, price, rsi, bias, reason):
-        """Writes bot analysis to DB so the mobile app can display it."""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
@@ -42,7 +35,6 @@ class XAUMasterStrategy:
             print(f"❌ DB Signal Error: {e}")
 
     async def get_recent_candles(self, service):
-        """Fetches last 250 M5 candles for accurate indicator calculation."""
         raw_candles = await service.get_candles(
             self.symbol, count=250, granularity=300
         )
@@ -57,7 +49,6 @@ class XAUMasterStrategy:
         return df
 
     def analyze_technicals(self, df):
-        """Calculates EMA 200, RSI 14, ATR 14."""
         if df.empty or len(df) < 200:
             return pd.DataFrame()
 
@@ -132,8 +123,9 @@ class XAUMasterStrategy:
                 reason = "Trend Up + Oversold RSI + Bullish Sentiment"
                 self.save_signal("BUY", price, rsi, market_bias, reason)
                 print("🟢 CONFLUENCE MET: Executing LONG (CALL) Order!")
+                # Duration handled internally by DerivTradingService (5 ticks)
                 result = await service.place_order(
-                    "CALL", self.trade_amount, self.TRADE_DURATION, self.symbol
+                    "CALL", self.trade_amount, 5, self.symbol
                 )
                 print(f"✅ Trade Result: {result}")
 
@@ -146,12 +138,11 @@ class XAUMasterStrategy:
                 self.save_signal("SELL", price, rsi, market_bias, reason)
                 print("🔴 CONFLUENCE MET: Executing SHORT (PUT) Order!")
                 result = await service.place_order(
-                    "PUT", self.trade_amount, self.TRADE_DURATION, self.symbol
+                    "PUT", self.trade_amount, 5, self.symbol
                 )
                 print(f"✅ Trade Result: {result}")
 
             else:
-                # Descriptive reason so mobile app can surface it clearly
                 if price < ema_200 and rsi < 35:
                     reason = "RSI Oversold but price below EMA 200 — too risky"
                 elif price > ema_200 and rsi > 65:
@@ -177,7 +168,6 @@ class XAUMasterStrategy:
             await service.close()
 
     async def start_bot_loop(self):
-        """Runs the strategy every 5 minutes."""
         self.is_running = True
         while self.is_running:
             await self.execute_trade_cycle()
