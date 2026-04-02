@@ -7,5 +7,6 @@ ta
 vaderSentiment
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt
 python-multipart
-aiohttp
+python-dotenv
