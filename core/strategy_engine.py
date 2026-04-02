@@ -1,5 +1,5 @@
 """
-XAU Master Strategy — production engine using persistent database.py.
+XAU Master Strategy — with push notifications wired in.
 """
 import asyncio
 import logging
@@ -13,6 +13,7 @@ from ta.volatility import AverageTrueRange
 from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 import database as db
+import notifications as notif
 
 logger = logging.getLogger("XAUStrategy")
 
@@ -37,6 +38,7 @@ class XAUMasterStrategy:
         self._daily_pnl          = 0.0
         self._opening_balance    = None
         self._last_reset_date    = None
+        self._last_session_notif = None  # track so we don't spam session-open notifs
 
     def _maybe_reset_daily(self, balance: float):
         today = datetime.now(timezone.utc).date()
@@ -52,7 +54,16 @@ class XAUMasterStrategy:
         hour = datetime.now(timezone.utc).hour
         return any(s <= hour < e for s, e in SESSIONS)
 
-    # ── DB writes (now use database.py) ───────────────────────────────────────
+    def _maybe_notify_session_start(self):
+        """Fire session-open notification once per session, not every cycle."""
+        today = datetime.now(timezone.utc).date()
+        hour  = datetime.now(timezone.utc).hour
+        key   = (today, hour // 5)   # changes every 5h so covers London + NY
+        if self._last_session_notif != key and self._in_trading_session():
+            self._last_session_notif = key
+            notif.notify_session_start()
+
+    # ── DB helpers ─────────────────────────────────────────────────────────────
     def save_signal(self, sig_type, price, rsi, bias, reason, confluence_score=0):
         try:
             db.insert_signal(
@@ -93,9 +104,9 @@ class XAUMasterStrategy:
         df["STOCH_K"] = stoch.stoch()
         df["STOCH_D"] = stoch.stoch_signal()
         df["ATR_14"]  = AverageTrueRange(high=h, low=l, close=c, window=14).average_true_range()
-        vm            = df["volume"].rolling(20).mean()
-        vs            = df["volume"].rolling(20).std()
-        df["VOL_Z"]   = (df["volume"] - vm) / (vs + 1e-9)
+        vm = df["volume"].rolling(20).mean()
+        vs = df["volume"].rolling(20).std()
+        df["VOL_Z"] = (df["volume"] - vm) / (vs + 1e-9)
         df.dropna(inplace=True)
         return df
 
@@ -108,8 +119,8 @@ class XAUMasterStrategy:
             df["EMA_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
             df.dropna(inplace=True)
             row = df.iloc[-1]
-            if row["EMA_50"] > row["EMA_200"]:   return "bullish"
-            if row["EMA_50"] < row["EMA_200"]:   return "bearish"
+            if row["EMA_50"] > row["EMA_200"]: return "bullish"
+            if row["EMA_50"] < row["EMA_200"]: return "bearish"
             return "neutral"
         except Exception as e:
             logger.warning(f"1H bias error: {e}")
@@ -118,9 +129,9 @@ class XAUMasterStrategy:
     def _score(self, row, sentiment):
         bull, bear = [], []
         price, ema50, ema200 = row["close"], row["EMA_50"], row["EMA_200"]
-        rsi, macd_h          = row["RSI_14"], row["MACD_H"]
-        sk, sd               = row["STOCH_K"], row["STOCH_D"]
-        vol_z                = row["VOL_Z"]
+        rsi, macd_h = row["RSI_14"], row["MACD_H"]
+        sk, sd      = row["STOCH_K"], row["STOCH_D"]
+        vol_z       = row["VOL_Z"]
 
         (bull if price > ema200 else bear).append(
             "Price above EMA 200" if price > ema200 else "Price below EMA 200")
@@ -133,7 +144,8 @@ class XAUMasterStrategy:
         if sk < 25 and sk > sd:   bull.append(f"Stoch oversold+cross ({sk:.1f})")
         elif sk > 75 and sk < sd: bear.append(f"Stoch overbought+cross ({sk:.1f})")
         if vol_z > 1.0:
-            (bull if len(bull) >= len(bear) else bear).append(f"Volume spike (z={vol_z:.1f})")
+            (bull if len(bull) >= len(bear) else bear).append(
+                f"Volume spike (z={vol_z:.1f})")
         if sentiment == "Bullish":   bull.append("News sentiment Bullish")
         elif sentiment == "Bearish": bear.append("News sentiment Bearish")
 
@@ -142,7 +154,7 @@ class XAUMasterStrategy:
     # ── Contract monitor ───────────────────────────────────────────────────────
     async def _monitor_contract(self, service, contract_id: str, stake: float):
         try:
-            logger.info(f"👁  Monitoring contract {contract_id}")
+            logger.info(f"👁  Monitoring {contract_id}")
             await service.ws.send({
                 "proposal_open_contracts": 1,
                 "contract_id": contract_id,
@@ -154,30 +166,40 @@ class XAUMasterStrategy:
                     msg = await service.ws.receive(timeout=30.0)
                 except TimeoutError:
                     break
-                poc    = msg.get("proposal_open_contracts") or msg.get("poc")
+                poc = msg.get("proposal_open_contracts") or msg.get("poc")
                 if not poc:
                     continue
                 status = poc.get("status", "")
                 if status not in ("won", "lost", "sold"):
                     continue
+
                 profit = float(poc.get("profit", 0))
                 won    = status == "won"
                 self._daily_pnl += profit
                 self.save_trade_result(contract_id, won, profit)
+
+                # ── Push notification: settlement ──────────────────────────
+                notif.notify_trade_settled(contract_id, won, profit)
+
                 if won:
                     self._consecutive_losses = 0
-                    logger.info(f"✅ WON | profit={profit:+.2f} | daily={self._daily_pnl:+.2f}")
+                    logger.info(f"✅ WON | profit={profit:+.2f}")
                 else:
                     self._consecutive_losses += 1
-                    logger.warning(f"❌ LOST | profit={profit:+.2f} | streak={self._consecutive_losses}")
+                    logger.warning(f"❌ LOST | streak={self._consecutive_losses}")
+
+                # ── Circuit breaker ────────────────────────────────────────
                 if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
                     self._circuit_broken = True
-                    logger.error("🚨 CIRCUIT BREAKER: 3 consecutive losses. Bot paused.")
+                    notif.notify_circuit_breaker(self._consecutive_losses)
+                    logger.error("🚨 CIRCUIT BREAKER triggered")
+
                 if self._opening_balance and self._opening_balance > 0:
                     dd = abs(self._daily_pnl) / self._opening_balance * 100
                     if self._daily_pnl < 0 and dd >= MAX_DAILY_DRAWDOWN_PCT:
                         self._circuit_broken = True
-                        logger.error(f"🚨 CIRCUIT BREAKER: Drawdown {dd:.1f}% hit limit.")
+                        notif.notify_circuit_breaker(self._consecutive_losses)
+                        logger.error(f"🚨 CIRCUIT BREAKER: drawdown {dd:.1f}%")
                 break
         except Exception as e:
             logger.error(f"Monitor error: {e}")
@@ -197,11 +219,12 @@ class XAUMasterStrategy:
             except Exception:
                 pass
 
+            self._maybe_notify_session_start()
+
             now = datetime.now(timezone.utc)
             logger.info(
-                f"[{now:%H:%M:%S}] 🤖 Scanning | "
-                f"session={'✅' if self._in_trading_session() else '❌'} | "
-                f"circuit={'🚨' if self._circuit_broken else '✅'} | "
+                f"[{now:%H:%M:%S}] 🤖 session={'✅' if self._in_trading_session() else '❌'} "
+                f"circuit={'🚨' if self._circuit_broken else '✅'} "
                 f"lock={'🔒' if self._trade_in_progress else '🔓'}"
             )
 
@@ -226,7 +249,7 @@ class XAUMasterStrategy:
                 market_bias = "Neutral"
 
             h1_bias = await self._get_1h_bias(service)
-            logger.info(f"📈 1H bias: {h1_bias}")
+            logger.info(f"📈 1H: {h1_bias}")
 
             df = await self._get_candles(service)
             df = self._compute(df)
@@ -277,12 +300,17 @@ class XAUMasterStrategy:
                 reason = " | ".join(reasons)
                 signal = "BUY" if direction == "CALL" else "SELL"
                 self.save_signal(signal, price, rsi, market_bias, reason, score)
-                logger.info(f"{'🟢' if direction=='CALL' else '🔴'} {signal} [{score}/7]")
 
+                logger.info(f"{'🟢' if direction=='CALL' else '🔴'} {signal} [{score}/7]")
                 self._trade_in_progress = True
+
                 result      = await service.place_order(direction, self.trade_amount)
                 contract_id = result.get("buy", {}).get("contract_id", "unknown")
                 logger.info(f"✅ Placed | contract_id={contract_id}")
+
+                # ── Push notification: trade executed ──────────────────────
+                notif.notify_trade_executed(direction, ANALYSIS_SYMBOL,
+                                            self.trade_amount, score)
 
                 monitor_svc = DerivTradingService()
                 await monitor_svc.authenticate()
@@ -294,7 +322,8 @@ class XAUMasterStrategy:
                 leaning = "bullish" if bull_score > bear_score else "bearish"
                 top_r   = bull_r if bull_score > bear_score else bear_r
                 self.save_signal("NEUTRAL", price, rsi, market_bias,
-                    f"Leaning {leaning} ({top}/7) — need {MIN_CONFLUENCE}. " + " | ".join(top_r), top)
+                    f"Leaning {leaning} ({top}/7) — need {MIN_CONFLUENCE}. "
+                    + " | ".join(top_r), top)
 
         except Exception as e:
             import traceback

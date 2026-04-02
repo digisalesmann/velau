@@ -10,6 +10,7 @@ from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
+import notifications as notif
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
@@ -72,6 +73,9 @@ class TradeRequest(BaseModel):
     symbol:        str = "frxXAUUSD"
     action:        Optional[str] = "buy"
 
+class FCMTokenRequest(BaseModel):
+    token: str
+
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -84,6 +88,19 @@ async def root():
         "in_session":     trading_bot._in_trading_session(),
     }
 
+# ── Push notification registration ────────────────────────────────────────────
+@app.post("/notifications/register")
+async def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
+    """Called by Flutter app on startup to register the device FCM token."""
+    notif.register_token(req.token)
+    return {"status": "registered"}
+
+@app.post("/notifications/unregister")
+async def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
+    notif.unregister_token(req.token)
+    return {"status": "unregistered"}
+
+# ── Bot control ────────────────────────────────────────────────────────────────
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
     return {
@@ -110,6 +127,7 @@ async def toggle_bot(user=Depends(get_current_user)):
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started", "is_running": True}
 
+# ── Dashboard ──────────────────────────────────────────────────────────────────
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
@@ -120,17 +138,12 @@ async def get_dashboard(user=Depends(get_current_user)):
         history_data = await service.get_statement()
         trades_list  = history_data.get("history", [])
 
-        # Today's trades from Deriv statement
         today_trades = [
             t for t in trades_list
             if datetime.fromtimestamp(t.get("time", 0)).date() == date.today()
         ]
-        daily_pnl = sum(float(t.get("pnl", 0)) for t in today_trades)
-
-        # Win rate from persistent trade_results table (accurate)
-        stats    = db.get_trade_stats()
-        win_rate = stats["win_rate"]
-
+        daily_pnl   = sum(float(t.get("pnl", 0)) for t in today_trades)
+        stats       = db.get_trade_stats()
         market_bias = db.get_latest_bias()
         balance     = account_info.get("balance", 0.0)
         pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
@@ -141,7 +154,7 @@ async def get_dashboard(user=Depends(get_current_user)):
             balance=balance,
             currency=account_info.get("currency", "USD"),
             account_id=account_info.get("account_id"),
-            win_rate=round(win_rate, 1),
+            win_rate=round(stats["win_rate"], 1),
             trades_today=len(today_trades),
             daily_pnl=round(daily_pnl, 2),
             daily_pnl_percent=round(pnl_percent, 2),
@@ -169,8 +182,7 @@ async def get_news():
 @app.get("/signals")
 async def get_signals(user=Depends(get_current_user)):
     try:
-        signals = db.get_signals(limit=30)
-        return {"signals": signals}
+        return {"signals": db.get_signals(limit=30)}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -181,8 +193,7 @@ async def get_history(user=Depends(get_current_user)):
     service = DerivTradingService()
     try:
         await service.authenticate()
-        history = await service.get_statement()
-        return history
+        return await service.get_statement()
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -208,8 +219,7 @@ async def get_symbols(user=Depends(get_current_user)):
     service = DerivTradingService()
     try:
         await service.authenticate()
-        symbols = await service.get_available_symbols()
-        return {"count": len(symbols), "symbols": symbols}
+        return {"count": 0, "symbols": await service.get_available_symbols()}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -221,9 +231,9 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
         raise HTTPException(status_code=400,
-            detail=f"Invalid contract_type '{req.contract_type}'. Must be CALL or PUT.")
+            detail=f"Invalid contract_type '{req.contract_type}'.")
     if not req.amount or req.amount <= 0:
-        raise HTTPException(status_code=400, detail="amount must be a positive number.")
+        raise HTTPException(status_code=400, detail="amount must be positive.")
 
     service = DerivTradingService()
     try:
