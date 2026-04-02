@@ -1,10 +1,12 @@
 """
-Deriv WebSocket client — tuned for Render cold-start latency.
+Deriv WebSocket client — Python 3.14 compatible.
 
-Render's free tier network takes 3-10 seconds to be fully ready after
-a cold start. The first WebSocket attempt often fails with a DNS or TCP
-reset. We use exponential back-off (2s, 4s, 8s... cap 30s) so the bot
-recovers automatically without crashing the whole process.
+Fix: asyncio.wait_for() has a known interaction with websockets on Python 3.14
+where CancelledError propagates incorrectly through the recv() coroutine,
+causing spurious TimeoutError even when the connection is healthy.
+
+Solution: use `async with asyncio.timeout(n)` (native since Python 3.11)
+which handles cancellation correctly inside websockets' async generator.
 """
 import asyncio
 import websockets
@@ -53,7 +55,7 @@ class DerivWebSocket:
 
             except Exception as e:
                 last_error = e
-                wait = min(2 ** (attempt + 1), 30)  # 2,4,8,16,30,30,30
+                wait = min(2 ** (attempt + 1), 30)
                 logger.warning(
                     f"WS attempt {attempt + 1}/{self.max_retries} failed: {e}. "
                     f"Retrying in {wait}s..."
@@ -61,8 +63,7 @@ class DerivWebSocket:
                 await asyncio.sleep(wait)
 
         raise ConnectionError(
-            f"WebSocket failed after {self.max_retries} attempts. "
-            f"Last: {last_error}"
+            f"WebSocket failed after {self.max_retries} attempts. Last: {last_error}"
         )
 
     async def send(self, message: dict):
@@ -72,12 +73,31 @@ class DerivWebSocket:
         logger.debug(f"→ {list(message.keys())}")
 
     async def receive(self, timeout: float = 20.0) -> dict:
+        """
+        Receive next frame with timeout.
+
+        Uses `async with asyncio.timeout()` instead of `asyncio.wait_for()`
+        to avoid the CancelledError → TimeoutError mis-propagation in
+        Python 3.14 + websockets.
+        """
         if not self.connection:
             raise Exception("WebSocket not connected.")
-        raw = await asyncio.wait_for(self.connection.recv(), timeout=timeout)
-        msg = json.loads(raw)
-        logger.debug(f"← msg_type={msg.get('msg_type', '?')}")
-        return msg
+
+        try:
+            async with asyncio.timeout(timeout):
+                raw = await self.connection.recv()
+            msg = json.loads(raw)
+            logger.debug(f"← msg_type={msg.get('msg_type', '?')}")
+            return msg
+        except TimeoutError:
+            raise TimeoutError(
+                f"WebSocket receive timed out after {timeout}s"
+            )
+        except asyncio.CancelledError:
+            # Re-raise cancellation — don't swallow it
+            raise
+        except Exception as e:
+            raise Exception(f"WebSocket receive error: {e}") from e
 
     async def close(self):
         if self.connection:

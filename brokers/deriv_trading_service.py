@@ -1,6 +1,5 @@
 """
-Deriv Trading Service — fixed auth handshake, demo-compatible symbols,
-correct duration units, and full error surfacing.
+Deriv Trading Service — Python 3.14 compatible, Render-tuned timeouts.
 """
 import asyncio
 import logging
@@ -10,10 +9,6 @@ from env_config import DERIV_TOKEN
 
 logger = logging.getLogger("DerivTradingService")
 
-# ── Demo execution symbol ──────────────────────────────────────────────────────
-# frxXAUUSD (real Gold) is NOT available on Deriv demo accounts.
-# 1HZ100V (Volatility 100 1s Index) is always open, always liquid on demo,
-# and fully supports tick-based binary options.
 DEMO_EXECUTION_SYMBOL = "1HZ100V"
 TICK_DURATION         = 5
 DURATION_UNIT         = "t"
@@ -21,30 +16,30 @@ DURATION_UNIT         = "t"
 
 class DerivTradingService:
     def __init__(self, token: str = None):
-        self.token        = token or DERIV_TOKEN
-        self.ws           = DerivWebSocket()
-        self._authorized  = False
+        self.token       = token or DERIV_TOKEN
+        self.ws          = DerivWebSocket()
+        self._authorized = False
 
     # ── AUTH ───────────────────────────────────────────────────────────────────
     async def authenticate(self):
         await self.ws.connect()
 
-        # Give Deriv's server a moment to finish the TCP handshake before we
-        # send auth — on Render cold starts this is especially important.
-        await asyncio.sleep(1.5)
+        # Let the TCP handshake fully settle — critical on Render cold starts
+        await asyncio.sleep(2.0)
 
         await self.ws.send({"authorize": self.token})
 
-        # Drain up to 15 frames looking for the authorize response.
-        # WrongResponse on early frames = stale ping/connection frame — skip it.
-        # Only treat WrongResponse as fatal after frame 5.
         for attempt in range(15):
             try:
-                raw = await self.ws.receive(timeout=12.0)
-            except asyncio.TimeoutError:
+                # 20s timeout — Render's network can be slow on first frame
+                raw = await self.ws.receive(timeout=20.0)
+            except TimeoutError:
                 raise Exception(
-                    "Deriv auth timed out — no response after 12s."
+                    "Deriv auth timed out — no response after 20s. "
+                    "Check DERIV_TOKEN and DERIV_APP_ID env vars on Render."
                 )
+            except asyncio.CancelledError:
+                raise
 
             msg_type = raw.get("msg_type", "")
             error    = raw.get("error")
@@ -52,14 +47,10 @@ class DerivTradingService:
             if error:
                 code = error.get("code", "")
                 msg  = error.get("message", "Unknown error")
-
-                # WrongResponse on early frames is always a stale frame — skip
+                # WrongResponse on early frames = stale ping frame — skip
                 if code == "WrongResponse" and attempt < 5:
-                    logger.warning(
-                        f"Skipping stale frame {attempt}: [{code}] {msg}"
-                    )
+                    logger.warning(f"Skipping stale frame {attempt}: [{code}] {msg}")
                     continue
-
                 logger.error(f"Auth error [{code}]: {msg}")
                 raise Exception(f"Deriv auth failed [{code}]: {msg}")
 
@@ -70,29 +61,22 @@ class DerivTradingService:
                 balance  = info.get("balance", "?")
                 currency = info.get("currency", "")
                 logger.info(
-                    f"✅ Auth OK | account={loginid} "
-                    f"balance={balance} {currency}"
+                    f"✅ Auth OK | account={loginid} balance={balance} {currency}"
                 )
                 return raw
 
-            logger.debug(
-                f"Skipping non-auth frame {attempt}: msg_type={msg_type}"
-            )
+            logger.debug(f"Skipping non-auth frame {attempt}: {msg_type}")
 
-        raise Exception(
-            "Deriv auth failed: no authorize response after 15 frames."
-        )
+        raise Exception("Deriv auth failed: no authorize response after 15 frames.")
 
     # ── ACCOUNT ────────────────────────────────────────────────────────────────
     async def get_account_info(self) -> dict:
         if not self._authorized:
             await self.authenticate()
         await self.ws.send({"balance": 1})
-        response = await self.ws.receive()
+        response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
-            raise Exception(
-                response["error"].get("message", "Balance fetch failed")
-            )
+            raise Exception(response["error"].get("message", "Balance fetch failed"))
         data = response.get("balance", {})
         return {
             "balance":    data.get("balance", 0.0),
@@ -105,11 +89,9 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
         await self.ws.send({"ticks": symbol, "subscribe": 1})
-        response = await self.ws.receive()
+        response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
-            raise Exception(
-                response["error"].get("message", "Tick subscribe failed")
-            )
+            raise Exception(response["error"].get("message", "Tick subscribe failed"))
         return response
 
     async def get_candles(
@@ -121,44 +103,33 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
         await self.ws.send({
-            "ticks_history": symbol,
+            "ticks_history":    symbol,
             "adjust_start_time": 1,
-            "count":       count,
-            "end":         "latest",
-            "style":       "candles",
-            "granularity": granularity,
+            "count":            count,
+            "end":              "latest",
+            "style":            "candles",
+            "granularity":      granularity,
         })
-        response = await self.ws.receive(timeout=25.0)
+        response = await self.ws.receive(timeout=30.0)
         if response.get("error"):
-            raise Exception(
-                response["error"].get("message", "Candle fetch failed")
-            )
+            raise Exception(response["error"].get("message", "Candle fetch failed"))
         return response.get("candles", [])
 
     async def get_available_symbols(self) -> list:
         if not self._authorized:
             await self.authenticate()
-        await self.ws.send({
-            "active_symbols": "brief",
-            "product_type":   "basic",
-        })
-        response = await self.ws.receive(timeout=15.0)
+        await self.ws.send({"active_symbols": "brief", "product_type": "basic"})
+        response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
-            raise Exception(
-                response["error"].get("message", "Symbol fetch failed")
-            )
-        symbols = response.get("active_symbols", [])
+            raise Exception(response["error"].get("message", "Symbol fetch failed"))
         return [
             {
                 "symbol":       s.get("symbol"),
                 "display_name": s.get("display_name"),
                 "is_open":      s.get("exchange_is_open"),
             }
-            for s in symbols
-            if any(
-                x in s.get("symbol", "")
-                for x in ["XAU", "frx", "R_", "1HZ", "BOOM", "CRASH"]
-            )
+            for s in response.get("active_symbols", [])
+            if any(x in s.get("symbol", "") for x in ["XAU", "frx", "R_", "1HZ", "BOOM", "CRASH"])
         ]
 
     # ── STATEMENT ──────────────────────────────────────────────────────────────
@@ -166,11 +137,9 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
         await self.ws.send({"statement": 1, "description": 1, "limit": 50})
-        response = await self.ws.receive(timeout=15.0)
+        response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
-            raise Exception(
-                response["error"].get("message", "Statement fetch failed")
-            )
+            raise Exception(response["error"].get("message", "Statement fetch failed"))
         trades = []
         for tx in response.get("statement", {}).get("transactions", []):
             trades.append({
@@ -193,21 +162,17 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
 
-        # Always redirect XAU/Forex symbols to the demo execution symbol
         exec_symbol = symbol or DEMO_EXECUTION_SYMBOL
         if "XAU" in exec_symbol or "frx" in exec_symbol:
             logger.warning(
-                f"Redirecting {exec_symbol} → {DEMO_EXECUTION_SYMBOL} "
-                f"(not available on demo)"
+                f"Redirecting {exec_symbol} → {DEMO_EXECUTION_SYMBOL} (not on demo)"
             )
             exec_symbol = DEMO_EXECUTION_SYMBOL
 
         logger.info(
-            f"📤 Proposal | {contract_type} ${amount} "
-            f"| {TICK_DURATION}t | {exec_symbol}"
+            f"📤 Proposal | {contract_type} ${amount} | {TICK_DURATION}t | {exec_symbol}"
         )
 
-        # ── Step 1: Get proposal ───────────────────────────────────────────────
         await self.ws.send({
             "proposal":      1,
             "amount":        amount,
@@ -219,28 +184,22 @@ class DerivTradingService:
             "symbol":        exec_symbol,
         })
 
-        proposal = await self._wait_for("proposal", timeout=15.0)
-
+        proposal = await self._wait_for("proposal", timeout=20.0)
         if proposal.get("error"):
             code = proposal["error"].get("code", "")
             msg  = proposal["error"].get("message", "Proposal failed")
-            logger.error(f"Proposal error [{code}]: {msg}")
             self._raise_trade_error(code, msg, "proposal")
 
         proposal_id = proposal.get("proposal", {}).get("id")
         if not proposal_id:
             raise Exception(f"Proposal returned no ID: {proposal}")
-
         logger.info(f"📋 Proposal OK: id={proposal_id}")
 
-        # ── Step 2: Buy ────────────────────────────────────────────────────────
         await self.ws.send({"buy": proposal_id, "price": amount})
-        result = await self._wait_for("buy", timeout=15.0)
-
+        result = await self._wait_for("buy", timeout=20.0)
         if result.get("error"):
             code = result["error"].get("code", "")
             msg  = result["error"].get("message", "Buy failed")
-            logger.error(f"Buy error [{code}]: {msg}")
             self._raise_trade_error(code, msg, "buy")
 
         contract_id = result.get("buy", {}).get("contract_id")
@@ -249,40 +208,24 @@ class DerivTradingService:
 
     # ── HELPERS ────────────────────────────────────────────────────────────────
     async def _wait_for(
-        self, expected: str, timeout: float = 15.0, max_frames: int = 10
+        self, expected: str, timeout: float = 20.0, max_frames: int = 10
     ) -> dict:
         for _ in range(max_frames):
             try:
                 msg = await self.ws.receive(timeout=timeout)
-            except asyncio.TimeoutError:
-                raise Exception(
-                    f"Timed out waiting for '{expected}' response."
-                )
-            if (
-                msg.get("msg_type") == expected
-                or msg.get(expected)
-                or msg.get("error")
-            ):
+            except TimeoutError:
+                raise Exception(f"Timed out waiting for '{expected}' response.")
+            if msg.get("msg_type") == expected or msg.get(expected) or msg.get("error"):
                 return msg
             logger.debug(f"Skipping frame: {msg.get('msg_type')}")
-        raise Exception(
-            f"No '{expected}' response after {max_frames} frames."
-        )
+        raise Exception(f"No '{expected}' response after {max_frames} frames.")
 
     @staticmethod
     def _raise_trade_error(code: str, msg: str, stage: str):
         hints = {
-            "PermissionDenied": (
-                "Your API token lacks Trade scope. "
-                "Regenerate at app.deriv.com → API Token with Read + Trade."
-            ),
-            "AuthorizationRequired": (
-                "Token expired or missing Trade scope. Regenerate your token."
-            ),
-            "OfferingsValidationError": (
-                f"Symbol/duration not offered at {stage}. "
-                "Check DEMO_EXECUTION_SYMBOL in deriv_trading_service.py."
-            ),
+            "PermissionDenied":        "Token lacks Trade scope. Regenerate at app.deriv.com → API Token.",
+            "AuthorizationRequired":   "Token expired. Regenerate your API token.",
+            "OfferingsValidationError": f"Symbol/duration not offered at {stage}. Check DEMO_EXECUTION_SYMBOL.",
         }
         raise Exception(hints.get(code, f"Trade error [{code}] at {stage}: {msg}"))
 
