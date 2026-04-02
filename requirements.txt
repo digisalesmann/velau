@@ -9,3 +9,4 @@ python-jose[cryptography]
 pwdlib[bcrypt]
 python-multipart
 python-dotenv
+psycopg2-binary

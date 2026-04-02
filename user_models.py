@@ -1,9 +1,6 @@
 """
-User and session management for FastAPI backend.
-
-Auth fix: passlib is unmaintained and broken with bcrypt>=4.0 on Python 3.14
-(AttributeError: module 'bcrypt' has no attribute '__about__').
-Replaced with pwdlib which is actively maintained and works correctly.
+User and session management — now uses database.py for persistence.
+PostgreSQL on Render, SQLite fallback for local dev.
 """
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -12,92 +9,24 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 import os
-import sqlite3
 
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
+from database import get_user, user_exists, create_user
 
 pwd_context = PasswordHash([BcryptHasher()])
-
-SECRET_KEY = os.getenv("SECRET_KEY", "REPLACE_WITH_A_SECURE_RANDOM_KEY")
-ALGORITHM  = "HS256"
+SECRET_KEY  = os.getenv("SECRET_KEY", "REPLACE_WITH_A_SECURE_RANDOM_KEY")
+ALGORITHM   = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
 security = HTTPBearer()
 router   = APIRouter()
 
-
-# ── DB PATH ────────────────────────────────────────────────────────────────────
-def get_db_path() -> str:
-    for path in [
-        "/tmp/users.db",
-        "/var/tmp/users.db",
-        os.path.expanduser("~/users.db"),
-    ]:
-        try:
-            conn = sqlite3.connect(path)
-            conn.execute("CREATE TABLE IF NOT EXISTS _test (id INTEGER)")
-            conn.execute("DROP TABLE _test")
-            conn.close()
-            print(f"Using DB at: {path}")
-            return path
-        except Exception as e:
-            print(f"Cannot use {path}: {e}")
-    raise RuntimeError("No writable path found for SQLite DB")
+# Keep DB_PATH for legacy references in main.py
+DB_PATH = os.getenv("DATABASE_URL", "/tmp/users.db")
 
 
-DB_PATH = get_db_path()
-
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-# ── SCHEMA ─────────────────────────────────────────────────────────────────────
-def init_db():
-    conn = get_db()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username        TEXT PRIMARY KEY,
-            hashed_password TEXT NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol          TEXT,
-            type            TEXT,
-            price           REAL,
-            rsi             REAL,
-            bias            TEXT,
-            reason          TEXT,
-            timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Safe migration for existing deployments — SQLite doesn't support
-    # ALTER TABLE ... ADD COLUMN IF NOT EXISTS so we catch the error
-    try:
-        conn.execute(
-            "ALTER TABLE signals ADD COLUMN confluence_score INTEGER DEFAULT 0"
-        )
-        print("Migrated: added confluence_score to signals")
-    except sqlite3.OperationalError:
-        pass
-
-    conn.commit()
-    conn.close()
-    print("DB initialized successfully")
-
-
-init_db()
-
-
-# ── MODELS ─────────────────────────────────────────────────────────────────────
+# ── Models ─────────────────────────────────────────────────────────────────────
 class User(BaseModel):
     username:        str
     hashed_password: str
@@ -111,7 +40,7 @@ class Token(BaseModel):
     token_type:   str
 
 
-# ── PASSWORD ───────────────────────────────────────────────────────────────────
+# ── Password ───────────────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
@@ -120,9 +49,7 @@ def get_password_hash(password: str) -> str:
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────────
-def create_access_token(
-    data: dict, expires_delta: Optional[timedelta] = None
-) -> str:
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
     expire    = datetime.utcnow() + (
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -131,37 +58,21 @@ def create_access_token(
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
-# ── DB HELPERS ─────────────────────────────────────────────────────────────────
+# ── DB wrappers ────────────────────────────────────────────────────────────────
 def get_user_from_db(username: str) -> Optional[User]:
-    conn = get_db()
-    row  = conn.execute(
-        "SELECT username, hashed_password FROM users WHERE username = ?",
-        (username,),
-    ).fetchone()
-    conn.close()
+    row = get_user(username)
     if row:
         return User(username=row["username"], hashed_password=row["hashed_password"])
     return None
 
 def create_user_in_db(username: str, hashed_password: str):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
-        (username, hashed_password),
-    )
-    conn.commit()
-    conn.close()
+    create_user(username, hashed_password)
 
 def user_exists_in_db(username: str) -> bool:
-    conn = get_db()
-    row  = conn.execute(
-        "SELECT 1 FROM users WHERE username = ?", (username,)
-    ).fetchone()
-    conn.close()
-    return row is not None
+    return user_exists(username)
 
 
-# ── AUTH DEPENDENCY ────────────────────────────────────────────────────────────
+# ── Auth dependency ────────────────────────────────────────────────────────────
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
@@ -171,9 +82,7 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload  = jwt.decode(
-            credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM]
-        )
+        payload  = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
         if not username:
             raise exc
@@ -188,14 +97,12 @@ async def get_current_user(
     return user
 
 
-# ── ROUTES ─────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 @router.post("/register", response_model=Token)
 async def register(user_in: UserIn):
     try:
         if user_exists_in_db(user_in.username):
-            raise HTTPException(
-                status_code=400, detail="Username already registered"
-            )
+            raise HTTPException(status_code=400, detail="Username already registered")
         hashed = get_password_hash(user_in.password)
         create_user_in_db(user_in.username, hashed)
         token = create_access_token(data={"sub": user_in.username})
@@ -215,9 +122,7 @@ async def login(user_in: UserIn):
     try:
         user = get_user_from_db(user_in.username)
         if not user or not verify_password(user_in.password, user.hashed_password):
-            raise HTTPException(
-                status_code=401, detail="Incorrect username or password"
-            )
+            raise HTTPException(status_code=401, detail="Incorrect username or password")
         token = create_access_token(data={"sub": user.username})
         return {"access_token": token, "token_type": "bearer"}
     except HTTPException:

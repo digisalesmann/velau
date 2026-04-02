@@ -2,32 +2,30 @@ from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 import asyncio
-import sqlite3
 import traceback
 from datetime import datetime, date
 from contextlib import asynccontextmanager
 
-from user_models import User, router as users_router, get_current_user, DB_PATH
+from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
+import database as db
 
-# 1. INITIALIZE THE MASTER BOT
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
 
 
 async def _delayed_bot_start(delay: int = 10):
-    print(f"⏳ Bot starts in {delay}s (waiting for server to settle)...")
+    print(f"⏳ Bot starts in {delay}s...")
     await asyncio.sleep(delay)
     await trading_bot.start_bot_loop()
 
 
-# 2. LIFESPAN MANAGER
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
     bot_task = asyncio.create_task(_delayed_bot_start(delay=10))
-    print("🚀 AI Trading Bot Engine queued (10s delay)")
+    print("🚀 AI Trading Bot Engine queued")
     yield
     trading_bot.is_running = False
     if bot_task:
@@ -36,15 +34,14 @@ async def lifespan(app: FastAPI):
             await bot_task
         except asyncio.CancelledError:
             pass
-    print("🛑 AI Trading Bot Engine stopped.")
+    print("🛑 Bot stopped.")
 
 
-# 3. APP
 app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
 
 
-# 4. MODELS
+# ── Models ─────────────────────────────────────────────────────────────────────
 class NewsResponse(BaseModel):
     articles: list
     sentiment: dict
@@ -60,7 +57,6 @@ class DashboardResponse(BaseModel):
     daily_pnl:           float = 0.0
     daily_pnl_percent:   float = 0.0
     market_bias:         str = "Neutral"
-    # Safety state
     circuit_broken:      bool = False
     consecutive_losses:  int = 0
     trade_in_progress:   bool = False
@@ -77,15 +73,15 @@ class TradeRequest(BaseModel):
     action:        Optional[str] = "buy"
 
 
-# 5. ENDPOINTS
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
     return {
-        "status":          "ok",
-        "bot_running":     trading_bot.is_running,
-        "circuit_broken":  trading_bot._circuit_broken,
-        "in_session":      trading_bot._in_trading_session(),
+        "status":         "ok",
+        "bot_running":    trading_bot.is_running,
+        "circuit_broken": trading_bot._circuit_broken,
+        "in_session":     trading_bot._in_trading_session(),
     }
 
 @app.get("/bot/status")
@@ -108,8 +104,8 @@ async def toggle_bot(user=Depends(get_current_user)):
             bot_task.cancel()
         return {"message": "Bot paused", "is_running": False}
     else:
-        trading_bot.is_running       = True
-        trading_bot._circuit_broken  = False  # manual restart resets circuit
+        trading_bot.is_running          = True
+        trading_bot._circuit_broken     = False
         trading_bot._consecutive_losses = 0
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started", "is_running": True}
@@ -124,29 +120,18 @@ async def get_dashboard(user=Depends(get_current_user)):
         history_data = await service.get_statement()
         trades_list  = history_data.get("history", [])
 
+        # Today's trades from Deriv statement
         today_trades = [
             t for t in trades_list
             if datetime.fromtimestamp(t.get("time", 0)).date() == date.today()
         ]
-        trades_today_count = len(today_trades)
-        daily_pnl  = sum(float(t.get("pnl", 0)) for t in today_trades)
-        wins       = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
-        win_rate   = (wins / len(trades_list) * 100) if trades_list else 0.0
+        daily_pnl = sum(float(t.get("pnl", 0)) for t in today_trades)
 
-        market_bias = "Neutral"
-        try:
-            conn   = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT bias FROM signals ORDER BY timestamp DESC LIMIT 1"
-            )
-            row = cursor.fetchone()
-            if row:
-                market_bias = row[0]
-            conn.close()
-        except Exception:
-            pass
+        # Win rate from persistent trade_results table (accurate)
+        stats    = db.get_trade_stats()
+        win_rate = stats["win_rate"]
 
+        market_bias = db.get_latest_bias()
         balance     = account_info.get("balance", 0.0)
         pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
 
@@ -157,7 +142,7 @@ async def get_dashboard(user=Depends(get_current_user)):
             currency=account_info.get("currency", "USD"),
             account_id=account_info.get("account_id"),
             win_rate=round(win_rate, 1),
-            trades_today=trades_today_count,
+            trades_today=len(today_trades),
             daily_pnl=round(daily_pnl, 2),
             daily_pnl_percent=round(pnl_percent, 2),
             market_bias=market_bias,
@@ -184,14 +169,7 @@ async def get_news():
 @app.get("/signals")
 async def get_signals(user=Depends(get_current_user)):
     try:
-        conn   = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM signals ORDER BY timestamp DESC LIMIT 30"
-        )
-        signals = [dict(row) for row in cursor.fetchall()]
-        conn.close()
+        signals = db.get_signals(limit=30)
         return {"signals": signals}
     except Exception as e:
         traceback.print_exc()
@@ -217,8 +195,7 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     service = DerivTradingService()
     try:
         await service.authenticate()
-        ticks = await service.subscribe_ticks(symbol=req.symbol)
-        return ticks
+        return await service.subscribe_ticks(symbol=req.symbol)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -242,41 +219,22 @@ async def get_symbols(user=Depends(get_current_user)):
 @app.post("/trade")
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-
     if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid contract_type '{req.contract_type}'. Must be CALL or PUT.",
-        )
+        raise HTTPException(status_code=400,
+            detail=f"Invalid contract_type '{req.contract_type}'. Must be CALL or PUT.")
     if not req.amount or req.amount <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="amount must be a positive number.",
-        )
+        raise HTTPException(status_code=400, detail="amount must be a positive number.")
 
     service = DerivTradingService()
     try:
         await service.authenticate()
-
         if req.action == "close":
             return {"status": "success", "message": "Position closed."}
-
-        print(
-            f"📲 Manual trade | type={req.contract_type} "
-            f"amount={req.amount} symbol={req.symbol} "
-            f"user={user.username}"
-        )
-
         result = await service.place_order(
             contract_type=req.contract_type.upper(),
-            amount=req.amount,
-            duration=5,
-            symbol=req.symbol,
+            amount=req.amount, duration=5, symbol=req.symbol,
         )
-
-        print(f"✅ Manual trade placed: {result}")
         return result
-
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
