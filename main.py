@@ -17,12 +17,6 @@ bot_task: Optional[asyncio.Task] = None
 
 
 async def _delayed_bot_start(delay: int = 10):
-    """
-    Wait for the server to fully boot before starting the bot loop.
-    On Render cold starts the network stack isn't ready immediately —
-    starting the WebSocket bot before uvicorn finishes its startup
-    causes recv() to get cancelled by the lifespan task runner.
-    """
     print(f"⏳ Bot starts in {delay}s (waiting for server to settle)...")
     await asyncio.sleep(delay)
     await trading_bot.start_bot_loop()
@@ -45,7 +39,7 @@ async def lifespan(app: FastAPI):
     print("🛑 AI Trading Bot Engine stopped.")
 
 
-# 3. INITIALIZE APP
+# 3. APP
 app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
 
@@ -56,16 +50,21 @@ class NewsResponse(BaseModel):
     sentiment: dict
 
 class DashboardResponse(BaseModel):
-    username:         str
-    bot_status:       str
-    balance:          float
-    currency:         str = "USD"
-    account_id:       Optional[str] = None
-    win_rate:         float = 0.0
-    trades_today:     int = 0
-    daily_pnl:        float = 0.0
-    daily_pnl_percent: float = 0.0
-    market_bias:      str = "Neutral"
+    username:            str
+    bot_status:          str
+    balance:             float
+    currency:            str = "USD"
+    account_id:          Optional[str] = None
+    win_rate:            float = 0.0
+    trades_today:        int = 0
+    daily_pnl:           float = 0.0
+    daily_pnl_percent:   float = 0.0
+    market_bias:         str = "Neutral"
+    # Safety state
+    circuit_broken:      bool = False
+    consecutive_losses:  int = 0
+    trade_in_progress:   bool = False
+    in_session:          bool = True
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
@@ -82,11 +81,23 @@ class TradeRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "bot_running": trading_bot.is_running}
+    return {
+        "status":          "ok",
+        "bot_running":     trading_bot.is_running,
+        "circuit_broken":  trading_bot._circuit_broken,
+        "in_session":      trading_bot._in_trading_session(),
+    }
 
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
-    return {"is_running": trading_bot.is_running}
+    return {
+        "is_running":         trading_bot.is_running,
+        "circuit_broken":     trading_bot._circuit_broken,
+        "consecutive_losses": trading_bot._consecutive_losses,
+        "trade_in_progress":  trading_bot._trade_in_progress,
+        "daily_pnl":          trading_bot._daily_pnl,
+        "in_session":         trading_bot._in_trading_session(),
+    }
 
 @app.post("/bot/toggle")
 async def toggle_bot(user=Depends(get_current_user)):
@@ -97,7 +108,9 @@ async def toggle_bot(user=Depends(get_current_user)):
             bot_task.cancel()
         return {"message": "Bot paused", "is_running": False}
     else:
-        trading_bot.is_running = True
+        trading_bot.is_running       = True
+        trading_bot._circuit_broken  = False  # manual restart resets circuit
+        trading_bot._consecutive_losses = 0
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started", "is_running": True}
 
@@ -148,6 +161,10 @@ async def get_dashboard(user=Depends(get_current_user)):
             daily_pnl=round(daily_pnl, 2),
             daily_pnl_percent=round(pnl_percent, 2),
             market_bias=market_bias,
+            circuit_broken=trading_bot._circuit_broken,
+            consecutive_losses=trading_bot._consecutive_losses,
+            trade_in_progress=trading_bot._trade_in_progress,
+            in_session=trading_bot._in_trading_session(),
         )
     except Exception as e:
         traceback.print_exc()
