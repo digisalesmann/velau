@@ -1,26 +1,30 @@
 """
 User and session management for FastAPI backend.
 
-Fix: switched from argon2 to bcrypt — argon2-cffi is not in requirements
-and fails silently on Render, causing all /register calls to 500.
+Auth fix: passlib is unmaintained and broken with bcrypt>=4.0 on Python 3.14
+(AttributeError: module 'bcrypt' has no attribute '__about__').
+Replaced with pwdlib which is actively maintained and works correctly.
 """
 from fastapi import APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 import os
 import sqlite3
 
+from pwdlib import PasswordHash
+from pwdlib.hashers.bcrypt import BcryptHasher
+
+pwd_context = PasswordHash([BcryptHasher()])
+
 SECRET_KEY = os.getenv("SECRET_KEY", "REPLACE_WITH_A_SECURE_RANDOM_KEY")
 ALGORITHM  = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days so app stays logged in
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security    = HTTPBearer()
-router      = APIRouter()
+security = HTTPBearer()
+router   = APIRouter()
 
 
 # ── DB PATH ────────────────────────────────────────────────────────────────────
@@ -51,11 +55,10 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-# ── SCHEMA INIT ────────────────────────────────────────────────────────────────
+# ── SCHEMA ─────────────────────────────────────────────────────────────────────
 def init_db():
     conn = get_db()
 
-    # Users table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username        TEXT PRIMARY KEY,
@@ -63,31 +66,28 @@ def init_db():
         )
     """)
 
-    # Signals table — full schema
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol    TEXT,
-            type      TEXT,
-            price     REAL,
-            rsi       REAL,
-            bias      TEXT,
-            reason    TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol          TEXT,
+            type            TEXT,
+            price           REAL,
+            rsi             REAL,
+            bias            TEXT,
+            reason          TEXT,
+            timestamp       DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Safe migration: add confluence_score column if it doesn't exist yet.
-    # This handles existing deployments where the table was already created
-    # without this column — SQLite doesn't support IF NOT EXISTS on ALTER TABLE
-    # so we catch the OperationalError gracefully.
+    # Safe migration for existing deployments — SQLite doesn't support
+    # ALTER TABLE ... ADD COLUMN IF NOT EXISTS so we catch the error
     try:
         conn.execute(
             "ALTER TABLE signals ADD COLUMN confluence_score INTEGER DEFAULT 0"
         )
-        print("Migrated: added confluence_score column to signals table")
+        print("Migrated: added confluence_score to signals")
     except sqlite3.OperationalError:
-        pass  # Column already exists — normal on re-deploys
+        pass
 
     conn.commit()
     conn.close()
@@ -111,13 +111,15 @@ class Token(BaseModel):
     token_type:   str
 
 
-# ── HELPERS ────────────────────────────────────────────────────────────────────
+# ── PASSWORD ───────────────────────────────────────────────────────────────────
 def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
+
+# ── JWT ────────────────────────────────────────────────────────────────────────
 def create_access_token(
     data: dict, expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -128,6 +130,8 @@ def create_access_token(
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+
+# ── DB HELPERS ─────────────────────────────────────────────────────────────────
 def get_user_from_db(username: str) -> Optional[User]:
     conn = get_db()
     row  = conn.execute(
@@ -135,7 +139,9 @@ def get_user_from_db(username: str) -> Optional[User]:
         (username,),
     ).fetchone()
     conn.close()
-    return User(username=row["username"], hashed_password=row["hashed_password"]) if row else None
+    if row:
+        return User(username=row["username"], hashed_password=row["hashed_password"])
+    return None
 
 def create_user_in_db(username: str, hashed_password: str):
     conn = get_db()
@@ -199,7 +205,8 @@ async def register(user_in: UserIn):
     except Exception:
         import traceback
         raise HTTPException(
-            status_code=500, detail=f"Register error: {traceback.format_exc()}"
+            status_code=500,
+            detail=f"Register error: {traceback.format_exc()}",
         )
 
 
@@ -218,5 +225,6 @@ async def login(user_in: UserIn):
     except Exception:
         import traceback
         raise HTTPException(
-            status_code=500, detail=f"Login error: {traceback.format_exc()}"
+            status_code=500,
+            detail=f"Login error: {traceback.format_exc()}",
         )

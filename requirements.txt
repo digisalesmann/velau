@@ -6,7 +6,6 @@ pandas
 ta
 vaderSentiment
 python-jose[cryptography]
-passlib[bcrypt]
-bcrypt
+pwdlib[bcrypt]
 python-multipart
 python-dotenv

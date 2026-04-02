@@ -15,17 +15,35 @@ from core.strategy_engine import XAUMasterStrategy
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
 
+
+async def _delayed_bot_start(delay: int = 10):
+    """
+    Wait for the server to fully boot before starting the bot loop.
+    On Render cold starts the network stack isn't ready immediately —
+    starting the WebSocket bot before uvicorn finishes its startup
+    causes recv() to get cancelled by the lifespan task runner.
+    """
+    print(f"⏳ Bot starts in {delay}s (waiting for server to settle)...")
+    await asyncio.sleep(delay)
+    await trading_bot.start_bot_loop()
+
+
 # 2. LIFESPAN MANAGER
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
-    bot_task = asyncio.create_task(trading_bot.start_bot_loop())
-    print("🚀 AI Trading Bot Engine Started!")
+    bot_task = asyncio.create_task(_delayed_bot_start(delay=10))
+    print("🚀 AI Trading Bot Engine queued (10s delay)")
     yield
     trading_bot.is_running = False
     if bot_task:
         bot_task.cancel()
-    print("🛑 AI Trading Bot Engine Stopped.")
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
+    print("🛑 AI Trading Bot Engine stopped.")
+
 
 # 3. INITIALIZE APP
 app = FastAPI(lifespan=lifespan)
@@ -38,26 +56,26 @@ class NewsResponse(BaseModel):
     sentiment: dict
 
 class DashboardResponse(BaseModel):
-    username: str
-    bot_status: str
-    balance: float
-    currency: str = "USD"
-    account_id: Optional[str] = None
-    win_rate: float = 0.0
-    trades_today: int = 0
-    daily_pnl: float = 0.0
+    username:         str
+    bot_status:       str
+    balance:          float
+    currency:         str = "USD"
+    account_id:       Optional[str] = None
+    win_rate:         float = 0.0
+    trades_today:     int = 0
+    daily_pnl:        float = 0.0
     daily_pnl_percent: float = 0.0
-    market_bias: str = "Neutral"
+    market_bias:      str = "Neutral"
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
 
 class TradeRequest(BaseModel):
     contract_type: Optional[str] = None
-    amount: Optional[float] = None
-    duration: Optional[int] = None
-    symbol: str = "frxXAUUSD"
-    action: Optional[str] = "buy"
+    amount:        Optional[float] = None
+    duration:      Optional[int] = None
+    symbol:        str = "frxXAUUSD"
+    action:        Optional[str] = "buy"
 
 
 # 5. ENDPOINTS
@@ -91,20 +109,20 @@ async def get_dashboard(user=Depends(get_current_user)):
         await service.authenticate()
         account_info = await service.get_account_info()
         history_data = await service.get_statement()
-        trades_list = history_data.get("history", [])
+        trades_list  = history_data.get("history", [])
 
         today_trades = [
             t for t in trades_list
             if datetime.fromtimestamp(t.get("time", 0)).date() == date.today()
         ]
         trades_today_count = len(today_trades)
-        daily_pnl = sum(float(t.get("pnl", 0)) for t in today_trades)
-        wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
-        win_rate = (wins / len(trades_list) * 100) if trades_list else 0.0
+        daily_pnl  = sum(float(t.get("pnl", 0)) for t in today_trades)
+        wins       = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
+        win_rate   = (wins / len(trades_list) * 100) if trades_list else 0.0
 
         market_bias = "Neutral"
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn   = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT bias FROM signals ORDER BY timestamp DESC LIMIT 1"
@@ -116,7 +134,7 @@ async def get_dashboard(user=Depends(get_current_user)):
         except Exception:
             pass
 
-        balance = account_info.get("balance", 0.0)
+        balance     = account_info.get("balance", 0.0)
         pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
 
         return DashboardResponse(
@@ -149,7 +167,7 @@ async def get_news():
 @app.get("/signals")
 async def get_signals(user=Depends(get_current_user)):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn   = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -190,9 +208,6 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     finally:
         await service.close()
 
-# --- Diagnostic endpoint: see what symbols your account can trade ---
-# Hit GET /symbols once after deploy to verify your VRW account's
-# available symbols, then remove or secure this endpoint.
 @app.get("/symbols")
 async def get_symbols(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
@@ -238,7 +253,7 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         result = await service.place_order(
             contract_type=req.contract_type.upper(),
             amount=req.amount,
-            duration=5,  # passed but internally clamped to ticks
+            duration=5,
             symbol=req.symbol,
         )
 
