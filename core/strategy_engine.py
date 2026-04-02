@@ -13,7 +13,7 @@ from ta.volatility import AverageTrueRange
 from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 import database as db
-import notifications as notif
+import notification as notif
 
 logger = logging.getLogger("XAUStrategy")
 
