@@ -1,12 +1,19 @@
 """
-Deriv WebSocket client — Python 3.14 compatible.
+Deriv WebSocket client — Python 3.14 safe.
 
-Fix: asyncio.wait_for() has a known interaction with websockets on Python 3.14
-where CancelledError propagates incorrectly through the recv() coroutine,
-causing spurious TimeoutError even when the connection is healthy.
+Root cause of all timeout issues:
+  Python 3.14 changed how CancelledError propagates through async generators.
+  websockets uses an async generator internally for recv(). Both
+  asyncio.wait_for() and asyncio.timeout() wrap their body in a task/scope
+  that catches CancelledError — but when websockets propagates CancelledError
+  upward through its generator, both wrappers misinterpret it as a timeout.
 
-Solution: use `async with asyncio.timeout(n)` (native since Python 3.11)
-which handles cancellation correctly inside websockets' async generator.
+Solution:
+  Wrap recv() in a plain asyncio.Task and use asyncio.wait() with a timeout.
+  asyncio.wait() does NOT cancel the underlying task on timeout — it just
+  stops waiting. We then cancel explicitly only if it actually timed out.
+  This gives us real timeout behaviour without interfering with websockets'
+  internal cancellation handling.
 """
 import asyncio
 import websockets
@@ -30,13 +37,11 @@ class DerivWebSocket:
             self.ws_url = (
                 f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
             )
-
         self.connection  = None
         self.max_retries = max_retries
 
     async def connect(self):
         last_error = None
-
         for attempt in range(self.max_retries):
             try:
                 self.connection = await websockets.connect(
@@ -52,7 +57,6 @@ class DerivWebSocket:
                 )
                 logger.info(f"✅ WebSocket connected (attempt {attempt + 1})")
                 return self.connection
-
             except Exception as e:
                 last_error = e
                 wait = min(2 ** (attempt + 1), 30)
@@ -61,7 +65,6 @@ class DerivWebSocket:
                     f"Retrying in {wait}s..."
                 )
                 await asyncio.sleep(wait)
-
         raise ConnectionError(
             f"WebSocket failed after {self.max_retries} attempts. Last: {last_error}"
         )
@@ -74,30 +77,54 @@ class DerivWebSocket:
 
     async def receive(self, timeout: float = 20.0) -> dict:
         """
-        Receive next frame with timeout.
+        Receive next WebSocket frame with a real timeout.
 
-        Uses `async with asyncio.timeout()` instead of `asyncio.wait_for()`
-        to avoid the CancelledError → TimeoutError mis-propagation in
-        Python 3.14 + websockets.
+        Uses asyncio.wait() on a Task wrapping recv() — this is the only
+        approach that correctly handles Python 3.14 + websockets because:
+
+        1. The Task runs recv() in isolation from our timeout logic.
+        2. asyncio.wait() with a timeout returns PENDING sets without
+           cancelling the task automatically.
+        3. We cancel explicitly only when we know it actually timed out.
+        4. CancelledError from websockets' internal generator never
+           leaks into our timeout handling.
         """
         if not self.connection:
             raise Exception("WebSocket not connected.")
 
+        loop = asyncio.get_event_loop()
+        recv_task = loop.create_task(self.connection.recv())
+
         try:
-            async with asyncio.timeout(timeout):
-                raw = await self.connection.recv()
-            msg = json.loads(raw)
-            logger.debug(f"← msg_type={msg.get('msg_type', '?')}")
-            return msg
-        except TimeoutError:
+            done, pending = await asyncio.wait(
+                {recv_task},
+                timeout=timeout,
+            )
+        except asyncio.CancelledError:
+            # Our own task was cancelled from outside — clean up and re-raise
+            recv_task.cancel()
+            raise
+
+        if recv_task in pending:
+            # Genuine timeout — cancel the recv task and raise
+            recv_task.cancel()
+            try:
+                await recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
             raise TimeoutError(
                 f"WebSocket receive timed out after {timeout}s"
             )
-        except asyncio.CancelledError:
-            # Re-raise cancellation — don't swallow it
-            raise
-        except Exception as e:
-            raise Exception(f"WebSocket receive error: {e}") from e
+
+        # Task completed — get result or propagate exception
+        exc = recv_task.exception()
+        if exc:
+            raise exc
+
+        raw = recv_task.result()
+        msg = json.loads(raw)
+        logger.debug(f"← msg_type={msg.get('msg_type', '?')}")
+        return msg
 
     async def close(self):
         if self.connection:
