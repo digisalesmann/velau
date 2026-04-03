@@ -1,9 +1,18 @@
 # MT5 live trading integration
 
-import MetaTrader5 as mt5
+import logging
+
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None
+    logging.warning("MetaTrader5 is not installed; MT5 trading is disabled")
+
 from config import settings
 
 def connect_mt5():
+    if mt5 is None:
+        raise RuntimeError("MetaTrader5 is not installed")
     if not mt5.initialize(server=settings.MT5_SERVER, login=int(settings.MT5_LOGIN), password=settings.MT5_PASSWORD):
         raise Exception(f"MT5 initialization failed: {mt5.last_error()}")
     return True

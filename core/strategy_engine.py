@@ -1,13 +1,6 @@
 """
 XAU Master Strategy — production engine.
 """
-import sys
-import os
-
-# Add project root to path so root-level modules (database, notifications)
-# are importable from within the core/ subdirectory
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import asyncio
 import logging
 import pandas as pd
@@ -20,7 +13,7 @@ from ta.volatility import AverageTrueRange
 from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 import database as db
-import notifications as notif
+from . import notifications as notif
 
 logger = logging.getLogger("XAUStrategy")
 

@@ -21,7 +21,7 @@ from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
-import notifications as notif   # ✅ fixed: was "notification"
+from core import notifications as notif
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
