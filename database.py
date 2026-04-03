@@ -1,12 +1,12 @@
 """
 database.py — persistent storage layer.
 
-Uses PostgreSQL (via DATABASE_URL env var on Render) with automatic
-fallback to SQLite for local development.
+PostgreSQL on Render (DATABASE_URL), SQLite fallback for local dev.
 
-Fix: all numeric values are explicitly cast to float() / int() before
-insert — PostgreSQL rejects numpy scalar types (np.float64, np.int64)
-which pandas returns from DataFrame operations.
+Key fix: all numeric values are cast to native Python float()/int()/str()
+before insert. PostgreSQL rejects numpy scalar types (np.float64, np.int64)
+that pandas returns from DataFrame .iloc[] row access — it tries to interpret
+the type name as a schema, producing "schema 'np' does not exist".
 """
 import os
 import logging
@@ -14,7 +14,7 @@ from contextlib import contextmanager
 
 logger = logging.getLogger("Database")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL  = os.getenv("DATABASE_URL", "")
 _USE_POSTGRES = bool(DATABASE_URL)
 
 if _USE_POSTGRES:
@@ -26,16 +26,16 @@ else:
     logger.warning("⚠️  DATABASE_URL not set — falling back to SQLite")
 
 
-# ── Connection factory ─────────────────────────────────────────────────────────
+# ── Connection ─────────────────────────────────────────────────────────────────
 
 @contextmanager
 def get_conn():
     if _USE_POSTGRES:
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     else:
-        conn = _get_sqlite()
+        conn = _sqlite_conn()
         cur  = conn.cursor()
     try:
         yield conn, cur
@@ -48,28 +48,27 @@ def get_conn():
         conn.close()
 
 
-def _get_sqlite():
+def _sqlite_conn():
     import sqlite3
-    for path in ["/tmp/users.db", "/var/tmp/users.db", os.path.expanduser("~/users.db")]:
+    for path in ["/tmp/users.db", "/var/tmp/users.db",
+                 os.path.expanduser("~/users.db")]:
         try:
-            conn = sqlite3.connect(path)
-            conn.row_factory = sqlite3.Row
-            return conn
+            c = sqlite3.connect(path)
+            c.row_factory = sqlite3.Row
+            return c
         except Exception:
             continue
-    raise RuntimeError("No writable SQLite path found")
+    raise RuntimeError("No writable SQLite path")
 
 
 def _ph():
-    """Return the correct placeholder token for the active DB."""
     return "%s" if _USE_POSTGRES else "?"
 
 
-# ── Schema init ────────────────────────────────────────────────────────────────
+# ── Schema ─────────────────────────────────────────────────────────────────────
 
 def init_db():
     with get_conn() as (conn, cur):
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 username        TEXT PRIMARY KEY,
@@ -126,54 +125,44 @@ def init_db():
                     timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Safe SQLite migrations
-            _safe_add_column(cur, "signals", "confluence_score", "INTEGER DEFAULT 0")
-            _safe_add_column(cur, "trade_results", "symbol", "TEXT DEFAULT '1HZ100V'")
+            _add_col(cur, "signals",       "confluence_score", "INTEGER DEFAULT 0")
+            _add_col(cur, "trade_results", "symbol",           "TEXT DEFAULT '1HZ100V'")
 
-    logger.info(f"✅ DB initialized ({'PostgreSQL' if _USE_POSTGRES else 'SQLite'})")
+    logger.info(f"✅ DB ready ({'PostgreSQL' if _USE_POSTGRES else 'SQLite'})")
 
 
-def _safe_add_column(cur, table, column, definition):
+def _add_col(cur, table, col, defn):
     try:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
     except Exception:
         pass
 
 
-# ── Generic query helpers ──────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def fetchall(sql: str, params: tuple = ()) -> list[dict]:
     with get_conn() as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        return [dict(r) for r in cur.fetchall()]
 
 def fetchone(sql: str, params: tuple = ()) -> dict | None:
     with get_conn() as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
-        row = cur.fetchone()
-        return dict(row) if row else None
+        r = cur.fetchone()
+        return dict(r) if r else None
 
 def execute(sql: str, params: tuple = ()):
     with get_conn() as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
 
 
-# ── Domain helpers ─────────────────────────────────────────────────────────────
+# ── Domain ─────────────────────────────────────────────────────────────────────
 
-def insert_signal(
-    symbol: str,
-    sig_type: str,
-    price: float,
-    rsi: float,
-    bias: str,
-    reason: str,
-    confluence_score: int = 0,
-):
+def insert_signal(symbol, sig_type, price, rsi, bias, reason, confluence_score=0):
     """
-    Insert a signal row. All numeric values are explicitly cast to native
-    Python types — PostgreSQL rejects numpy scalars (np.float64, np.int64)
-    that pandas returns from DataFrame row access.
+    Cast all values to native Python types before insert.
+    pandas returns np.float64/np.int64 from DataFrame rows — PostgreSQL
+    rejects these and misreads the type name as a schema identifier.
     """
     execute(
         """
@@ -183,25 +172,24 @@ def insert_signal(
         (
             str(symbol),
             str(sig_type),
-            float(price),           # cast np.float64 → float
-            float(rsi),             # cast np.float64 → float
+            float(price),
+            float(rsi),
             str(bias),
             str(reason),
-            int(confluence_score),  # cast np.int64  → int
+            int(confluence_score),
         ),
     )
 
 def get_signals(limit: int = 30) -> list[dict]:
     return fetchall(
-        "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?",
-        (limit,),
+        "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
     )
 
 def get_latest_bias() -> str:
     row = fetchone("SELECT bias FROM signals ORDER BY timestamp DESC LIMIT 1")
     return row["bias"] if row else "Neutral"
 
-def insert_trade_result(contract_id: str, won: bool, pnl: float, symbol: str = "1HZ100V"):
+def insert_trade_result(contract_id, won, pnl, symbol="1HZ100V"):
     if _USE_POSTGRES:
         execute(
             """
@@ -219,10 +207,9 @@ def insert_trade_result(contract_id: str, won: bool, pnl: float, symbol: str = "
 
 def get_trade_stats() -> dict:
     row = fetchone("""
-        SELECT
-            COUNT(*)                                      AS total,
-            SUM(CASE WHEN won THEN 1 ELSE 0 END)         AS wins,
-            COALESCE(SUM(pnl), 0)                        AS total_pnl
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
+               COALESCE(SUM(pnl), 0) AS total_pnl
         FROM trade_results
     """)
     if not row or not row["total"]:
@@ -235,26 +222,22 @@ def get_trade_stats() -> dict:
         "total_pnl":    round(float(row["total_pnl"]), 2),
     }
 
-
-# ── User helpers ───────────────────────────────────────────────────────────────
-
-def get_user(username: str) -> dict | None:
+def get_user(username):
     return fetchone(
         "SELECT username, hashed_password FROM users WHERE username = ?",
         (username,),
     )
 
-def user_exists(username: str) -> bool:
+def user_exists(username):
     return fetchone(
         "SELECT 1 FROM users WHERE username = ?", (username,)
     ) is not None
 
-def create_user(username: str, hashed_password: str):
+def create_user(username, hashed_password):
     execute(
         "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
         (username, hashed_password),
     )
 
 
-# Initialise on import
 init_db()
