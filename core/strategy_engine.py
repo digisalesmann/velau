@@ -1,7 +1,13 @@
 """
 XAU Master Strategy — production engine.
-Fix: import notifications (not notification) — typo was silently killing the bot.
 """
+import sys
+import os
+
+# Add project root to path so root-level modules (database, notifications)
+# are importable from within the core/ subdirectory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import logging
 import pandas as pd
@@ -14,7 +20,7 @@ from ta.volatility import AverageTrueRange
 from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 import database as db
-import notifications as notif   # ✅ fixed: was "notification"
+import notifications as notif
 
 logger = logging.getLogger("XAUStrategy")
 
@@ -237,7 +243,7 @@ class XAUMasterStrategy:
 
             if self._circuit_broken:
                 self.save_signal("NEUTRAL", 0, 0, "N/A",
-                    f"Circuit breaker active. Resumes tomorrow.", 0)
+                    "Circuit breaker active. Resumes tomorrow.", 0)
                 return
 
             if self._trade_in_progress:
@@ -299,7 +305,7 @@ class XAUMasterStrategy:
                 else:
                     self.save_signal("NEUTRAL", price, rsi, market_bias,
                         f"5M bullish ({bull_score}/7) blocked by 1H downtrend", bull_score)
-                    logger.info("⏳ Blocked by 1H bearish trend")
+                    logger.info("⏳ Blocked by 1H bearish")
                     return
 
             elif bear_score >= MIN_CONFLUENCE and bear_score > bull_score:
@@ -309,7 +315,7 @@ class XAUMasterStrategy:
                 else:
                     self.save_signal("NEUTRAL", price, rsi, market_bias,
                         f"5M bearish ({bear_score}/7) blocked by 1H uptrend", bear_score)
-                    logger.info("⏳ Blocked by 1H bullish trend")
+                    logger.info("⏳ Blocked by 1H bullish")
                     return
 
             if direction:
