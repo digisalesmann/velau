@@ -1,33 +1,52 @@
-from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel
-from typing import Optional
+import logging
 import asyncio
 import traceback
 from datetime import datetime, date
 from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel
+
+# ── Logging must be configured BEFORE anything else ───────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+logger = logging.getLogger("Main")
 
 from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
-import notification as notif
+import notifications as notif   # ✅ fixed: was "notification"
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
 
 
-async def _delayed_bot_start(delay: int = 10):
-    print(f"⏳ Bot starts in {delay}s...")
+async def _bot_runner(delay: int = 10):
+    logger.info(f"⏳ Bot starts in {delay}s...")
     await asyncio.sleep(delay)
-    await trading_bot.start_bot_loop()
+    logger.info("🤖 Bot loop starting now")
+    try:
+        await trading_bot.start_bot_loop()
+    except asyncio.CancelledError:
+        logger.info("Bot task cancelled cleanly")
+    except Exception as e:
+        logger.error(f"Bot loop fatal error: {e}")
+        traceback.print_exc()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
-    bot_task = asyncio.create_task(_delayed_bot_start(delay=10))
-    print("🚀 AI Trading Bot Engine queued")
+    logger.info("🚀 FastAPI startup — queueing bot")
+    bot_task = asyncio.create_task(_bot_runner(delay=10))
     yield
+    logger.info("🛑 FastAPI shutdown — stopping bot")
     trading_bot.is_running = False
     if bot_task:
         bot_task.cancel()
@@ -35,7 +54,6 @@ async def lifespan(app: FastAPI):
             await bot_task
         except asyncio.CancelledError:
             pass
-    print("🛑 Bot stopped.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -88,10 +106,8 @@ async def root():
         "in_session":     trading_bot._in_trading_session(),
     }
 
-# ── Push notification registration ────────────────────────────────────────────
 @app.post("/notifications/register")
 async def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
-    """Called by Flutter app on startup to register the device FCM token."""
     notif.register_token(req.token)
     return {"status": "registered"}
 
@@ -100,7 +116,6 @@ async def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
     notif.unregister_token(req.token)
     return {"status": "unregistered"}
 
-# ── Bot control ────────────────────────────────────────────────────────────────
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
     return {
@@ -127,7 +142,6 @@ async def toggle_bot(user=Depends(get_current_user)):
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started", "is_running": True}
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
@@ -219,7 +233,7 @@ async def get_symbols(user=Depends(get_current_user)):
     service = DerivTradingService()
     try:
         await service.authenticate()
-        return {"count": 0, "symbols": await service.get_available_symbols()}
+        return {"symbols": await service.get_available_symbols()}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -234,7 +248,6 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
             detail=f"Invalid contract_type '{req.contract_type}'.")
     if not req.amount or req.amount <= 0:
         raise HTTPException(status_code=400, detail="amount must be positive.")
-
     service = DerivTradingService()
     try:
         await service.authenticate()
