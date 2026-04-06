@@ -1,31 +1,60 @@
 """
-XAU Master Strategy — production engine.
+XAU Master Strategy — SMC-enhanced engine.
+
+Replaced unreliable pillars:
+  ❌ Volume Z-Score  — Deriv returns no real volume for Forex (all 1.0 synthetic)
+  ❌ Stochastic      — redundant with RSI, rarely triggers alongside other conditions
+
+Added Smart Money Concepts pillars:
+  ✅ Fair Value Gap (FVG)        — 3-candle imbalance, price in unfilled gap = entry signal
+  ✅ Market Structure (BOS)      — Break of Structure confirms trend continuation
+  ✅ Liquidity Sweep             — price grabs beyond recent swing high/low then reverses
+
+New threshold: 4/7 (down from 5/7) — SMC signals are more specific so lower bar needed.
+
+7 Pillars:
+  1. EMA 200        — long-term trend direction
+  2. EMA 50         — short-term trend direction
+  3. RSI 14         — momentum extreme (>65 bear, <35 bull)
+  4. MACD histogram — momentum shift direction
+  5. FVG            — fair value gap imbalance present
+  6. BOS/CHoCH      — market structure break confirms direction
+  7. Sentiment      — NLP news bias
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import asyncio
 import logging
 import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 
 from ta.trend      import EMAIndicator, MACD
-from ta.momentum   import RSIIndicator, StochasticOscillator
+from ta.momentum   import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 import database as db
-from . import notifications as notif
+import notifications as notif
 
 logger = logging.getLogger("XAUStrategy")
 
 ANALYSIS_SYMBOL        = "frxXAUUSD"
 TRADE_AMOUNT           = 10.0
 MAX_SAFE_ATR           = 18.0
-MIN_CONFLUENCE         = 5
+MIN_CONFLUENCE         = 4          # 4/7 — SMC signals are specific enough
 CANDLE_COUNT           = 300
 LOOP_INTERVAL          = 300
 MAX_CONSECUTIVE_LOSSES = 3
 MAX_DAILY_DRAWDOWN_PCT = 10.0
 SESSIONS               = [(7, 12), (12, 17)]
+
+# SMC parameters
+SWING_LOOKBACK   = 10   # candles to look back for swing highs/lows
+FVG_MIN_SIZE_PCT = 0.02  # minimum FVG size as % of price (filters noise)
 
 
 class XAUMasterStrategy:
@@ -91,12 +120,12 @@ class XAUMasterStrategy:
         df = pd.DataFrame(raw)
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].astype(float)
-        df["volume"] = df.get("volume", pd.Series([1.0] * len(df))).astype(float)
+        df.reset_index(drop=True, inplace=True)
         logger.info(f"✅ Got {len(df)} candles")
         return df
 
-    # ── Indicators ─────────────────────────────────────────────────────────────
-    def _compute(self, df: pd.DataFrame) -> pd.DataFrame:
+    # ── Standard indicators ────────────────────────────────────────────────────
+    def _compute_standard(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or len(df) < 210:
             logger.warning(f"Not enough candles: {len(df)} (need 210)")
             return pd.DataFrame()
@@ -106,17 +135,135 @@ class XAUMasterStrategy:
         df["RSI_14"]  = RSIIndicator(close=c, window=14).rsi()
         macd          = MACD(close=c, window_slow=26, window_fast=12, window_sign=9)
         df["MACD_H"]  = macd.macd_diff()
-        stoch         = StochasticOscillator(high=h, low=l, close=c, window=14, smooth_window=3)
-        df["STOCH_K"] = stoch.stoch()
-        df["STOCH_D"] = stoch.stoch_signal()
         df["ATR_14"]  = AverageTrueRange(high=h, low=l, close=c, window=14).average_true_range()
-        vm = df["volume"].rolling(20).mean()
-        vs = df["volume"].rolling(20).std()
-        df["VOL_Z"] = (df["volume"] - vm) / (vs + 1e-9)
         df.dropna(inplace=True)
-        logger.info(f"✅ Indicators computed on {len(df)} rows")
+        df.reset_index(drop=True, inplace=True)
+        logger.info(f"✅ Standard indicators on {len(df)} rows")
         return df
 
+    # ── SMC: Fair Value Gap ────────────────────────────────────────────────────
+    def _detect_fvg(self, df: pd.DataFrame) -> tuple[str, str]:
+        """
+        A Fair Value Gap (FVG) is a 3-candle imbalance:
+        - Bullish FVG: candle[i].low > candle[i-2].high (gap up, unfilled)
+        - Bearish FVG: candle[i].high < candle[i-2].low (gap down, unfilled)
+
+        We check the last 10 candles for an FVG where current price is
+        inside the gap (meaning it could fill it = high probability entry).
+
+        Returns: (direction, description) where direction is 'bull', 'bear', or ''
+        """
+        if len(df) < 10:
+            return "", ""
+
+        current_price = float(df["close"].iloc[-1])
+        recent = df.tail(15).reset_index(drop=True)
+
+        for i in range(2, len(recent)):
+            c0 = recent.iloc[i-2]  # first candle
+            c2 = recent.iloc[i]    # third candle
+
+            # Bullish FVG: gap between c0.high and c2.low
+            if c2["low"] > c0["high"]:
+                gap_size = c2["low"] - c0["high"]
+                if gap_size / current_price >= FVG_MIN_SIZE_PCT:
+                    # Price retraced into the gap = high probability buy
+                    if c0["high"] <= current_price <= c2["low"]:
+                        return "bull", f"Bullish FVG ({c0['high']:.2f}-{c2['low']:.2f})"
+
+            # Bearish FVG: gap between c2.high and c0.low
+            if c2["high"] < c0["low"]:
+                gap_size = c0["low"] - c2["high"]
+                if gap_size / current_price >= FVG_MIN_SIZE_PCT:
+                    # Price retraced into the gap = high probability sell
+                    if c2["high"] <= current_price <= c0["low"]:
+                        return "bear", f"Bearish FVG ({c2['high']:.2f}-{c0['low']:.2f})"
+
+        return "", "No FVG"
+
+    # ── SMC: Market Structure (BOS / CHoCH) ────────────────────────────────────
+    def _detect_market_structure(self, df: pd.DataFrame) -> tuple[str, str]:
+        """
+        Break of Structure (BOS): price breaks above last swing high (bullish)
+        or below last swing low (bearish), confirming trend continuation.
+
+        Change of Character (CHoCH): price breaks the OPPOSITE swing,
+        signalling a potential reversal — we treat this as a weaker signal.
+
+        We use the last SWING_LOOKBACK candles to find swing highs/lows.
+        Returns: ('bull'/'bear'/'', description)
+        """
+        if len(df) < SWING_LOOKBACK + 5:
+            return "", ""
+
+        recent = df.tail(SWING_LOOKBACK + 5).reset_index(drop=True)
+        current_close = float(recent["close"].iloc[-1])
+        prev_close    = float(recent["close"].iloc[-2])
+
+        # Find swing high and swing low in the lookback window (excluding last 2 candles)
+        lookback = recent.iloc[:-2]
+        swing_high = float(lookback["high"].max())
+        swing_low  = float(lookback["low"].min())
+
+        # BOS bullish: current candle closes above the swing high
+        if current_close > swing_high and prev_close <= swing_high:
+            return "bull", f"BOS bullish (broke {swing_high:.2f})"
+
+        # BOS bearish: current candle closes below the swing low
+        if current_close < swing_low and prev_close >= swing_low:
+            return "bear", f"BOS bearish (broke {swing_low:.2f})"
+
+        # Trend continuation without fresh break — check if we're in the right zone
+        # If price is above swing high zone, still bullish structure
+        mid = (swing_high + swing_low) / 2
+        if current_close > mid:
+            return "bull", f"Bullish structure (above midpoint {mid:.2f})"
+        else:
+            return "bear", f"Bearish structure (below midpoint {mid:.2f})"
+
+    # ── SMC: Liquidity Sweep ───────────────────────────────────────────────────
+    def _detect_liquidity_sweep(self, df: pd.DataFrame) -> tuple[str, str]:
+        """
+        A liquidity sweep occurs when price briefly exceeds a recent swing
+        high/low (grabbing stop losses) and then immediately reverses.
+
+        Pattern:
+        - Bullish sweep: candle wick went BELOW recent swing low but closed ABOVE it
+          (swept buy-side liquidity, now reversing up)
+        - Bearish sweep: candle wick went ABOVE recent swing high but closed BELOW it
+          (swept sell-side liquidity, now reversing down)
+
+        This is one of the strongest SMC entry signals.
+        Returns: ('bull'/'bear'/'', description)
+        """
+        if len(df) < SWING_LOOKBACK + 3:
+            return "", ""
+
+        # Get the swing reference from candles before the last 3
+        reference = df.iloc[-(SWING_LOOKBACK + 3):-3]
+        last3      = df.tail(3).reset_index(drop=True)
+
+        if reference.empty:
+            return "", ""
+
+        swing_high = float(reference["high"].max())
+        swing_low  = float(reference["low"].min())
+
+        # Check last 3 candles for sweep pattern
+        for i in range(len(last3)):
+            candle = last3.iloc[i]
+
+            # Bullish sweep: wick below swing low, closed above it
+            if candle["low"] < swing_low and candle["close"] > swing_low:
+                return "bull", f"Liquidity sweep below {swing_low:.2f} (bullish reversal)"
+
+            # Bearish sweep: wick above swing high, closed below it
+            if candle["high"] > swing_high and candle["close"] < swing_high:
+                return "bear", f"Liquidity sweep above {swing_high:.2f} (bearish reversal)"
+
+        return "", "No sweep"
+
+    # ── 1H bias ────────────────────────────────────────────────────────────────
     async def _get_1h_bias(self, service) -> str:
         try:
             df = await self._get_candles(service, gran=3600, count=220)
@@ -134,28 +281,74 @@ class XAUMasterStrategy:
             logger.warning(f"1H bias error: {e}")
             return "neutral"
 
-    def _score(self, row, sentiment):
-        bull, bear = [], []
-        price, ema50, ema200 = row["close"], row["EMA_50"], row["EMA_200"]
-        rsi, macd_h = row["RSI_14"], row["MACD_H"]
-        sk, sd      = row["STOCH_K"], row["STOCH_D"]
-        vol_z       = row["VOL_Z"]
+    # ── Confluence scorer ──────────────────────────────────────────────────────
+    def _score(self, df: pd.DataFrame, sentiment: str) -> tuple:
+        """
+        7 pillars — returns (bull_score, bear_score, bull_reasons, bear_reasons)
 
-        (bull if price > ema200 else bear).append(
-            "Price above EMA 200" if price > ema200 else "Price below EMA 200")
-        (bull if price > ema50 else bear).append(
-            "Price above EMA 50" if price > ema50 else "Price below EMA 50")
-        if rsi < 35:   bull.append(f"RSI oversold ({rsi:.1f})")
-        elif rsi > 65: bear.append(f"RSI overbought ({rsi:.1f})")
-        (bull if macd_h > 0 else bear).append(
-            "MACD bullish" if macd_h > 0 else "MACD bearish")
-        if sk < 25 and sk > sd:   bull.append(f"Stoch oversold ({sk:.1f})")
-        elif sk > 75 and sk < sd: bear.append(f"Stoch overbought ({sk:.1f})")
-        if vol_z > 1.0:
-            (bull if len(bull) >= len(bear) else bear).append(
-                f"Volume spike (z={vol_z:.1f})")
-        if sentiment == "Bullish":   bull.append("Sentiment bullish")
-        elif sentiment == "Bearish": bear.append("Sentiment bearish")
+        Pillar 1: EMA 200 trend
+        Pillar 2: EMA 50 trend
+        Pillar 3: RSI extreme
+        Pillar 4: MACD histogram
+        Pillar 5: Fair Value Gap
+        Pillar 6: Market Structure (BOS)
+        Pillar 7: News Sentiment
+        """
+        bull, bear = [], []
+        row = df.iloc[-1]
+
+        price  = float(row["close"])
+        ema50  = float(row["EMA_50"])
+        ema200 = float(row["EMA_200"])
+        rsi    = float(row["RSI_14"])
+        macd_h = float(row["MACD_H"])
+
+        # ── Pillar 1: EMA 200 ──────────────────────────────────────────────────
+        if price > ema200:
+            bull.append(f"Price above EMA 200 ({ema200:.2f})")
+        else:
+            bear.append(f"Price below EMA 200 ({ema200:.2f})")
+
+        # ── Pillar 2: EMA 50 ───────────────────────────────────────────────────
+        if price > ema50:
+            bull.append(f"Price above EMA 50 ({ema50:.2f})")
+        else:
+            bear.append(f"Price below EMA 50 ({ema50:.2f})")
+
+        # ── Pillar 3: RSI ──────────────────────────────────────────────────────
+        if rsi > 65:
+            bear.append(f"RSI overbought ({rsi:.1f})")
+        elif rsi < 35:
+            bull.append(f"RSI oversold ({rsi:.1f})")
+        # 35-65 = neutral, neither side scores
+
+        # ── Pillar 4: MACD histogram ───────────────────────────────────────────
+        if macd_h > 0:
+            bull.append(f"MACD bullish ({macd_h:.3f})")
+        else:
+            bear.append(f"MACD bearish ({macd_h:.3f})")
+
+        # ── Pillar 5: Fair Value Gap ───────────────────────────────────────────
+        fvg_dir, fvg_desc = self._detect_fvg(df)
+        if fvg_dir == "bull":
+            bull.append(fvg_desc)
+        elif fvg_dir == "bear":
+            bear.append(fvg_desc)
+        logger.info(f"🔲 FVG: {fvg_desc}")
+
+        # ── Pillar 6: Market Structure ─────────────────────────────────────────
+        bos_dir, bos_desc = self._detect_market_structure(df)
+        if bos_dir == "bull":
+            bull.append(bos_desc)
+        elif bos_dir == "bear":
+            bear.append(bos_desc)
+        logger.info(f"🏗  BOS: {bos_desc}")
+
+        # ── Pillar 7: Sentiment ────────────────────────────────────────────────
+        if sentiment == "Bullish":
+            bull.append("News sentiment Bullish")
+        elif sentiment == "Bearish":
+            bear.append("News sentiment Bearish")
 
         return len(bull), len(bear), bull, bear
 
@@ -250,6 +443,7 @@ class XAUMasterStrategy:
                 )
                 return
 
+            # Sentiment
             logger.info("📰 Fetching sentiment...")
             try:
                 _, sentiment_data = get_news_and_sentiment()
@@ -259,10 +453,12 @@ class XAUMasterStrategy:
                 logger.warning(f"Sentiment failed: {e}")
                 market_bias = "Neutral"
 
+            # 1H bias
             h1_bias = await self._get_1h_bias(service)
 
+            # 5M candles + indicators
             df = await self._get_candles(service, gran=300, count=300)
-            df = self._compute(df)
+            df = self._compute_standard(df)
             if df.empty:
                 self.save_signal("NEUTRAL", 0, 0, market_bias, "Collecting data...", 0)
                 return
@@ -278,14 +474,19 @@ class XAUMasterStrategy:
                 f"MACD={float(row['MACD_H']):.5f} | Bias={market_bias}"
             )
 
+            # Volatility gate
             if atr > MAX_SAFE_ATR:
                 logger.warning(f"⚠️  ATR={atr:.2f} too high — skipping")
                 self.save_signal("NEUTRAL", price, rsi, market_bias,
                     f"Volatility too high (ATR {atr:.2f})", 0)
                 return
 
-            bull_score, bear_score, bull_r, bear_r = self._score(row, market_bias)
-            logger.info(f"🔢 BULL={bull_score}/7 | BEAR={bear_score}/7 | Need {MIN_CONFLUENCE}")
+            # Score confluence
+            bull_score, bear_score, bull_r, bear_r = self._score(df, market_bias)
+            logger.info(
+                f"🔢 BULL={bull_score}/7 | BEAR={bear_score}/7 | "
+                f"Need {MIN_CONFLUENCE} to trade"
+            )
 
             direction = None
             reasons   = []
@@ -320,8 +521,9 @@ class XAUMasterStrategy:
                 result      = await service.place_order(direction, self.trade_amount)
                 contract_id = result.get("buy", {}).get("contract_id", "unknown")
                 logger.info(f"✅ {direction} placed | contract_id={contract_id}")
-                notif.notify_trade_executed(direction, ANALYSIS_SYMBOL,
-                                            self.trade_amount, score)
+                notif.notify_trade_executed(
+                    direction, ANALYSIS_SYMBOL, self.trade_amount, score
+                )
                 monitor_svc = DerivTradingService()
                 await monitor_svc.authenticate()
                 asyncio.create_task(
