@@ -242,10 +242,14 @@ def insert_signal(symbol, sig_type, price, rsi, bias, reason,
     )
 
 def get_signals(limit: int = 30, username: str = None) -> list[dict]:
+    """Return signals for this user OR legacy signals with no username."""
     if username:
         return fetchall(
-            "SELECT * FROM signals WHERE username = ? "
-            "ORDER BY timestamp DESC LIMIT ?",
+            """
+            SELECT * FROM signals
+            WHERE username = ? OR username IS NULL
+            ORDER BY timestamp DESC LIMIT ?
+            """,
             (username, limit),
         )
     return fetchall(
@@ -255,8 +259,11 @@ def get_signals(limit: int = 30, username: str = None) -> list[dict]:
 def get_latest_bias(username: str = None) -> str:
     if username:
         row = fetchone(
-            "SELECT bias FROM signals WHERE username = ? "
-            "ORDER BY timestamp DESC LIMIT 1",
+            """
+            SELECT bias FROM signals
+            WHERE username = ? OR username IS NULL
+            ORDER BY timestamp DESC LIMIT 1
+            """,
             (username,),
         )
     else:
@@ -299,7 +306,8 @@ def get_trade_stats(username: str = None) -> dict:
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
                    COALESCE(SUM(pnl), 0) AS total_pnl
-            FROM trade_results WHERE username = ?
+            FROM trade_results
+            WHERE username = ? OR username IS NULL
             """,
             (username,),
         )
