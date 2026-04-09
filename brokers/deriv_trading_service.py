@@ -23,15 +23,11 @@ class DerivTradingService:
     # ── AUTH ───────────────────────────────────────────────────────────────────
     async def authenticate(self):
         await self.ws.connect()
-
-        # Let the TCP handshake fully settle — critical on Render cold starts
         await asyncio.sleep(2.0)
-
         await self.ws.send({"authorize": self.token})
 
         for attempt in range(15):
             try:
-                # 20s timeout — Render's network can be slow on first frame
                 raw = await self.ws.receive(timeout=20.0)
             except TimeoutError:
                 raise Exception(
@@ -47,7 +43,6 @@ class DerivTradingService:
             if error:
                 code = error.get("code", "")
                 msg  = error.get("message", "Unknown error")
-                # WrongResponse on early frames = stale ping frame — skip
                 if code == "WrongResponse" and attempt < 5:
                     logger.warning(f"Skipping stale frame {attempt}: [{code}] {msg}")
                     continue
@@ -134,21 +129,113 @@ class DerivTradingService:
 
     # ── STATEMENT ──────────────────────────────────────────────────────────────
     async def get_statement(self) -> dict:
+        """
+        Fetch transaction history for binary options account.
+
+        Deriv's statement API returns different fields for binary options
+        vs CFD trades. For binary options (tick contracts on 1HZ100V):
+
+        Raw transaction fields:
+          action_type      — "buy" or "sell" (sell = contract settled)
+          amount           — net P&L (negative for buy cost, positive for payout)
+          balance_after    — account balance after transaction
+          contract_id      — the contract ID
+          display_name     — symbol display name e.g. "Volatility 100 (1s) Index"
+          purchase_time    — epoch timestamp of purchase
+          transaction_time — epoch timestamp of this transaction
+          shortcode        — e.g. "CALL_1HZ100V_10.00_1234567_5T"
+
+        We pair buy+sell transactions by contract_id to show net P&L per trade.
+        """
         if not self._authorized:
             await self.authenticate()
-        await self.ws.send({"statement": 1, "description": 1, "limit": 50})
+
+        await self.ws.send({
+            "statement": 1,
+            "description": 1,
+            "limit": 100,          # fetch more to get full pairs
+        })
         response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
             raise Exception(response["error"].get("message", "Statement fetch failed"))
+
+        raw_txns = response.get("statement", {}).get("transactions", [])
+        logger.info(f"Raw statement: {len(raw_txns)} transactions")
+
+        # ── Pair buy/sell transactions by contract_id ──────────────────────────
+        # Each binary options trade creates TWO transactions:
+        #   1. Buy  — negative amount (cost of contract e.g. -$10)
+        #   2. Sell — positive amount (payout e.g. +$17.50 win, +$0 loss)
+        # We combine them to show net P&L per contract.
+
+        contracts: dict = {}
+
+        for tx in raw_txns:
+            contract_id  = str(tx.get("contract_id", ""))
+            action       = tx.get("action_type", "")
+            amount       = float(tx.get("amount", 0))
+            symbol       = tx.get("display_name", "Volatility 100 (1s) Index")
+            tx_time      = tx.get("transaction_time", 0)
+            purchase_time= tx.get("purchase_time", tx_time)
+            shortcode    = tx.get("shortcode", "")
+
+            if not contract_id or contract_id == "None":
+                continue
+
+            if contract_id not in contracts:
+                contracts[contract_id] = {
+                    "contract_id":   contract_id,
+                    "symbol":        symbol,
+                    "buy_amount":    0.0,
+                    "sell_amount":   0.0,
+                    "time":          purchase_time or tx_time,
+                    "shortcode":     shortcode,
+                    "settled":       False,
+                }
+
+            if action == "buy":
+                contracts[contract_id]["buy_amount"]  = amount   # negative
+                contracts[contract_id]["time"]        = tx_time
+            elif action == "sell":
+                contracts[contract_id]["sell_amount"] = amount   # positive
+                contracts[contract_id]["settled"]     = True
+
+        # ── Build trade list ───────────────────────────────────────────────────
         trades = []
-        for tx in response.get("statement", {}).get("transactions", []):
+        for cid, c in contracts.items():
+            buy_cost = abs(c["buy_amount"])   # e.g. 10.00
+            payout   = c["sell_amount"]        # e.g. 17.50 or 0.0
+            net_pnl  = payout - buy_cost       # e.g. +7.50 or -10.00
+
+            # Determine direction from shortcode (CALL_... or PUT_...)
+            shortcode = c["shortcode"].upper()
+            if shortcode.startswith("CALL"):
+                direction = "CALL (BUY)"
+            elif shortcode.startswith("PUT"):
+                direction = "PUT (SELL)"
+            else:
+                direction = "Options"
+
+            # Only show settled contracts
+            if not c["settled"] and payout == 0.0:
+                continue
+
             trades.append({
-                "symbol":        tx.get("display_name"),
-                "pnl":           tx.get("amount"),
-                "time":          tx.get("transaction_time"),
-                "type":          tx.get("action_type"),
-                "contract_type": tx.get("contract_id"),
+                "symbol":        c["symbol"],
+                "contract_id":   cid,
+                "type":          direction,
+                "contract_type": "BINARY",
+                "pnl":           round(net_pnl, 2),
+                "buy_cost":      round(buy_cost, 2),
+                "payout":        round(payout, 2),
+                "time":          c["time"],
+                "won":           net_pnl > 0,
             })
+
+        # Sort by time descending (most recent first)
+        trades.sort(key=lambda x: x["time"], reverse=True)
+        logger.info(f"Parsed {len(trades)} completed contracts from {len(contracts)} total")
+
         return {"history": trades}
 
     # ── PLACE ORDER ────────────────────────────────────────────────────────────
@@ -223,8 +310,8 @@ class DerivTradingService:
     @staticmethod
     def _raise_trade_error(code: str, msg: str, stage: str):
         hints = {
-            "PermissionDenied":        "Token lacks Trade scope. Regenerate at app.deriv.com → API Token.",
-            "AuthorizationRequired":   "Token expired. Regenerate your API token.",
+            "PermissionDenied":         "Token lacks Trade scope. Regenerate at app.deriv.com → API Token.",
+            "AuthorizationRequired":    "Token expired. Regenerate your API token.",
             "OfferingsValidationError": f"Symbol/duration not offered at {stage}. Check DEMO_EXECUTION_SYMBOL.",
         }
         raise Exception(hints.get(code, f"Trade error [{code}] at {stage}: {msg}"))
