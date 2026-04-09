@@ -74,17 +74,18 @@ def init_db():
                     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Add columns if they don't exist (for existing deployments)
+            # Add columns if they don't exist (for existing deployments).
+            # Use savepoints so a failed ALTER doesn't abort the transaction.
             for col, defn in [
                 ("deriv_token",   "TEXT DEFAULT NULL"),
                 ("deriv_account", "TEXT DEFAULT NULL"),
             ]:
                 try:
-                    cur.execute(
-                        f"ALTER TABLE users ADD COLUMN {col} {defn}"
-                    )
+                    cur.execute("SAVEPOINT add_col")
+                    cur.execute(f"ALTER TABLE users ADD COLUMN {col} {defn}")
+                    cur.execute("RELEASE SAVEPOINT add_col")
                 except Exception:
-                    pass  # already exists
+                    cur.execute("ROLLBACK TO SAVEPOINT add_col")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
