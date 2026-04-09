@@ -20,7 +20,7 @@ from user_models import User, router as users_router, get_current_user
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
-from core import notifications as notif
+import notifications as notif
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
@@ -310,5 +310,30 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
+    finally:
+        await service.close()
+
+
+# ── Candles endpoint (for chart screen) ───────────────────────────────────────
+class CandleRequest(BaseModel):
+    symbol:      str = "frxXAUUSD"
+    count:       int = 120
+    granularity: int = 300   # seconds: 60=1m, 300=5m, 900=15m, 3600=1h, 14400=4h
+
+@app.post("/candles")
+async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService()
+    try:
+        await service.authenticate()
+        raw = await service.get_candles(
+            symbol=req.symbol,
+            count=min(req.count, 300),
+            granularity=req.granularity,
+        )
+        return {"candles": raw}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
