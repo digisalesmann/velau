@@ -425,23 +425,3 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
     finally:
         await service.close()
-
-@app.post("/migrate")
-async def run_migration():
-    """One-time migration — remove after running."""
-    import database as db
-    results = []
-    migrations = [
-        "ALTER TABLE signals ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL",
-        "ALTER TABLE trade_results ADD COLUMN IF NOT EXISTS username TEXT DEFAULT NULL",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS deriv_token TEXT DEFAULT NULL",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS deriv_account TEXT DEFAULT NULL",
-    ]
-    with db.get_conn() as (conn, cur):
-        for sql in migrations:
-            try:
-                cur.execute(sql)
-                results.append({"sql": sql, "status": "ok"})
-            except Exception as e:
-                results.append({"sql": sql, "status": str(e)})
-    return {"results": results}
