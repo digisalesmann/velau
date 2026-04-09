@@ -8,7 +8,6 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 
-# ── Logging must be configured BEFORE anything else ───────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -73,6 +72,7 @@ class DashboardResponse(BaseModel):
     account_id:          Optional[str] = None
     win_rate:            float = 0.0
     trades_today:        int = 0
+    total_trades:        int = 0
     daily_pnl:           float = 0.0
     daily_pnl_percent:   float = 0.0
     market_bias:         str = "Neutral"
@@ -152,15 +152,23 @@ async def get_dashboard(user=Depends(get_current_user)):
         history_data = await service.get_statement()
         trades_list  = history_data.get("history", [])
 
+        balance = account_info.get("balance", 0.0)
+
+        # ── Accurate stats from full statement ────────────────────────────────
+        total_trades = len(trades_list)
+        wins         = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
+        win_rate     = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+
+        # Today's trades and P&L
         today_trades = [
             t for t in trades_list
-            if datetime.fromtimestamp(t.get("time", 0)).date() == date.today()
+            if t.get("time") and
+            datetime.fromtimestamp(int(t["time"])).date() == date.today()
         ]
-        daily_pnl   = sum(float(t.get("pnl", 0)) for t in today_trades)
-        stats       = db.get_trade_stats()
-        market_bias = db.get_latest_bias()
-        balance     = account_info.get("balance", 0.0)
-        pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
+        daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
+        pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
+
+        market_bias  = db.get_latest_bias()
 
         return DashboardResponse(
             username=user.username,
@@ -168,8 +176,9 @@ async def get_dashboard(user=Depends(get_current_user)):
             balance=balance,
             currency=account_info.get("currency", "USD"),
             account_id=account_info.get("account_id"),
-            win_rate=round(stats["win_rate"], 1),
+            win_rate=win_rate,
             trades_today=len(today_trades),
+            total_trades=total_trades,
             daily_pnl=round(daily_pnl, 2),
             daily_pnl_percent=round(pnl_percent, 2),
             market_bias=market_bias,
@@ -181,6 +190,46 @@ async def get_dashboard(user=Depends(get_current_user)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Dashboard error: {e}")
+    finally:
+        await service.close()
+
+@app.get("/open_contracts")
+async def get_open_contracts(user=Depends(get_current_user)):
+    """Returns currently open binary options contracts."""
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService()
+    try:
+        await service.authenticate()
+        await service.ws.send({
+            "proposal_open_contracts": 1,
+            "subscribe": 0,   # just fetch, don't subscribe
+        })
+        response = await service.ws.receive(timeout=20.0)
+        if response.get("error"):
+            return {"contracts": []}
+
+        contracts = response.get("proposal_open_contracts", {})
+        if not contracts:
+            return {"contracts": []}
+
+        open_list = []
+        for cid, c in contracts.items():
+            if c.get("is_expired") or c.get("is_settleable"):
+                continue
+            open_list.append({
+                "contract_id":   cid,
+                "symbol":        c.get("display_name", "Volatility 100 (1s)"),
+                "contract_type": c.get("contract_type", ""),
+                "buy_price":     c.get("buy_price", 0),
+                "current_spot":  c.get("current_spot", 0),
+                "profit":        c.get("profit", 0),
+                "entry_spot":    c.get("entry_spot", 0),
+                "expiry_time":   c.get("expiry_time", 0),
+            })
+        return {"contracts": open_list}
+    except Exception as e:
+        traceback.print_exc()
+        return {"contracts": [], "error": str(e)}
     finally:
         await service.close()
 
