@@ -10,3 +10,4 @@ pwdlib[bcrypt]
 python-multipart
 python-dotenv
 psycopg2-binary
+google-auth
