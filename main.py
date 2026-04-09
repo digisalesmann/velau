@@ -80,6 +80,7 @@ class DashboardResponse(BaseModel):
     consecutive_losses:  int = 0
     trade_in_progress:   bool = False
     in_session:          bool = True
+    deriv_connected:     bool = False
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
@@ -93,6 +94,29 @@ class TradeRequest(BaseModel):
 
 class FCMTokenRequest(BaseModel):
     token: str
+
+class DerivConnectRequest(BaseModel):
+    api_token: str
+
+class CandleRequest(BaseModel):
+    symbol:      str = "frxXAUUSD"
+    count:       int = 120
+    granularity: int = 300
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _get_user_token(username: str) -> str:
+    """
+    Get Deriv token for this user.
+    Falls back to the server-level DERIV_TOKEN env var for backwards
+    compatibility (single-user mode / admin account).
+    """
+    user_token = db.get_deriv_token(username)
+    if user_token:
+        return user_token
+    # Fallback to server env var (your account, for backwards compat)
+    from env_config import DERIV_TOKEN
+    return DERIV_TOKEN
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -115,6 +139,95 @@ async def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
 async def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
     notif.unregister_token(req.token)
     return {"status": "unregistered"}
+
+
+# ── Deriv connection management ────────────────────────────────────────────────
+
+@app.post("/deriv/connect")
+async def connect_deriv(
+    req: DerivConnectRequest,
+    user=Depends(get_current_user)
+):
+    """
+    Connect a user's personal Deriv API token.
+    Validates the token by attempting authentication, then stores it.
+    """
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService(token=req.api_token)
+    try:
+        await service.authenticate()
+        info = await service.get_account_info()
+        account_id = info.get("account_id", "")
+        balance    = info.get("balance", 0.0)
+        currency   = info.get("currency", "USD")
+
+        # Validate it's an Options account (VRTC for demo, CR for real)
+        if not account_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read account ID. Check your token."
+            )
+
+        # Store token
+        db.save_deriv_token(user.username, req.api_token, account_id)
+        logger.info(
+            f"✅ {user.username} connected Deriv account "
+            f"{account_id} (${balance} {currency})"
+        )
+
+        return {
+            "status":     "connected",
+            "account_id": account_id,
+            "balance":    balance,
+            "currency":   currency,
+            "message":    f"Connected to {account_id}",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token validation failed: {str(e)}"
+        )
+    finally:
+        await service.close()
+
+
+@app.post("/deriv/disconnect")
+async def disconnect_deriv(user=Depends(get_current_user)):
+    """Remove the user's stored Deriv token."""
+    db.save_deriv_token(user.username, "", "")
+    return {"status": "disconnected"}
+
+
+@app.get("/deriv/status")
+async def deriv_status(user=Depends(get_current_user)):
+    """Check if user has a connected Deriv account."""
+    token = db.get_deriv_token(user.username)
+    if not token:
+        return {"connected": False, "account_id": None, "balance": None}
+
+    from brokers.deriv_trading_service import DerivTradingService
+    service = DerivTradingService(token=token)
+    try:
+        await service.authenticate()
+        info = await service.get_account_info()
+        return {
+            "connected":  True,
+            "account_id": info.get("account_id"),
+            "balance":    info.get("balance"),
+            "currency":   info.get("currency", "USD"),
+        }
+    except Exception as e:
+        return {
+            "connected": False,
+            "error":     str(e),
+        }
+    finally:
+        await service.close()
+
+
+# ── Bot control ────────────────────────────────────────────────────────────────
 
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
@@ -142,33 +255,34 @@ async def toggle_bot(user=Depends(get_current_user)):
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started", "is_running": True}
 
+
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
     try:
         await service.authenticate()
         account_info = await service.get_account_info()
         history_data = await service.get_statement()
         trades_list  = history_data.get("history", [])
 
-        balance = account_info.get("balance", 0.0)
-
-        # ── Accurate stats from full statement ────────────────────────────────
+        balance      = account_info.get("balance", 0.0)
         total_trades = len(trades_list)
         wins         = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
         win_rate     = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
 
-        # Today's trades and P&L
         today_trades = [
             t for t in trades_list
             if t.get("time") and
             datetime.fromtimestamp(int(t["time"])).date() == date.today()
         ]
-        daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
-        pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
-
-        market_bias  = db.get_latest_bias()
+        daily_pnl   = sum(float(t.get("pnl", 0)) for t in today_trades)
+        pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
+        market_bias = db.get_latest_bias(username=user.username)
+        deriv_token = db.get_deriv_token(user.username)
 
         return DashboardResponse(
             username=user.username,
@@ -186,6 +300,7 @@ async def get_dashboard(user=Depends(get_current_user)):
             consecutive_losses=trading_bot._consecutive_losses,
             trade_in_progress=trading_bot._trade_in_progress,
             in_session=trading_bot._in_trading_session(),
+            deriv_connected=bool(deriv_token),
         )
     except Exception as e:
         traceback.print_exc()
@@ -193,25 +308,24 @@ async def get_dashboard(user=Depends(get_current_user)):
     finally:
         await service.close()
 
+
 @app.get("/open_contracts")
 async def get_open_contracts(user=Depends(get_current_user)):
-    """Returns currently open binary options contracts."""
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
     try:
         await service.authenticate()
         await service.ws.send({
             "proposal_open_contracts": 1,
-            "subscribe": 0,   # just fetch, don't subscribe
+            "subscribe": 0,
         })
         response = await service.ws.receive(timeout=20.0)
         if response.get("error"):
             return {"contracts": []}
-
         contracts = response.get("proposal_open_contracts", {})
         if not contracts:
             return {"contracts": []}
-
         open_list = []
         for cid, c in contracts.items():
             if c.get("is_expired") or c.get("is_settleable"):
@@ -224,14 +338,13 @@ async def get_open_contracts(user=Depends(get_current_user)):
                 "current_spot":  c.get("current_spot", 0),
                 "profit":        c.get("profit", 0),
                 "entry_spot":    c.get("entry_spot", 0),
-                "expiry_time":   c.get("expiry_time", 0),
             })
         return {"contracts": open_list}
     except Exception as e:
-        traceback.print_exc()
         return {"contracts": [], "error": str(e)}
     finally:
         await service.close()
+
 
 @app.get("/news", response_model=NewsResponse)
 async def get_news():
@@ -239,26 +352,24 @@ async def get_news():
         articles, sentiment = get_news_and_sentiment()
         return NewsResponse(articles=articles, sentiment=sentiment)
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"News error: {e}")
 
 @app.get("/signals")
 async def get_signals(user=Depends(get_current_user)):
     try:
-        return {"signals": db.get_signals(limit=30)}
+        return {"signals": db.get_signals(limit=30, username=user.username)}
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/dashboard/history")
 async def get_history(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
     try:
         await service.authenticate()
         return await service.get_statement()
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
@@ -266,64 +377,21 @@ async def get_history(user=Depends(get_current_user)):
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
     try:
         await service.authenticate()
         return await service.subscribe_ticks(symbol=req.symbol)
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
-
-@app.get("/symbols")
-async def get_symbols(user=Depends(get_current_user)):
-    from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
-    try:
-        await service.authenticate()
-        return {"symbols": await service.get_available_symbols()}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await service.close()
-
-@app.post("/trade")
-async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
-    from brokers.deriv_trading_service import DerivTradingService
-    if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
-        raise HTTPException(status_code=400,
-            detail=f"Invalid contract_type '{req.contract_type}'.")
-    if not req.amount or req.amount <= 0:
-        raise HTTPException(status_code=400, detail="amount must be positive.")
-    service = DerivTradingService()
-    try:
-        await service.authenticate()
-        if req.action == "close":
-            return {"status": "success", "message": "Position closed."}
-        result = await service.place_order(
-            contract_type=req.contract_type.upper(),
-            amount=req.amount, duration=5, symbol=req.symbol,
-        )
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
-    finally:
-        await service.close()
-
-
-# ── Candles endpoint (for chart screen) ───────────────────────────────────────
-class CandleRequest(BaseModel):
-    symbol:      str = "frxXAUUSD"
-    count:       int = 120
-    granularity: int = 300   # seconds: 60=1m, 300=5m, 900=15m, 3600=1h, 14400=4h
 
 @app.post("/candles")
 async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService()
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
     try:
         await service.authenticate()
         raw = await service.get_candles(
@@ -333,7 +401,27 @@ async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
         )
         return {"candles": raw}
     except Exception as e:
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await service.close()
+
+@app.post("/trade")
+async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
+    from brokers.deriv_trading_service import DerivTradingService
+    if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
+        raise HTTPException(status_code=400, detail="Invalid contract_type.")
+    if not req.amount or req.amount <= 0:
+        raise HTTPException(status_code=400, detail="amount must be positive.")
+    token   = _get_user_token(user.username)
+    service = DerivTradingService(token=token)
+    try:
+        await service.authenticate()
+        result = await service.place_order(
+            contract_type=req.contract_type.upper(),
+            amount=req.amount, duration=5, symbol=req.symbol,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
     finally:
         await service.close()

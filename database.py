@@ -3,10 +3,10 @@ database.py — persistent storage layer.
 
 PostgreSQL on Render (DATABASE_URL), SQLite fallback for local dev.
 
-Key fix: all numeric values are cast to native Python float()/int()/str()
-before insert. PostgreSQL rejects numpy scalar types (np.float64, np.int64)
-that pandas returns from DataFrame .iloc[] row access — it tries to interpret
-the type name as a schema, producing "schema 'np' does not exist".
+Tables:
+  users         — auth credentials + encrypted Deriv token per user
+  signals       — strategy signals
+  trade_results — trade outcomes per user
 """
 import os
 import logging
@@ -25,8 +25,6 @@ else:
     import sqlite3
     logger.warning("⚠️  DATABASE_URL not set — falling back to SQLite")
 
-
-# ── Connection ─────────────────────────────────────────────────────────────────
 
 @contextmanager
 def get_conn():
@@ -49,7 +47,6 @@ def get_conn():
 
 
 def _sqlite_conn():
-    import sqlite3
     for path in ["/tmp/users.db", "/var/tmp/users.db",
                  os.path.expanduser("~/users.db")]:
         try:
@@ -65,19 +62,30 @@ def _ph():
     return "%s" if _USE_POSTGRES else "?"
 
 
-# ── Schema ─────────────────────────────────────────────────────────────────────
-
 def init_db():
     with get_conn() as (conn, cur):
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                username        TEXT PRIMARY KEY,
-                hashed_password TEXT NOT NULL,
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
         if _USE_POSTGRES:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username        TEXT PRIMARY KEY,
+                    hashed_password TEXT NOT NULL,
+                    deriv_token     TEXT DEFAULT NULL,
+                    deriv_account   TEXT DEFAULT NULL,
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Add columns if they don't exist (for existing deployments)
+            for col, defn in [
+                ("deriv_token",   "TEXT DEFAULT NULL"),
+                ("deriv_account", "TEXT DEFAULT NULL"),
+            ]:
+                try:
+                    cur.execute(
+                        f"ALTER TABLE users ADD COLUMN {col} {defn}"
+                    )
+                except Exception:
+                    pass  # already exists
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id               SERIAL PRIMARY KEY,
@@ -88,20 +96,32 @@ def init_db():
                     bias             TEXT,
                     reason           TEXT,
                     confluence_score INTEGER DEFAULT 0,
+                    username         TEXT DEFAULT NULL,
                     timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trade_results (
                     id          SERIAL PRIMARY KEY,
-                    contract_id TEXT UNIQUE,
+                    contract_id TEXT,
                     won         BOOLEAN,
                     pnl         REAL,
                     symbol      TEXT DEFAULT '1HZ100V',
-                    timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    username    TEXT DEFAULT NULL,
+                    timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(contract_id, username)
                 )
             """)
         else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username        TEXT PRIMARY KEY,
+                    hashed_password TEXT NOT NULL,
+                    deriv_token     TEXT DEFAULT NULL,
+                    deriv_account   TEXT DEFAULT NULL,
+                    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,21 +132,32 @@ def init_db():
                     bias             TEXT,
                     reason           TEXT,
                     confluence_score INTEGER DEFAULT 0,
+                    username         TEXT DEFAULT NULL,
                     timestamp        DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trade_results (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    contract_id TEXT UNIQUE,
+                    contract_id TEXT,
                     won         INTEGER,
                     pnl         REAL,
                     symbol      TEXT DEFAULT '1HZ100V',
-                    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
+                    username    TEXT DEFAULT NULL,
+                    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(contract_id, username)
                 )
             """)
-            _add_col(cur, "signals",       "confluence_score", "INTEGER DEFAULT 0")
-            _add_col(cur, "trade_results", "symbol",           "TEXT DEFAULT '1HZ100V'")
+            for col, defn in [
+                ("confluence_score", "INTEGER DEFAULT 0"),
+                ("username",         "TEXT DEFAULT NULL"),
+            ]:
+                _add_col(cur, "signals", col, defn)
+            for col, defn in [
+                ("symbol",   "TEXT DEFAULT '1HZ100V'"),
+                ("username", "TEXT DEFAULT NULL"),
+            ]:
+                _add_col(cur, "trade_results", col, defn)
 
     logger.info(f"✅ DB ready ({'PostgreSQL' if _USE_POSTGRES else 'SQLite'})")
 
@@ -137,8 +168,6 @@ def _add_col(cur, table, col, defn):
     except Exception:
         pass
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def fetchall(sql: str, params: tuple = ()) -> list[dict]:
     with get_conn() as (conn, cur):
@@ -156,62 +185,132 @@ def execute(sql: str, params: tuple = ()):
         cur.execute(sql.replace("?", _ph()), params)
 
 
-# ── Domain ─────────────────────────────────────────────────────────────────────
+# ── User management ────────────────────────────────────────────────────────────
 
-def insert_signal(symbol, sig_type, price, rsi, bias, reason, confluence_score=0):
-    """
-    Cast all values to native Python types before insert.
-    pandas returns np.float64/np.int64 from DataFrame rows — PostgreSQL
-    rejects these and misreads the type name as a schema identifier.
-    """
-    execute(
-        """
-        INSERT INTO signals (symbol, type, price, rsi, bias, reason, confluence_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(symbol),
-            str(sig_type),
-            float(price),
-            float(rsi),
-            str(bias),
-            str(reason),
-            int(confluence_score),
-        ),
+def get_user(username: str):
+    return fetchone(
+        "SELECT * FROM users WHERE username = ?", (username,)
     )
 
-def get_signals(limit: int = 30) -> list[dict]:
+def user_exists(username: str) -> bool:
+    return fetchone(
+        "SELECT 1 FROM users WHERE username = ?", (username,)
+    ) is not None
+
+def create_user(username: str, hashed_password: str):
+    execute(
+        "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
+        (username, hashed_password),
+    )
+
+def save_deriv_token(username: str, token: str, account_id: str = ""):
+    """Store the user's Deriv API token."""
+    execute(
+        "UPDATE users SET deriv_token = ?, deriv_account = ? WHERE username = ?",
+        (str(token), str(account_id), str(username)),
+    )
+
+def get_deriv_token(username: str) -> str | None:
+    """Retrieve the user's Deriv API token."""
+    row = fetchone(
+        "SELECT deriv_token FROM users WHERE username = ?", (username,)
+    )
+    return row["deriv_token"] if row else None
+
+def get_all_users_with_tokens() -> list[dict]:
+    """Return all users who have connected a Deriv account."""
+    return fetchall(
+        "SELECT username, deriv_token, deriv_account FROM users "
+        "WHERE deriv_token IS NOT NULL AND deriv_token != ''"
+    )
+
+
+# ── Signals ────────────────────────────────────────────────────────────────────
+
+def insert_signal(symbol, sig_type, price, rsi, bias, reason,
+                  confluence_score=0, username=None):
+    execute(
+        """
+        INSERT INTO signals
+          (symbol, type, price, rsi, bias, reason, confluence_score, username)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (str(symbol), str(sig_type), float(price), float(rsi),
+         str(bias), str(reason), int(confluence_score),
+         str(username) if username else None),
+    )
+
+def get_signals(limit: int = 30, username: str = None) -> list[dict]:
+    if username:
+        return fetchall(
+            "SELECT * FROM signals WHERE username = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (username, limit),
+        )
     return fetchall(
         "SELECT * FROM signals ORDER BY timestamp DESC LIMIT ?", (limit,)
     )
 
-def get_latest_bias() -> str:
-    row = fetchone("SELECT bias FROM signals ORDER BY timestamp DESC LIMIT 1")
+def get_latest_bias(username: str = None) -> str:
+    if username:
+        row = fetchone(
+            "SELECT bias FROM signals WHERE username = ? "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (username,),
+        )
+    else:
+        row = fetchone(
+            "SELECT bias FROM signals ORDER BY timestamp DESC LIMIT 1"
+        )
     return row["bias"] if row else "Neutral"
 
-def insert_trade_result(contract_id, won, pnl, symbol="1HZ100V"):
+
+# ── Trade results ──────────────────────────────────────────────────────────────
+
+def insert_trade_result(contract_id, won, pnl,
+                        symbol="1HZ100V", username=None):
     if _USE_POSTGRES:
         execute(
             """
-            INSERT INTO trade_results (contract_id, won, pnl, symbol)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (contract_id) DO UPDATE SET won=EXCLUDED.won, pnl=EXCLUDED.pnl
+            INSERT INTO trade_results (contract_id, won, pnl, symbol, username)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (contract_id, username)
+            DO UPDATE SET won=EXCLUDED.won, pnl=EXCLUDED.pnl
             """,
-            (str(contract_id), bool(won), float(pnl), str(symbol)),
+            (str(contract_id), bool(won), float(pnl),
+             str(symbol), str(username) if username else None),
         )
     else:
         execute(
-            "INSERT OR REPLACE INTO trade_results (contract_id, won, pnl, symbol) VALUES (?, ?, ?, ?)",
-            (str(contract_id), int(won), float(pnl), str(symbol)),
+            """
+            INSERT OR REPLACE INTO trade_results
+              (contract_id, won, pnl, symbol, username)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(contract_id), int(won), float(pnl),
+             str(symbol), str(username) if username else None),
         )
 
-def get_trade_stats() -> dict:
-    row = fetchone("""
-        SELECT COUNT(*) AS total,
-               SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
-               COALESCE(SUM(pnl), 0) AS total_pnl
-        FROM trade_results
-    """)
+def get_trade_stats(username: str = None) -> dict:
+    if username:
+        row = fetchone(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
+                   COALESCE(SUM(pnl), 0) AS total_pnl
+            FROM trade_results WHERE username = ?
+            """,
+            (username,),
+        )
+    else:
+        row = fetchone(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN won THEN 1 ELSE 0 END) AS wins,
+                   COALESCE(SUM(pnl), 0) AS total_pnl
+            FROM trade_results
+            """
+        )
     if not row or not row["total"]:
         return {"win_rate": 0.0, "total_trades": 0, "total_pnl": 0.0}
     total = int(row["total"])
@@ -221,23 +320,6 @@ def get_trade_stats() -> dict:
         "total_trades": total,
         "total_pnl":    round(float(row["total_pnl"]), 2),
     }
-
-def get_user(username):
-    return fetchone(
-        "SELECT username, hashed_password FROM users WHERE username = ?",
-        (username,),
-    )
-
-def user_exists(username):
-    return fetchone(
-        "SELECT 1 FROM users WHERE username = ?", (username,)
-    ) is not None
-
-def create_user(username, hashed_password):
-    execute(
-        "INSERT INTO users (username, hashed_password) VALUES (?, ?)",
-        (username, hashed_password),
-    )
 
 
 init_db()
