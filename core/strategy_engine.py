@@ -30,7 +30,7 @@ from position_sizing               import (
     calculate_stake, get_sizing_context, WINS_TO_EXIT_RECOVERY
 )
 import database as db
-import notifications as notif
+from core import notifications as notif
 
 logger = logging.getLogger("XAUStrategy")
 
