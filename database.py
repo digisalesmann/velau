@@ -277,11 +277,11 @@ def save_totp_secret(username: str, secret: str):
     execute("UPDATE users SET totp_secret = ? WHERE username = ?", (secret, username))
 
 def enable_totp(username: str):
-    execute("UPDATE users SET totp_enabled = 1 WHERE username = ?", (username,))
+    execute("UPDATE users SET totp_enabled = TRUE WHERE username = ?", (username,))
 
 def disable_totp(username: str):
     execute(
-        "UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE username = ?",
+        "UPDATE users SET totp_enabled = FALSE, totp_secret = NULL WHERE username = ?",
         (username,),
     )
 
