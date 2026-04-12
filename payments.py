@@ -40,9 +40,9 @@ PLANS: dict[str, dict] = {
     },
 }
 
-# Default crypto: USDT on TRON (TRC-20) — low fees, widely accepted.
-# NOWPayments currency code: "usdttrc20"
-DEFAULT_CRYPTO = "usdttrc20"
+# Default crypto: USDT on BNB Smart Chain (BEP-20).
+# NOWPayments currency code: "usdtbsc"
+DEFAULT_CRYPTO = "usdtbsc"
 
 # NOWPayments payment statuses that mean the payment is complete.
 CONFIRMED_STATUSES = {"finished", "confirmed"}

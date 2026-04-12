@@ -438,14 +438,18 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
 @app.get("/subscription/status")
 async def get_subscription_status(user=Depends(get_current_user)):
     """Return the user's current subscription status."""
+    admin = db.is_admin(user.username)
+    if admin:
+        return {"active": True, "plan": "admin", "is_admin": True}
     sub = db.get_active_subscription(user.username)
     if sub:
         return {
             "active":     True,
             "plan":       sub["plan"],
             "expires_at": sub.get("expires_at"),
+            "is_admin":   False,
         }
-    return {"active": False}
+    return {"active": False, "is_admin": False}
 
 
 @app.post("/subscription/create")
