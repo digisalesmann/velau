@@ -523,6 +523,23 @@ async def poll_payment(payment_id: str, user=Depends(get_current_user)):
         return {"status": sub["status"]}
 
 
+class CancelPaymentRequest(BaseModel):
+    payment_id: str
+
+@app.post("/subscription/cancel")
+async def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_current_user)):
+    """User-initiated cancel of a pending payment they no longer want to complete."""
+    sub = db.get_subscription_by_payment(req.payment_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if sub["username"] != user.username:
+        raise HTTPException(status_code=403, detail="Not your payment.")
+    if sub["status"] != "pending":
+        raise HTTPException(status_code=400, detail=f"Cannot cancel a {sub['status']} payment.")
+    db.cancel_pending_subscription(req.payment_id, user.username)
+    return {"ok": True}
+
+
 @app.post("/subscription/webhook")
 async def subscription_webhook(request: Request):
     """

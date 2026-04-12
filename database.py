@@ -445,6 +445,14 @@ def get_subscription_by_payment(payment_id: str) -> dict | None:
     )
 
 
+def cancel_pending_subscription(payment_id: str, username: str):
+    """Mark a pending subscription as cancelled. Only cancels if still pending and owned by user."""
+    execute(
+        "UPDATE subscriptions SET status = 'cancelled' WHERE payment_id = ? AND username = ? AND status = 'pending'",
+        (payment_id, username),
+    )
+
+
 def activate_subscription(payment_id: str, plan: str):
     """Set subscription to active with the correct expiry for the plan."""
     from datetime import datetime, timedelta
