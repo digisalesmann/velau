@@ -12,7 +12,7 @@ import os
 
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
-from database import get_user, user_exists, create_user
+from database import get_user, user_exists, create_user, is_admin as db_is_admin
 
 pwd_context = PasswordHash([BcryptHasher()])
 SECRET_KEY  = os.getenv("SECRET_KEY", "REPLACE_WITH_A_SECURE_RANDOM_KEY")
@@ -38,6 +38,7 @@ class UserIn(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type:   str
+    is_admin:     bool = False
 
 
 # ── Password ───────────────────────────────────────────────────────────────────
@@ -106,7 +107,7 @@ async def register(user_in: UserIn):
         hashed = get_password_hash(user_in.password)
         create_user_in_db(user_in.username, hashed)
         token = create_access_token(data={"sub": user_in.username})
-        return {"access_token": token, "token_type": "bearer"}
+        return {"access_token": token, "token_type": "bearer", "is_admin": False}
     except HTTPException:
         raise
     except Exception:
@@ -123,8 +124,9 @@ async def login(user_in: UserIn):
         user = get_user_from_db(user_in.username)
         if not user or not verify_password(user_in.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Incorrect username or password")
-        token = create_access_token(data={"sub": user.username})
-        return {"access_token": token, "token_type": "bearer"}
+        token    = create_access_token(data={"sub": user.username})
+        is_admin = db_is_admin(user.username)
+        return {"access_token": token, "token_type": "bearer", "is_admin": is_admin}
     except HTTPException:
         raise
     except Exception:

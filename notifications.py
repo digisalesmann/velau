@@ -107,33 +107,32 @@ def _send(title: str, body: str, data: dict = None):
 # ── Public helpers ────────────────────────────────────────────────────────────
 
 def notify_trade_executed(direction: str, symbol: str, amount: float, score: int):
-    emoji  = "🟢" if direction == "CALL" else "🔴"
-    action = "BUY (CALL)" if direction == "CALL" else "SELL (PUT)"
+    action = "CALL (Buy)" if direction == "CALL" else "PUT (Sell)"
     _send(
-        title=f"{emoji} Trade Executed {action}",
-        body=f"{symbol} · ${amount:.2f} stake · Confluence {score}/7",
+        title=f"Trade Placed {action}",
+        body=f"{symbol}  |  Stake ${amount:.2f}  |  Confluence {score}/7",
         data={"type": "trade_executed", "direction": direction, "symbol": symbol},
     )
 
 def notify_trade_settled(contract_id: str, won: bool, pnl: float):
-    emoji  = "✅" if won else "❌"
-    result = "WON" if won else "LOST"
+    result = "Won" if won else "Lost"
+    sign   = "+" if pnl >= 0 else "-"
     _send(
-        title=f"{emoji} Trade {result} · {'+' if pnl >= 0 else ''}{pnl:.2f} USD",
-        body=f"Contract {contract_id} settled.",
+        title=f"Trade {result}  {sign}${abs(pnl):.2f}",
+        body=f"Contract {contract_id} has been settled.",
         data={"type": "trade_settled", "won": str(won), "pnl": str(pnl)},
     )
 
 def notify_circuit_breaker(consecutive_losses: int):
     _send(
-        title="🚨 Circuit Breaker Triggered",
-        body=f"{consecutive_losses} consecutive losses, bot paused for today. Resets at midnight UTC.",
+        title="Circuit Breaker Triggered",
+        body=f"{consecutive_losses} consecutive losses, bot paused for today. Resumes at midnight UTC.",
         data={"type": "circuit_breaker"},
     )
 
 def notify_session_start():
     _send(
-        title="📈 Trading Session Open",
-        body="London/NY session started, bot is now scanning XAU/USD.",
+        title="Trading Session Open",
+        body="London/NY session active. Bot is scanning XAU/USD.",
         data={"type": "session_start"},
     )

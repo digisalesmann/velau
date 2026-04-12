@@ -79,6 +79,7 @@ def init_db():
             for col, defn in [
                 ("deriv_token",   "TEXT DEFAULT NULL"),
                 ("deriv_account", "TEXT DEFAULT NULL"),
+                ("is_admin",      "BOOLEAN DEFAULT FALSE"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -113,6 +114,21 @@ def init_db():
                     UNIQUE(contract_id, username)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id           SERIAL PRIMARY KEY,
+                    username     TEXT NOT NULL,
+                    plan         TEXT NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'pending',
+                    payment_id   TEXT UNIQUE,
+                    pay_address  TEXT,
+                    pay_amount   REAL,
+                    pay_currency TEXT,
+                    price_usd    REAL,
+                    expires_at   TIMESTAMP,
+                    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -120,6 +136,7 @@ def init_db():
                     hashed_password TEXT NOT NULL,
                     deriv_token     TEXT DEFAULT NULL,
                     deriv_account   TEXT DEFAULT NULL,
+                    is_admin        INTEGER DEFAULT 0,
                     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -147,6 +164,21 @@ def init_db():
                     username    TEXT DEFAULT NULL,
                     timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(contract_id, username)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username     TEXT NOT NULL,
+                    plan         TEXT NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'pending',
+                    payment_id   TEXT UNIQUE,
+                    pay_address  TEXT,
+                    pay_amount   REAL,
+                    pay_currency TEXT,
+                    price_usd    REAL,
+                    expires_at   DATETIME,
+                    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             for col, defn in [
@@ -217,6 +249,16 @@ def get_deriv_token(username: str) -> str | None:
         "SELECT deriv_token FROM users WHERE username = ?", (username,)
     )
     return row["deriv_token"] if row else None
+
+def is_admin(username: str) -> bool:
+    row = fetchone("SELECT is_admin FROM users WHERE username = ?", (username,))
+    if not row:
+        return False
+    val = row["is_admin"]
+    return bool(val) if val is not None else False
+
+def set_admin(username: str, value: bool):
+    execute("UPDATE users SET is_admin = ? WHERE username = ?", (int(value), username))
 
 def get_all_users_with_tokens() -> list[dict]:
     """Return all users who have connected a Deriv account."""
@@ -329,6 +371,150 @@ def get_trade_stats(username: str = None) -> dict:
         "total_trades": total,
         "total_pnl":    round(float(row["total_pnl"]), 2),
     }
+
+
+# ── Subscriptions ──────────────────────────────────────────────────────────────
+
+def get_active_subscription(username: str) -> dict | None:
+    """Return the user's active subscription row, or None."""
+    if _USE_POSTGRES:
+        return fetchone(
+            """
+            SELECT * FROM subscriptions
+            WHERE username = ?
+              AND status = 'active'
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (username,),
+        )
+    return fetchone(
+        """
+        SELECT * FROM subscriptions
+        WHERE username = ?
+          AND status = 'active'
+          AND (expires_at IS NULL OR expires_at > datetime('now'))
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (username,),
+    )
+
+
+def create_pending_subscription(
+    username: str, plan: str, payment_id: str,
+    pay_address: str, pay_amount: float, pay_currency: str, price_usd: float,
+):
+    execute(
+        """
+        INSERT INTO subscriptions
+          (username, plan, status, payment_id, pay_address, pay_amount, pay_currency, price_usd)
+        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+        """,
+        (username, plan, payment_id, pay_address, pay_amount, pay_currency, price_usd),
+    )
+
+
+def get_subscription_by_payment(payment_id: str) -> dict | None:
+    return fetchone(
+        "SELECT * FROM subscriptions WHERE payment_id = ?", (payment_id,)
+    )
+
+
+def activate_subscription(payment_id: str, plan: str):
+    """Set subscription to active with the correct expiry for the plan."""
+    from datetime import datetime, timedelta
+    from payments import PLANS
+
+    days = PLANS[plan]["days"]
+    expires_at = datetime.utcnow() + timedelta(days=days) if days else None
+
+    if expires_at:
+        execute(
+            "UPDATE subscriptions SET status = 'active', expires_at = ? WHERE payment_id = ?",
+            (expires_at, payment_id),
+        )
+    else:
+        execute(
+            "UPDATE subscriptions SET status = 'active', expires_at = NULL WHERE payment_id = ?",
+            (payment_id,),
+        )
+
+
+# ── Admin queries ──────────────────────────────────────────────────────────────
+
+def admin_get_users() -> list[dict]:
+    """All users with their latest subscription status."""
+    if _USE_POSTGRES:
+        return fetchall("""
+            SELECT u.username, u.deriv_account, u.created_at,
+                   s.plan, s.status AS sub_status, s.expires_at, s.price_usd
+            FROM users u
+            LEFT JOIN (
+                SELECT DISTINCT ON (username) *
+                FROM subscriptions
+                ORDER BY username, created_at DESC
+            ) s ON s.username = u.username
+            ORDER BY u.created_at DESC
+        """)
+    return fetchall("""
+        SELECT u.username, u.deriv_account, u.created_at,
+               s.plan, s.status AS sub_status, s.expires_at, s.price_usd
+        FROM users u
+        LEFT JOIN (
+            SELECT * FROM subscriptions
+            GROUP BY username
+            HAVING created_at = MAX(created_at)
+        ) s ON s.username = u.username
+        ORDER BY u.created_at DESC
+    """)
+
+
+def admin_get_subscriptions() -> list[dict]:
+    """All subscriptions, newest first."""
+    return fetchall("SELECT * FROM subscriptions ORDER BY created_at DESC")
+
+
+def admin_get_stats() -> dict:
+    """Aggregate stats for the admin overview."""
+    users_row    = fetchone("SELECT COUNT(*) AS cnt FROM users")
+    total_users  = int(users_row["cnt"]) if users_row else 0
+
+    active_row   = fetchone("SELECT COUNT(*) AS cnt FROM subscriptions WHERE status = 'active'")
+    active_subs  = int(active_row["cnt"]) if active_row else 0
+
+    revenue_row  = fetchone("SELECT COALESCE(SUM(price_usd), 0) AS total FROM subscriptions WHERE status = 'active'")
+    total_revenue = float(revenue_row["total"]) if revenue_row else 0.0
+
+    plan_rows = fetchall("SELECT plan, COUNT(*) AS cnt FROM subscriptions WHERE status = 'active' GROUP BY plan")
+    by_plan   = {r["plan"]: int(r["cnt"]) for r in plan_rows}
+
+    return {
+        "total_users":   total_users,
+        "active_subs":   active_subs,
+        "total_revenue": round(total_revenue, 2),
+        "by_plan":       by_plan,
+    }
+
+
+def admin_revoke_subscription(sub_id: int):
+    execute("UPDATE subscriptions SET status = 'revoked' WHERE id = ?", (sub_id,))
+
+
+def admin_grant_subscription(username: str, plan: str):
+    """Manually grant a free subscription (no payment required)."""
+    import time as _time
+    from datetime import datetime, timedelta
+    from payments import PLANS
+    days       = PLANS[plan]["days"]
+    expires_at = datetime.utcnow() + timedelta(days=days) if days else None
+    execute(
+        """
+        INSERT INTO subscriptions
+          (username, plan, status, payment_id, pay_address, pay_amount, pay_currency, price_usd, expires_at)
+        VALUES (?, ?, 'active', ?, '', 0, 'manual', 0, ?)
+        """,
+        (username, plan, f"manual_{username}_{int(_time.time())}", expires_at),
+    )
 
 
 init_db()

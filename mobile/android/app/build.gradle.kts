@@ -15,9 +15,12 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Required for flutter_local_notifications and other modern libraries
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
+        // Use compilerOptions block to avoid deprecation warning if needed in newer Gradle versions
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
@@ -42,6 +45,9 @@ flutter {
 }
 
 dependencies {
+    // Required for core library desugaring for libraries that need newer Java APIs
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
+
     // Import the Firebase BoM
     implementation(platform("com.google.firebase:firebase-bom:34.11.0"))
     // Add the Firebase SDKs you need

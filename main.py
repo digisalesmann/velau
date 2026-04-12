@@ -1,3 +1,6 @@
+import json
+import hmac
+import hashlib
 import logging
 import asyncio
 import traceback
@@ -5,7 +8,7 @@ from datetime import datetime, date
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -97,6 +100,9 @@ class FCMTokenRequest(BaseModel):
 
 class DerivConnectRequest(BaseModel):
     api_token: str
+
+class SubscriptionCreateRequest(BaseModel):
+    plan: str  # "monthly" | "yearly" | "lifetime"
 
 class CandleRequest(BaseModel):
     symbol:      str = "frxXAUUSD"
@@ -425,3 +431,185 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
     finally:
         await service.close()
+
+
+# ── Subscription / payments ────────────────────────────────────────────────────
+
+@app.get("/subscription/status")
+async def get_subscription_status(user=Depends(get_current_user)):
+    """Return the user's current subscription status."""
+    sub = db.get_active_subscription(user.username)
+    if sub:
+        return {
+            "active":     True,
+            "plan":       sub["plan"],
+            "expires_at": sub.get("expires_at"),
+        }
+    return {"active": False}
+
+
+@app.post("/subscription/create")
+async def create_subscription(req: SubscriptionCreateRequest,
+                              user=Depends(get_current_user)):
+    """Create a crypto payment invoice for the requested plan."""
+    from payments import create_payment, PLANS
+
+    if req.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan. Choose monthly, yearly, or lifetime.")
+
+    # Don't allow double-subscribing while still active
+    existing = db.get_active_subscription(user.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="You already have an active subscription.")
+
+    try:
+        payment = create_payment(req.plan, user.username)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error(f"Payment creation failed for {user.username}: {e}")
+        raise HTTPException(status_code=500, detail="Could not create payment. Please try again.")
+
+    db.create_pending_subscription(
+        username=user.username,
+        plan=req.plan,
+        payment_id=str(payment["payment_id"]),
+        pay_address=payment.get("pay_address", ""),
+        pay_amount=float(payment.get("pay_amount", 0)),
+        pay_currency=payment.get("pay_currency", ""),
+        price_usd=float(payment.get("price_amount", 0)),
+    )
+
+    return {
+        "payment_id":  str(payment["payment_id"]),
+        "pay_address": payment["pay_address"],
+        "pay_amount":  payment["pay_amount"],
+        "pay_currency": payment["pay_currency"],
+        "price_usd":   payment["price_amount"],
+        "plan":        req.plan,
+    }
+
+
+@app.get("/subscription/poll/{payment_id}")
+async def poll_payment(payment_id: str, user=Depends(get_current_user)):
+    """
+    Client polls this endpoint every ~15 s to detect payment confirmation.
+    Returns {"status": "active"|"waiting"|"confirming"|...}.
+    """
+    from payments import get_payment_status, is_confirmed
+
+    sub = db.get_subscription_by_payment(payment_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+
+    if sub["status"] == "active":
+        return {"status": "active", "plan": sub["plan"]}
+
+    # Double-check with NOWPayments in case webhook was missed
+    try:
+        np = get_payment_status(payment_id)
+        np_status = np.get("payment_status", "waiting")
+        if is_confirmed(np_status):
+            db.activate_subscription(payment_id, sub["plan"])
+            logger.info(f"Subscription activated (poll) for {user.username} — plan {sub['plan']}")
+            return {"status": "active", "plan": sub["plan"]}
+        return {"status": np_status}
+    except Exception as e:
+        logger.warning(f"NOWPayments poll error: {e}")
+        return {"status": sub["status"]}
+
+
+@app.post("/subscription/webhook")
+async def subscription_webhook(request: Request):
+    """
+    NOWPayments IPN webhook — called when a payment status changes.
+    Verifies the HMAC-SHA512 signature if NOWPAYMENTS_IPN_SECRET is set.
+    """
+    import os
+    body = await request.body()
+
+    ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
+    if ipn_secret:
+        sig      = request.headers.get("x-nowpayments-sig", "")
+        expected = hmac.new(ipn_secret.encode(), body, hashlib.sha512).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(status_code=401, detail="Invalid IPN signature.")
+
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON.")
+
+    payment_id     = str(data.get("payment_id", ""))
+    payment_status = data.get("payment_status", "")
+
+    from payments import is_confirmed
+    if is_confirmed(payment_status):
+        sub = db.get_subscription_by_payment(payment_id)
+        if sub and sub["status"] == "pending":
+            db.activate_subscription(payment_id, sub["plan"])
+            logger.info(f"Subscription activated (webhook) payment_id={payment_id}")
+
+    return {"received": True}
+
+
+# ── Admin endpoints ────────────────────────────────────────────────────────────
+
+def _require_admin(user=Depends(get_current_user)):
+    if not db.is_admin(user.username):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
+class AdminGrantRequest(BaseModel):
+    username: str
+    plan:     str  # monthly | yearly | lifetime
+
+class AdminRevokeRequest(BaseModel):
+    sub_id: int
+
+class AdminSetAdminRequest(BaseModel):
+    username: str
+    value:    bool
+
+
+@app.get("/admin/stats")
+async def admin_stats(user=Depends(_require_admin)):
+    return db.admin_get_stats()
+
+
+@app.get("/admin/users")
+async def admin_users(user=Depends(_require_admin)):
+    return {"users": db.admin_get_users()}
+
+
+@app.get("/admin/subscriptions")
+async def admin_subscriptions(user=Depends(_require_admin)):
+    return {"subscriptions": db.admin_get_subscriptions()}
+
+
+@app.post("/admin/grant")
+async def admin_grant(req: AdminGrantRequest, user=Depends(_require_admin)):
+    from payments import PLANS
+    if req.plan not in PLANS:
+        raise HTTPException(status_code=400, detail="Invalid plan.")
+    if not db.get_user(req.username):
+        raise HTTPException(status_code=404, detail="User not found.")
+    db.admin_grant_subscription(req.username, req.plan)
+    logger.info(f"Admin {user.username} granted {req.plan} to {req.username}")
+    return {"ok": True}
+
+
+@app.post("/admin/revoke")
+async def admin_revoke(req: AdminRevokeRequest, user=Depends(_require_admin)):
+    db.admin_revoke_subscription(req.sub_id)
+    logger.info(f"Admin {user.username} revoked subscription {req.sub_id}")
+    return {"ok": True}
+
+
+@app.post("/admin/set_admin")
+async def admin_set_admin(req: AdminSetAdminRequest, user=Depends(_require_admin)):
+    if not db.get_user(req.username):
+        raise HTTPException(status_code=404, detail="User not found.")
+    db.set_admin(req.username, req.value)
+    return {"ok": True}
