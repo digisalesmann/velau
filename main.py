@@ -617,3 +617,58 @@ async def admin_set_admin(req: AdminSetAdminRequest, user=Depends(_require_admin
         raise HTTPException(status_code=404, detail="User not found.")
     db.set_admin(req.username, req.value)
     return {"ok": True}
+
+
+# ── 2FA endpoints ──────────────────────────────────────────────────────────────
+
+class TwoFACodeRequest(BaseModel):
+    code: str
+
+
+@app.get("/2fa/status")
+async def get_2fa_status(user=Depends(get_current_user)):
+    data = db.get_totp_data(user.username)
+    return {"enabled": bool(data and data.get("totp_enabled"))}
+
+
+@app.get("/2fa/setup")
+async def setup_2fa(user=Depends(get_current_user)):
+    import pyotp
+    secret = pyotp.random_base32()
+    db.save_totp_secret(user.username, secret)
+    uri = pyotp.TOTP(secret).provisioning_uri(user.username, issuer_name="Velau")
+    return {"secret": secret, "uri": uri}
+
+
+@app.post("/2fa/enable")
+async def enable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+    import pyotp
+    data = db.get_totp_data(user.username)
+    if not data or not data.get("totp_secret"):
+        raise HTTPException(status_code=400, detail="Run /2fa/setup first.")
+    if not pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code.")
+    db.enable_totp(user.username)
+    return {"ok": True}
+
+
+@app.post("/2fa/verify")
+async def verify_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+    import pyotp
+    data = db.get_totp_data(user.username)
+    if not data or not data.get("totp_enabled"):
+        return {"valid": True}
+    valid = pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1)
+    return {"valid": valid}
+
+
+@app.post("/2fa/disable")
+async def disable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+    import pyotp
+    data = db.get_totp_data(user.username)
+    if not data or not data.get("totp_secret"):
+        raise HTTPException(status_code=400, detail="2FA is not set up.")
+    if not pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code.")
+    db.disable_totp(user.username)
+    return {"ok": True}

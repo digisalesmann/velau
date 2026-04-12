@@ -80,6 +80,8 @@ def init_db():
                 ("deriv_token",   "TEXT DEFAULT NULL"),
                 ("deriv_account", "TEXT DEFAULT NULL"),
                 ("is_admin",      "BOOLEAN DEFAULT FALSE"),
+                ("totp_secret",   "TEXT DEFAULT NULL"),
+                ("totp_enabled",  "BOOLEAN DEFAULT FALSE"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -137,6 +139,8 @@ def init_db():
                     deriv_token     TEXT DEFAULT NULL,
                     deriv_account   TEXT DEFAULT NULL,
                     is_admin        INTEGER DEFAULT 0,
+                    totp_secret     TEXT DEFAULT NULL,
+                    totp_enabled    INTEGER DEFAULT 0,
                     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -259,6 +263,27 @@ def is_admin(username: str) -> bool:
 
 def set_admin(username: str, value: bool):
     execute("UPDATE users SET is_admin = ? WHERE username = ?", (int(value), username))
+
+
+# ── TOTP / 2FA ────────────────────────────────────────────────────────────────
+
+def get_totp_data(username: str) -> dict | None:
+    return fetchone(
+        "SELECT totp_secret, totp_enabled FROM users WHERE username = ?",
+        (username,),
+    )
+
+def save_totp_secret(username: str, secret: str):
+    execute("UPDATE users SET totp_secret = ? WHERE username = ?", (secret, username))
+
+def enable_totp(username: str):
+    execute("UPDATE users SET totp_enabled = 1 WHERE username = ?", (username,))
+
+def disable_totp(username: str):
+    execute(
+        "UPDATE users SET totp_enabled = 0, totp_secret = NULL WHERE username = ?",
+        (username,),
+    )
 
 def get_all_users_with_tokens() -> list[dict]:
     """Return all users who have connected a Deriv account."""
