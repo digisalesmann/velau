@@ -59,7 +59,7 @@ def unregister_token(token: str):
 def _send(title: str, body: str, data: dict = None):
     """Send a push notification to all registered devices (one request each)."""
     if not _device_tokens:
-        logger.debug("No registered devices — skipping push")
+        logger.debug("No registered devices, skipping push")
         return
 
     access_token = _get_access_token()
@@ -110,7 +110,7 @@ def notify_trade_executed(direction: str, symbol: str, amount: float, score: int
     emoji  = "🟢" if direction == "CALL" else "🔴"
     action = "BUY (CALL)" if direction == "CALL" else "SELL (PUT)"
     _send(
-        title=f"{emoji} Trade Executed — {action}",
+        title=f"{emoji} Trade Executed {action}",
         body=f"{symbol} · ${amount:.2f} stake · Confluence {score}/7",
         data={"type": "trade_executed", "direction": direction, "symbol": symbol},
     )
@@ -127,13 +127,13 @@ def notify_trade_settled(contract_id: str, won: bool, pnl: float):
 def notify_circuit_breaker(consecutive_losses: int):
     _send(
         title="🚨 Circuit Breaker Triggered",
-        body=f"{consecutive_losses} consecutive losses — bot paused for today. Resets at midnight UTC.",
+        body=f"{consecutive_losses} consecutive losses, bot paused for today. Resets at midnight UTC.",
         data={"type": "circuit_breaker"},
     )
 
 def notify_session_start():
     _send(
         title="📈 Trading Session Open",
-        body="London/NY session started — bot is now scanning XAU/USD.",
+        body="London/NY session started, bot is now scanning XAU/USD.",
         data={"type": "session_start"},
     )

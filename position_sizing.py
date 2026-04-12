@@ -109,7 +109,7 @@ def calculate_stake(
         stake = max(MIN_STAKE, balance * 0.01)
         stake = _round_stake(stake)
         logger.warning(
-            f"⚠️  Win rate {win_rate:.1%} below 50% — "
+            f"⚠️  Win rate {win_rate:.1%} below 50%, applying "
             f"minimum sizing ${stake:.2f} until strategy recovers"
         )
         return stake, "WIN_RATE_CAUTION"

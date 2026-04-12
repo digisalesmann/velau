@@ -323,7 +323,7 @@ class XAUMasterStrategy:
                     self._circuit_broken = True
                     notif.notify_circuit_breaker(self._consecutive_losses)
                     logger.error(
-                        f"🚨 CIRCUIT BREAKER — "
+                        f"🚨 CIRCUIT BREAKER, "
                         f"{self._consecutive_losses} consecutive losses"
                     )
 
@@ -332,7 +332,7 @@ class XAUMasterStrategy:
                     if self._daily_pnl < 0 and dd >= MAX_DAILY_DRAWDOWN_PCT:
                         self._circuit_broken = True
                         notif.notify_circuit_breaker(self._consecutive_losses)
-                        logger.error(f"🚨 CIRCUIT BREAKER — drawdown {dd:.1f}%")
+                        logger.error(f"🚨 CIRCUIT BREAKER, drawdown {dd:.1f}%")
                 break
 
         except Exception as e:
@@ -430,7 +430,7 @@ class XAUMasterStrategy:
                     logger.info(f"🟢 CALL [{score}/7]")
                 else:
                     self.save_signal("NEUTRAL", price, rsi, market_bias,
-                        f"5M bull ({bull_score}/7) blocked — 1H bearish",
+                        f"5M bull ({bull_score}/7) blocked, 1H bearish",
                         bull_score)
                     return
 
@@ -440,7 +440,7 @@ class XAUMasterStrategy:
                     logger.info(f"🔴 PUT [{score}/7]")
                 else:
                     self.save_signal("NEUTRAL", price, rsi, market_bias,
-                        f"5M bear ({bear_score}/7) blocked — 1H bullish",
+                        f"5M bear ({bear_score}/7) blocked, 1H bullish",
                         bear_score)
                     return
 
