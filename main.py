@@ -364,7 +364,7 @@ async def get_news():
 async def get_signals(user=Depends(get_current_user)):
     try:
         from datetime import timezone as tz
-        now_utc  = datetime.now(timezone.utc)
+        now_utc  = datetime.now(tz.utc)
         hour_utc = now_utc.hour
         in_session = trading_bot._in_trading_session()
 
