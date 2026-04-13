@@ -9,9 +9,11 @@ from env_config import DERIV_TOKEN
 
 logger = logging.getLogger("DerivTradingService")
 
-DEMO_EXECUTION_SYMBOL = "1HZ100V"
-TICK_DURATION         = 5
-DURATION_UNIT         = "t"
+# Trade on the same asset we analyse so TA is relevant.
+# Binary options on frxXAUUSD are available on both demo and live Deriv accounts.
+EXECUTION_SYMBOL = "frxXAUUSD"
+CONTRACT_DURATION      = 15   # minutes — matches the 15-minute analysis candles
+CONTRACT_DURATION_UNIT = "m"
 
 
 class DerivTradingService:
@@ -243,21 +245,17 @@ class DerivTradingService:
         self,
         contract_type: str,
         amount: float,
-        duration: int = TICK_DURATION,
+        duration: int = CONTRACT_DURATION,
+        duration_unit: str = CONTRACT_DURATION_UNIT,
         symbol: str = None,
     ) -> dict:
         if not self._authorized:
             await self.authenticate()
 
-        exec_symbol = symbol or DEMO_EXECUTION_SYMBOL
-        if "XAU" in exec_symbol or "frx" in exec_symbol:
-            logger.warning(
-                f"Redirecting {exec_symbol} → {DEMO_EXECUTION_SYMBOL} (not on demo)"
-            )
-            exec_symbol = DEMO_EXECUTION_SYMBOL
+        exec_symbol = symbol or EXECUTION_SYMBOL
 
         logger.info(
-            f"📤 Proposal | {contract_type} ${amount} | {TICK_DURATION}t | {exec_symbol}"
+            f"📤 Proposal | {contract_type} ${amount} | {duration}{duration_unit} | {exec_symbol}"
         )
 
         await self.ws.send({
@@ -266,8 +264,8 @@ class DerivTradingService:
             "basis":         "stake",
             "contract_type": contract_type,
             "currency":      "USD",
-            "duration":      TICK_DURATION,
-            "duration_unit": DURATION_UNIT,
+            "duration":      duration,
+            "duration_unit": duration_unit,
             "symbol":        exec_symbol,
         })
 

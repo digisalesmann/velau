@@ -1,15 +1,31 @@
 """
-XAU Master Strategy — SMC engine with tiered position sizing.
+XAU/USD Master Strategy — multi-timeframe trend-following engine.
+
+Timeframe stack:
+  4H  candles → macro bias (bull/bear market)
+  1H  candles → session trend direction
+  15M candles → primary entry/exit signals
+
+Confluence scoring (4/7 required):
+  1. 4H EMA trend  — price vs EMA200 on 4H
+  2. 1H EMA trend  — EMA50 vs EMA200 on 1H
+  3. RSI 50-line   — RSI14 > 50 (bull) / < 50 (bear) on 15M
+  4. MACD momentum — histogram direction + zero-line cross on 15M
+  5. Bollinger Band — price below mid-band pullback in uptrend (bull)
+                      price above mid-band pullback in downtrend (bear)
+  6. ADX trend     — ADX > 20 confirms a trending market (not scoring direction)
+  7. BOS structure — fresh break of swing high/low on 15M
+
+Trade contract: frxXAUUSD CALL/PUT, 15-minute expiry (matches analysis candle).
 
 Position sizing tiers:
-  $0-50:    10% per trade  (survival mode)
-  $50-200:   5% per trade  (growth mode)
-  $200-1000: 3% per trade  (compound mode)
-  $1000+:    2% per trade, $50 cap (preservation mode)
+  $0-50    → 10%   (survival)
+  $50-200  →  5%   (growth)
+  $200-1000→  3%   (compound)
+  $1000+   →  2%, $50 cap (preservation)
 
-Recovery mode: after any loss, drops one tier until 2 consecutive wins.
-
-Confluence threshold: 5/7 (BOS fixed to only score on FRESH breaks)
+Break-even win rate at 75% payout: 57.1%
+Target: 60%+
 """
 import sys
 import os
@@ -20,11 +36,10 @@ import logging
 import pandas as pd
 from datetime import datetime, timezone
 
-from ta.trend      import EMAIndicator, MACD
+from ta.trend      import EMAIndicator, MACD, ADXIndicator
 from ta.momentum   import RSIIndicator
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
 
-from news.news_pipeline            import get_news_and_sentiment
 from brokers.deriv_trading_service import DerivTradingService
 from position_sizing               import (
     calculate_stake, get_sizing_context, WINS_TO_EXIT_RECOVERY
@@ -35,14 +50,14 @@ from core import notifications as notif
 logger = logging.getLogger("XAUStrategy")
 
 ANALYSIS_SYMBOL        = "frxXAUUSD"
-MAX_SAFE_ATR           = 18.0
-MIN_CONFLUENCE         = 5
-LOOP_INTERVAL          = 300
+MIN_CONFLUENCE         = 4          # 4/7 with better-quality indicators
+LOOP_INTERVAL          = 300        # 5-minute cycles
 MAX_CONSECUTIVE_LOSSES = 3
 MAX_DAILY_DRAWDOWN_PCT = 10.0
-SESSIONS               = [(7, 12), (12, 17)]
-SWING_LOOKBACK         = 10
-FVG_MIN_SIZE_PCT       = 0.02
+SESSIONS               = [(7, 17)]  # London + NY combined (UTC 7-17)
+SWING_LOOKBACK         = 12
+MAX_SAFE_ATR           = 20.0       # filter extreme volatility spikes
+ADX_TREND_THRESHOLD    = 20         # only enter when market is trending
 
 
 class XAUMasterStrategy:
@@ -103,7 +118,7 @@ class XAUMasterStrategy:
         )
         return stake, tier
 
-    # ── DB ─────────────────────────────────────────────────────────────────────
+    # ── DB helpers ─────────────────────────────────────────────────────────────
     def save_signal(self, sig_type, price, rsi, bias, reason, score=0):
         try:
             db.insert_signal(
@@ -120,8 +135,8 @@ class XAUMasterStrategy:
         except Exception as e:
             logger.error(f"Trade result DB error: {e}")
 
-    # ── Candles ────────────────────────────────────────────────────────────────
-    async def _get_candles(self, service, gran=300, count=300) -> pd.DataFrame:
+    # ── Candle fetching ────────────────────────────────────────────────────────
+    async def _get_candles(self, service, gran=900, count=250) -> pd.DataFrame:
         logger.info(f"📥 Candles gran={gran}s count={count}")
         raw = await service.get_candles(ANALYSIS_SYMBOL, count=count, granularity=gran)
         if not raw:
@@ -130,83 +145,64 @@ class XAUMasterStrategy:
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].astype(float)
         df.reset_index(drop=True, inplace=True)
-        logger.info(f"✅ {len(df)} candles")
+        logger.info(f"✅ {len(df)} candles (gran={gran}s)")
         return df
 
-    def _compute_standard(self, df: pd.DataFrame) -> pd.DataFrame:
+    # ── Indicator computation ──────────────────────────────────────────────────
+    def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or len(df) < 210:
             logger.warning(f"Not enough candles: {len(df)}")
             return pd.DataFrame()
         c, h, l = df["close"], df["high"], df["low"]
+
+        # Trend
         df["EMA_50"]  = EMAIndicator(close=c, window=50).ema_indicator()
         df["EMA_200"] = EMAIndicator(close=c, window=200).ema_indicator()
+
+        # Momentum
         df["RSI_14"]  = RSIIndicator(close=c, window=14).rsi()
         macd          = MACD(close=c, window_slow=26, window_fast=12, window_sign=9)
         df["MACD_H"]  = macd.macd_diff()
+        df["MACD_L"]  = macd.macd()      # MACD line (for zero-cross)
+
+        # Volatility / range
         df["ATR_14"]  = AverageTrueRange(high=h, low=l, close=c, window=14).average_true_range()
+        bb = BollingerBands(close=c, window=20, window_dev=2)
+        df["BB_MID"]  = bb.bollinger_mavg()
+        df["BB_UP"]   = bb.bollinger_hband()
+        df["BB_LO"]   = bb.bollinger_lband()
+        df["BB_PCT"]  = bb.bollinger_pband()   # 0=lower band, 1=upper band
+
+        # Trend strength
+        adx = ADXIndicator(high=h, low=l, close=c, window=14)
+        df["ADX"]     = adx.adx()
+        df["DI_PLUS"] = adx.adx_pos()
+        df["DI_MINUS"]= adx.adx_neg()
+
         df.dropna(inplace=True)
         df.reset_index(drop=True, inplace=True)
         logger.info(f"✅ Indicators on {len(df)} rows")
         return df
 
-    # ── SMC detectors ──────────────────────────────────────────────────────────
-    def _detect_fvg(self, df):
-        if len(df) < 10:
-            return "", "No FVG"
-        price  = float(df["close"].iloc[-1])
-        recent = df.tail(15).reset_index(drop=True)
-        for i in range(2, len(recent)):
-            c0, c2 = recent.iloc[i-2], recent.iloc[i]
-            if c2["low"] > c0["high"]:
-                gap = c2["low"] - c0["high"]
-                if gap / price >= FVG_MIN_SIZE_PCT:
-                    if c0["high"] <= price <= c2["low"]:
-                        return "bull", f"Bullish FVG ({c0['high']:.2f}-{c2['low']:.2f})"
-            if c2["high"] < c0["low"]:
-                gap = c0["low"] - c2["high"]
-                if gap / price >= FVG_MIN_SIZE_PCT:
-                    if c2["high"] <= price <= c0["low"]:
-                        return "bear", f"Bearish FVG ({c2['high']:.2f}-{c0['low']:.2f})"
-        return "", "No FVG"
-
-    def _detect_market_structure(self, df):
-        """
-        Only scores on a FRESH break of structure this candle.
-        Prevents the 'above midpoint' bug that scored every cycle in a trend.
-        """
-        if len(df) < SWING_LOOKBACK + 5:
-            return "", "No BOS"
-        recent        = df.tail(SWING_LOOKBACK + 5).reset_index(drop=True)
-        cur           = float(recent["close"].iloc[-1])
-        prev          = float(recent["close"].iloc[-2])
-        lookback      = recent.iloc[:-2]
-        swing_high    = float(lookback["high"].max())
-        swing_low     = float(lookback["low"].min())
-
-        if cur > swing_high and prev <= swing_high:
-            return "bull", f"BOS: broke {swing_high:.2f}"
-        if cur < swing_low and prev >= swing_low:
-            return "bear", f"BOS: broke {swing_low:.2f}"
-        return "", "No fresh BOS"
-
-    def _detect_liquidity_sweep(self, df):
-        if len(df) < SWING_LOOKBACK + 3:
-            return "", "No sweep"
-        ref   = df.iloc[-(SWING_LOOKBACK + 3):-3]
-        last3 = df.tail(3).reset_index(drop=True)
-        if ref.empty:
-            return "", "No sweep"
-        swing_high = float(ref["high"].max())
-        swing_low  = float(ref["low"].min())
-        for i in range(len(last3)):
-            c = last3.iloc[i]
-            if c["low"] < swing_low and c["close"] > swing_low:
-                return "bull", f"Liq sweep below {swing_low:.2f}"
-            if c["high"] > swing_high and c["close"] < swing_high:
-                return "bear", f"Liq sweep above {swing_high:.2f}"
-        return "", "No sweep"
+    # ── Multi-timeframe bias ───────────────────────────────────────────────────
+    async def _get_4h_bias(self, service) -> str:
+        """Macro trend: price vs EMA200 on 4H candles."""
+        try:
+            df = await self._get_candles(service, gran=14400, count=220)
+            if df.empty or len(df) < 210:
+                return "neutral"
+            df["EMA_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+            df.dropna(inplace=True)
+            row  = df.iloc[-1]
+            bias = "bullish" if row["close"] > row["EMA_200"] else "bearish"
+            logger.info(f"📈 4H macro bias: {bias} | price={row['close']:.2f} EMA200={row['EMA_200']:.2f}")
+            return bias
+        except Exception as e:
+            logger.warning(f"4H bias error: {e}")
+            return "neutral"
 
     async def _get_1h_bias(self, service) -> str:
+        """Session trend: EMA50 vs EMA200 on 1H candles."""
         try:
             df = await self._get_candles(service, gran=3600, count=220)
             if df.empty or len(df) < 210:
@@ -217,54 +213,111 @@ class XAUMasterStrategy:
             row  = df.iloc[-1]
             bias = "bullish" if row["EMA_50"] > row["EMA_200"] else \
                    "bearish" if row["EMA_50"] < row["EMA_200"] else "neutral"
-            logger.info(f"📈 1H: {bias}")
+            logger.info(f"📈 1H session bias: {bias} | EMA50={row['EMA_50']:.2f} EMA200={row['EMA_200']:.2f}")
             return bias
         except Exception as e:
-            logger.warning(f"1H bias: {e}")
+            logger.warning(f"1H bias error: {e}")
             return "neutral"
 
-    def _score(self, df, sentiment):
-        bull, bear = [], []
-        row    = df.iloc[-1]
-        price  = float(row["close"])
-        ema50  = float(row["EMA_50"])
-        ema200 = float(row["EMA_200"])
-        rsi    = float(row["RSI_14"])
-        macd_h = float(row["MACD_H"])
+    # ── Structure detection ────────────────────────────────────────────────────
+    def _detect_bos(self, df):
+        """Fresh break of structure on current 15M candle only."""
+        if len(df) < SWING_LOOKBACK + 5:
+            return "", "No BOS"
+        recent     = df.tail(SWING_LOOKBACK + 5).reset_index(drop=True)
+        cur        = float(recent["close"].iloc[-1])
+        prev       = float(recent["close"].iloc[-2])
+        lookback   = recent.iloc[:-2]
+        swing_high = float(lookback["high"].max())
+        swing_low  = float(lookback["low"].min())
+        if cur > swing_high and prev <= swing_high:
+            return "bull", f"BOS broke {swing_high:.2f}"
+        if cur < swing_low and prev >= swing_low:
+            return "bear", f"BOS broke {swing_low:.2f}"
+        return "", "No fresh BOS"
 
-        # 1. EMA 200
-        (bull if price > ema200 else bear).append(
-            "Above EMA 200" if price > ema200 else "Below EMA 200")
+    # ── Confluence scorer ──────────────────────────────────────────────────────
+    def _score(self, df: pd.DataFrame, h1_bias: str, h4_bias: str) -> tuple:
+        bull_r, bear_r = [], []
+        row     = df.iloc[-1]
+        price   = float(row["close"])
+        ema50   = float(row["EMA_50"])
+        ema200  = float(row["EMA_200"])
+        rsi     = float(row["RSI_14"])
+        macd_h  = float(row["MACD_H"])
+        macd_l  = float(row["MACD_L"])
+        adx     = float(row["ADX"])
+        di_plus = float(row["DI_PLUS"])
+        di_minus= float(row["DI_MINUS"])
+        bb_pct  = float(row["BB_PCT"])
+        bb_mid  = float(row["BB_MID"])
 
-        # 2. EMA 50
-        (bull if price > ema50 else bear).append(
-            "Above EMA 50" if price > ema50 else "Below EMA 50")
+        logger.info(
+            f"📊 Price={price:.2f} RSI={rsi:.1f} ADX={adx:.1f} "
+            f"EMA50={ema50:.2f} EMA200={ema200:.2f} "
+            f"MACD_H={macd_h:.4f} BB%={bb_pct:.2f}"
+        )
 
-        # 3. RSI — only at genuine extremes
-        if rsi > 65:   bear.append(f"RSI overbought ({rsi:.1f})")
-        elif rsi < 35: bull.append(f"RSI oversold ({rsi:.1f})")
+        # 1. 4H macro bias (strong trend filter)
+        if h4_bias == "bullish":
+            bull_r.append(f"4H macro bullish (price > EMA200)")
+        elif h4_bias == "bearish":
+            bear_r.append(f"4H macro bearish (price < EMA200)")
 
-        # 4. MACD
-        (bull if macd_h > 0 else bear).append(
-            f"MACD bull" if macd_h > 0 else "MACD bear")
+        # 2. 1H session trend (EMA50 vs EMA200 cross)
+        if h1_bias == "bullish":
+            bull_r.append("1H EMA50 > EMA200 (uptrend)")
+        elif h1_bias == "bearish":
+            bear_r.append("1H EMA50 < EMA200 (downtrend)")
 
-        # 5. FVG
-        fvg_dir, fvg_desc = self._detect_fvg(df)
-        if fvg_dir == "bull":   bull.append(fvg_desc)
-        elif fvg_dir == "bear": bear.append(fvg_desc)
-        logger.info(f"🔲 FVG: {fvg_desc}")
+        # 3. RSI 50-line momentum — crossing 50 is more reliable than extremes
+        prev_rsi = float(df.iloc[-2]["RSI_14"])
+        if rsi > 50:
+            bull_r.append(f"RSI {rsi:.1f} > 50 (bullish momentum)")
+        elif rsi < 50:
+            bear_r.append(f"RSI {rsi:.1f} < 50 (bearish momentum)")
 
-        # 6. BOS — fresh breaks only
-        bos_dir, bos_desc = self._detect_market_structure(df)
-        if bos_dir == "bull":   bull.append(bos_desc)
-        elif bos_dir == "bear": bear.append(bos_desc)
+        # 4. MACD histogram direction + zero-line position
+        prev_macd_h = float(df.iloc[-2]["MACD_H"])
+        if macd_h > 0 and macd_l > 0:
+            bull_r.append(f"MACD above zero, histogram positive")
+        elif macd_h < 0 and macd_l < 0:
+            bear_r.append(f"MACD below zero, histogram negative")
+        elif macd_h > 0 and macd_h > prev_macd_h:
+            bull_r.append(f"MACD histogram rising (momentum building)")
+        elif macd_h < 0 and macd_h < prev_macd_h:
+            bear_r.append(f"MACD histogram falling (momentum dropping)")
+
+        # 5. Bollinger Band position — look for pullbacks to mid-band in trend direction
+        # In uptrend: buy when price pulls back below mid-band (BB% < 0.5)
+        # In downtrend: sell when price bounces above mid-band (BB% > 0.5)
+        if bb_pct < 0.45 and h1_bias == "bullish":
+            bull_r.append(f"Price below BB mid in uptrend (pullback entry)")
+        elif bb_pct > 0.55 and h1_bias == "bearish":
+            bear_r.append(f"Price above BB mid in downtrend (pullback entry)")
+        elif bb_pct < 0.25:
+            bull_r.append(f"Price at lower BB band (oversold)")
+        elif bb_pct > 0.75:
+            bear_r.append(f"Price at upper BB band (overbought)")
+
+        # 6. ADX + DI direction — trend strength
+        if adx > ADX_TREND_THRESHOLD:
+            if di_plus > di_minus:
+                bull_r.append(f"ADX {adx:.1f} trending, +DI > -DI (bullish pressure)")
+            elif di_minus > di_plus:
+                bear_r.append(f"ADX {adx:.1f} trending, -DI > +DI (bearish pressure)")
+        else:
+            logger.info(f"⚠️  ADX {adx:.1f} < {ADX_TREND_THRESHOLD} (choppy market, ADX factor neutral)")
+
+        # 7. Fresh BOS structure break
+        bos_dir, bos_desc = self._detect_bos(df)
+        if bos_dir == "bull":
+            bull_r.append(bos_desc)
+        elif bos_dir == "bear":
+            bear_r.append(bos_desc)
         logger.info(f"🏗  BOS: {bos_desc}")
 
-        # 7. Sentiment
-        if sentiment == "Bullish":   bull.append("Sentiment bullish")
-        elif sentiment == "Bearish": bear.append("Sentiment bearish")
-
-        return len(bull), len(bear), bull, bear
+        return len(bull_r), len(bear_r), bull_r, bear_r
 
     # ── Contract monitor ───────────────────────────────────────────────────────
     async def _monitor_contract(self, service, contract_id, stake):
@@ -275,10 +328,10 @@ class XAUMasterStrategy:
                 "contract_id": contract_id,
                 "subscribe": 1,
             })
-            deadline = asyncio.get_event_loop().time() + 120
+            deadline = asyncio.get_event_loop().time() + 1200   # 20-min max watch window
             while asyncio.get_event_loop().time() < deadline:
                 try:
-                    msg = await service.ws.receive(timeout=30.0)
+                    msg = await service.ws.receive(timeout=60.0)
                 except TimeoutError:
                     break
                 poc = msg.get("proposal_open_contracts") or msg.get("poc")
@@ -300,39 +353,30 @@ class XAUMasterStrategy:
                     if self._in_recovery and \
                             self._consecutive_wins >= WINS_TO_EXIT_RECOVERY:
                         self._in_recovery = False
-                        logger.info(
-                            f"✅ Exiting recovery after "
-                            f"{self._consecutive_wins} wins"
-                        )
+                        logger.info(f"✅ Exiting recovery after {self._consecutive_wins} wins")
                     logger.info(
-                        f"✅ WON +${profit:.2f} | "
-                        f"streak=+{self._consecutive_wins} | "
-                        f"daily={self._daily_pnl:+.2f}"
+                        f"✅ WON +${profit:.2f} | streak=+{self._consecutive_wins} | daily={self._daily_pnl:+.2f}"
                     )
                 else:
                     self._consecutive_wins    = 0
                     self._consecutive_losses += 1
                     self._in_recovery         = True
                     logger.warning(
-                        f"❌ LOST -${stake:.2f} | "
-                        f"streak=-{self._consecutive_losses} | "
+                        f"❌ LOST -${stake:.2f} | streak=-{self._consecutive_losses} | "
                         f"→ recovery (need {WINS_TO_EXIT_RECOVERY} wins)"
                     )
 
                 if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
                     self._circuit_broken = True
                     notif.notify_circuit_breaker(self._consecutive_losses)
-                    logger.error(
-                        f"🚨 CIRCUIT BREAKER, "
-                        f"{self._consecutive_losses} consecutive losses"
-                    )
+                    logger.error(f"🚨 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses")
 
                 if self._opening_balance and self._opening_balance > 0:
                     dd = abs(self._daily_pnl) / self._opening_balance * 100
                     if self._daily_pnl < 0 and dd >= MAX_DAILY_DRAWDOWN_PCT:
                         self._circuit_broken = True
                         notif.notify_circuit_breaker(self._consecutive_losses)
-                        logger.error(f"🚨 CIRCUIT BREAKER, drawdown {dd:.1f}%")
+                        logger.error(f"🚨 CIRCUIT BREAKER: drawdown {dd:.1f}%")
                 break
 
         except Exception as e:
@@ -341,7 +385,7 @@ class XAUMasterStrategy:
             self._trade_in_progress = False
             logger.info("🔓 Position lock released")
 
-    # ── Main cycle ─────────────────────────────────────────────────────────────
+    # ── Main trade cycle ───────────────────────────────────────────────────────
     async def execute_trade_cycle(self):
         now_utc = datetime.now(timezone.utc)
         logger.info(f"━━━ Cycle {now_utc:%H:%M:%S} UTC ━━━")
@@ -360,7 +404,7 @@ class XAUMasterStrategy:
                     f"recovery={'⚠️' if self._in_recovery else '✅'}"
                 )
             except Exception as e:
-                logger.warning(f"Balance: {e}")
+                logger.warning(f"Balance fetch: {e}")
 
             self._maybe_notify_session_start()
 
@@ -372,98 +416,88 @@ class XAUMasterStrategy:
 
             if self._circuit_broken:
                 self.save_signal("NEUTRAL", 0, 0, "N/A",
-                    "Circuit breaker active. Resumes tomorrow.", 0)
+                    "Circuit breaker active — resumes next trading day.", 0)
                 return
 
             if self._trade_in_progress:
                 return
 
             if not self._in_trading_session():
-                logger.info(f"😴 Outside session (UTC {now_utc.hour}:00)")
+                logger.info(f"😴 Outside session (UTC {now_utc.hour}:00) | Active: 07:00-17:00 UTC")
                 return
 
-            try:
-                _, sentiment_data = get_news_and_sentiment()
-                market_bias = sentiment_data.get("overall", "Neutral")
-                logger.info(f"📰 {market_bias}")
-            except Exception as e:
-                logger.warning(f"Sentiment: {e}")
-                market_bias = "Neutral"
-
+            # ── Fetch all timeframes ───────────────────────────────────────────
+            h4_bias = await self._get_4h_bias(service)
             h1_bias = await self._get_1h_bias(service)
 
-            df = await self._get_candles(service, gran=300, count=300)
-            df = self._compute_standard(df)
+            # Primary: 15M candles (250 bars = ~2.6 days)
+            df = await self._get_candles(service, gran=900, count=250)
+            df = self._compute_indicators(df)
             if df.empty:
-                self.save_signal("NEUTRAL", 0, 0, market_bias,
-                    "Collecting data...", 0)
+                self.save_signal("NEUTRAL", 0, 0, "N/A", "Collecting market data...", 0)
                 return
 
             row   = df.iloc[-1]
             price = float(row["close"])
             rsi   = float(row["RSI_14"])
             atr   = float(row["ATR_14"])
+            adx   = float(row["ADX"])
 
-            logger.info(
-                f"📊 Price={price:.2f} RSI={rsi:.1f} ATR={atr:.2f} "
-                f"EMA50={float(row['EMA_50']):.2f} "
-                f"EMA200={float(row['EMA_200']):.2f} "
-                f"MACD={float(row['MACD_H']):.5f}"
-            )
-
+            # ── Volatility gate ────────────────────────────────────────────────
             if atr > MAX_SAFE_ATR:
-                self.save_signal("NEUTRAL", price, rsi, market_bias,
-                    f"ATR too high ({atr:.2f})", 0)
+                self.save_signal("NEUTRAL", price, rsi, "N/A",
+                    f"Extreme volatility (ATR {atr:.2f}) — waiting for calm", 0)
+                logger.warning(f"⚠️  ATR {atr:.2f} > {MAX_SAFE_ATR}, skipping")
                 return
 
-            bull_score, bear_score, bull_r, bear_r = self._score(df, market_bias)
-            logger.info(
-                f"🔢 BULL={bull_score}/7 BEAR={bear_score}/7 "
-                f"need {MIN_CONFLUENCE}"
-            )
+            # ── Score confluence ───────────────────────────────────────────────
+            bull_score, bear_score, bull_r, bear_r = self._score(df, h1_bias, h4_bias)
+            logger.info(f"🔢 BULL={bull_score}/7 BEAR={bear_score}/7 need {MIN_CONFLUENCE}")
+
+            # ── Hard bias filter — only trade WITH the trend, not against it ──
+            # Require 4H and 1H to agree before entering. This cuts noise trades.
+            biases_agree_bull = h4_bias in ("bullish", "neutral") and h1_bias in ("bullish", "neutral")
+            biases_agree_bear = h4_bias in ("bearish", "neutral") and h1_bias in ("bearish", "neutral")
 
             direction, reasons, score = None, [], 0
 
             if bull_score >= MIN_CONFLUENCE and bull_score > bear_score:
-                if h1_bias in ("bullish", "neutral"):
+                if biases_agree_bull:
                     direction, reasons, score = "CALL", bull_r, bull_score
-                    logger.info(f"🟢 CALL [{score}/7]")
+                    logger.info(f"🟢 CALL [{score}/7] | 4H={h4_bias} 1H={h1_bias}")
                 else:
-                    self.save_signal("NEUTRAL", price, rsi, market_bias,
-                        f"5M bull ({bull_score}/7) blocked, 1H bearish",
+                    self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                        f"15M bull ({bull_score}/7) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
                         bull_score)
                     return
 
             elif bear_score >= MIN_CONFLUENCE and bear_score > bull_score:
-                if h1_bias in ("bearish", "neutral"):
+                if biases_agree_bear:
                     direction, reasons, score = "PUT", bear_r, bear_score
-                    logger.info(f"🔴 PUT [{score}/7]")
+                    logger.info(f"🔴 PUT [{score}/7] | 4H={h4_bias} 1H={h1_bias}")
                 else:
-                    self.save_signal("NEUTRAL", price, rsi, market_bias,
-                        f"5M bear ({bear_score}/7) blocked, 1H bullish",
+                    self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                        f"15M bear ({bear_score}/7) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
                         bear_score)
                     return
 
             if direction:
                 stake, tier = self._get_stake()
-                signal = "BUY" if direction == "CALL" else "SELL"
-                self.save_signal(signal, price, rsi, market_bias,
+                signal_type = "BUY" if direction == "CALL" else "SELL"
+                self.save_signal(signal_type, price, rsi, h1_bias,
                     " | ".join(reasons), score)
 
                 logger.info(
                     f"🚀 {direction} | ${stake:.2f} "
                     f"({stake/self._current_balance*100:.1f}% | {tier}) | "
-                    f"confluence={score}/7"
+                    f"confluence={score}/7 | ADX={adx:.1f}"
                 )
                 self._trade_in_progress = True
 
                 result      = await service.place_order(direction, stake)
                 contract_id = result.get("buy", {}).get("contract_id", "unknown")
-                logger.info(f"✅ Placed | {contract_id}")
-
-                notif.notify_trade_executed(
-                    direction, ANALYSIS_SYMBOL, stake, score
-                )
+                logger.info(f"✅ Placed | contract={contract_id}")
+                notif.notify_trade_executed(direction, ANALYSIS_SYMBOL, stake, score)
 
                 monitor_svc = DerivTradingService()
                 await monitor_svc.authenticate()
@@ -475,11 +509,11 @@ class XAUMasterStrategy:
                 leaning = "bullish" if bull_score >= bear_score else "bearish"
                 top_r   = bull_r if bull_score >= bear_score else bear_r
                 self.save_signal(
-                    "NEUTRAL", price, rsi, market_bias,
-                    f"Leaning {leaning} ({top}/7), need {MIN_CONFLUENCE}. "
-                    + " | ".join(top_r), top
+                    "NEUTRAL", price, rsi, h1_bias,
+                    f"Leaning {leaning} ({top}/7, need {MIN_CONFLUENCE}). "
+                    + " | ".join(top_r[:3]), top
                 )
-                logger.info(f"⏳ {leaning} {top}/7")
+                logger.info(f"⏳ Waiting — {leaning} {top}/7 (need {MIN_CONFLUENCE})")
 
         except Exception as e:
             logger.error(f"❌ Cycle error: {e}")
@@ -499,6 +533,6 @@ class XAUMasterStrategy:
             except Exception as e:
                 logger.error(f"Loop error: {e}")
             if self.is_running:
-                logger.info(f"⏱  Next in {LOOP_INTERVAL}s")
+                logger.info(f"⏱  Next cycle in {LOOP_INTERVAL}s")
                 await asyncio.sleep(LOOP_INTERVAL)
         logger.info("🛑 Stopped")
