@@ -177,7 +177,7 @@ async def connect_deriv(
         # Store token
         db.save_deriv_token(user.username, req.api_token, account_id)
         logger.info(
-            f"✅ {user.username} connected Deriv account "
+            f"{user.username} connected Deriv account "
             f"{account_id} (${balance} {currency})"
         )
 
@@ -651,6 +651,13 @@ async def get_2fa_status(user=Depends(get_current_user)):
 @app.get("/2fa/setup")
 async def setup_2fa(user=Depends(get_current_user)):
     import pyotp
+    data = db.get_totp_data(user.username)
+    # Refuse to overwrite an already-active secret — user must disable first
+    if data and data.get("totp_enabled"):
+        raise HTTPException(
+            status_code=400,
+            detail="2FA is already enabled. Disable it before setting up a new authenticator."
+        )
     secret = pyotp.random_base32()
     db.save_totp_secret(user.username, secret)
     uri = pyotp.TOTP(secret).provisioning_uri(user.username, issuer_name="Velau")
