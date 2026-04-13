@@ -381,7 +381,7 @@ async def get_signals(user=Depends(get_current_user)):
         return {
             "signals":         db.get_signals(limit=30, username=user.username),
             "in_session":      in_session,
-            "session_hours":   "07:00–17:00 UTC (London + NY)",
+            "session_hours":   "07:00-17:00 UTC (London + NY)",
             "mins_to_session": mins_to_session if not in_session else 0,
             "bot_running":     trading_bot.is_running,
         }
