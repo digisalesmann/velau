@@ -74,6 +74,8 @@ class XAUMasterStrategy:
         self._last_session_notif = None
         self._current_balance    = 0.0
         self._win_rate           = 0.0
+        self._sentiment_cache: dict = {}
+        self._sentiment_cache_time: datetime | None = None
 
     # ── State management ───────────────────────────────────────────────────────
     def _maybe_reset_daily(self, balance: float):
@@ -93,6 +95,21 @@ class XAUMasterStrategy:
     def _in_trading_session(self) -> bool:
         hour = datetime.now(timezone.utc).hour
         return any(s <= hour < e for s, e in SESSIONS)
+
+    def _get_cached_sentiment(self) -> dict:
+        """Refresh news sentiment at most once every 30 minutes."""
+        now = datetime.now(timezone.utc)
+        age = (now - self._sentiment_cache_time).total_seconds() if self._sentiment_cache_time else 9999
+        if age > 1800:
+            try:
+                from news.news_pipeline import get_news_and_sentiment
+                _, s = get_news_and_sentiment()
+                self._sentiment_cache      = s
+                self._sentiment_cache_time = now
+                logger.info(f"📰 Sentiment: {s['overall']} ({s['score']:+.3f}) | articles={s['articles_analyzed']}")
+            except Exception as e:
+                logger.warning(f"Sentiment refresh failed: {e}")
+        return self._sentiment_cache
 
     def _maybe_notify_session_start(self):
         today = datetime.now(timezone.utc).date()
@@ -141,9 +158,27 @@ class XAUMasterStrategy:
         raw = await service.get_candles(ANALYSIS_SYMBOL, count=count, granularity=gran)
         if not raw:
             return pd.DataFrame()
+
+        # For 15M only: fetch a second batch ending just before the first one starts
+        # so we get ~280 rows instead of Deriv's ~139 cap.
+        if gran == 900 and len(raw) > 0:
+            oldest_epoch = raw[0]['epoch']
+            try:
+                raw2 = await service.get_candles(
+                    ANALYSIS_SYMBOL, count=count, granularity=gran,
+                    end=oldest_epoch - gran,
+                )
+                if raw2:
+                    raw = raw2 + raw
+                    logger.info(f"🔗 Stitched: {len(raw2)}+{len(raw) - len(raw2)} candles")
+            except Exception as e:
+                logger.warning(f"Candle stitch batch 2 failed (using single batch): {e}")
+
         df = pd.DataFrame(raw)
         for col in ("open", "high", "low", "close"):
             df[col] = df[col].astype(float)
+        df.drop_duplicates(subset=["epoch"], keep="last", inplace=True)
+        df.sort_values("epoch", inplace=True)
         df.reset_index(drop=True, inplace=True)
         logger.info(f"✅ {len(df)} candles (gran={gran}s)")
         return df
@@ -426,6 +461,17 @@ class XAUMasterStrategy:
                 logger.info(f"😴 Outside session (UTC {now_utc.hour}:00) | Active: 07:00-17:00 UTC")
                 return
 
+            # ── Economic calendar blackout ─────────────────────────────────────────
+            try:
+                from news.news_pipeline import get_economic_blackout
+                is_blackout, blackout_reason = get_economic_blackout(now_utc)
+                if is_blackout:
+                    logger.warning(f"📅 {blackout_reason} — skipping cycle")
+                    self.save_signal("NEUTRAL", 0, 0, "N/A", blackout_reason, 0)
+                    return
+            except Exception as e:
+                logger.warning(f"Calendar check failed: {e}")
+
             # ── Fetch all timeframes ───────────────────────────────────────────
             h4_bias = await self._get_4h_bias(service)
             h1_bias = await self._get_1h_bias(service)
@@ -493,6 +539,27 @@ class XAUMasterStrategy:
                     f"confluence={score}/7 | ADX={adx:.1f}"
                 )
                 self._trade_in_progress = True
+
+                # ── News sentiment filter ──────────────────────────────────────────────
+                sentiment     = self._get_cached_sentiment()
+                news_overall  = sentiment.get("overall", "Neutral")
+                sentiment_min = MIN_CONFLUENCE + 1   # raise bar when news disagrees
+                if direction == "CALL" and news_overall == "Bearish":
+                    if score < sentiment_min:
+                        logger.warning(f"⚠️  Bearish news opposes CALL ({score}/7 < {sentiment_min}) — skipping")
+                        self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                            f"News sentiment Bearish — CALL needs {sentiment_min}/7, got {score}/7", score)
+                        return
+                    logger.info(f"📰 News Bearish but CALL has high confluence ({score}/7) — proceeding")
+                elif direction == "PUT" and news_overall == "Bullish":
+                    if score < sentiment_min:
+                        logger.warning(f"⚠️  Bullish news opposes PUT ({score}/7 < {sentiment_min}) — skipping")
+                        self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                            f"News sentiment Bullish — PUT needs {sentiment_min}/7, got {score}/7", score)
+                        return
+                    logger.info(f"📰 News Bullish but PUT has high confluence ({score}/7) — proceeding")
+                elif news_overall != "Neutral":
+                    logger.info(f"📰 Sentiment {news_overall} aligns with {direction}")
 
                 result      = await service.place_order(direction, stake)
                 contract_id = result.get("buy", {}).get("contract_id", "unknown")

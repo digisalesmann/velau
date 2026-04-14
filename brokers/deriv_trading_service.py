@@ -96,6 +96,7 @@ class DerivTradingService:
         symbol: str = "frxXAUUSD",
         count: int = 250,
         granularity: int = 300,
+        end: str | int = "latest",
     ) -> list:
         if not self._authorized:
             await self.authenticate()
@@ -103,7 +104,7 @@ class DerivTradingService:
             "ticks_history":    symbol,
             "adjust_start_time": 1,
             "count":            count,
-            "end":              "latest",
+            "end":              end,
             "style":            "candles",
             "granularity":      granularity,
         })

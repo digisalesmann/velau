@@ -122,3 +122,83 @@ def get_news_and_sentiment() -> tuple[list, dict]:
         "high_impact_events": [],
         "articles_analyzed":  n,
     }
+
+
+def get_economic_blackout(now_utc=None) -> tuple[bool, str]:
+    """
+    Returns (is_blackout, reason) if we are within the pre/post window
+    of a high-impact USD event that drives gold (NFP, CPI, FOMC, PPI).
+
+    Priority order:
+      1. Finnhub economic calendar (if FINNHUB_API_KEY env var is set, free tier)
+      2. Hardcoded NFP detection — first Friday of month at 13:30 UTC
+    """
+    from datetime import datetime, timezone as _tz
+    if now_utc is None:
+        now_utc = datetime.now(_tz.utc)
+
+    # ── 1. Finnhub ─────────────────────────────────────────────────────────────
+    finnhub_key = os.getenv("FINNHUB_API_KEY", "")
+    if finnhub_key:
+        try:
+            today  = now_utc.strftime("%Y-%m-%d")
+            resp   = requests.get(
+                "https://finnhub.io/api/v1/calendar/economic",
+                params={"from": today, "to": today, "token": finnhub_key},
+                timeout=6,
+            )
+            events = resp.json().get("economicCalendar", [])
+            # High-impact USD events that move gold
+            GOLD_EVENTS = {
+                "Nonfarm Payrolls", "CPI", "Core CPI", "PCE", "Core PCE",
+                "FOMC", "Federal Funds Rate", "PPI", "Core PPI",
+                "Retail Sales", "GDP", "ISM Manufacturing", "ISM Services",
+                "Initial Jobless Claims", "Unemployment Rate",
+            }
+            for ev in events:
+                if ev.get("impact", 0) < 3:      # only HIGH impact
+                    continue
+                if ev.get("country", "").upper() != "US":
+                    continue
+                ev_name = ev.get("event", "")
+                if not any(g in ev_name for g in GOLD_EVENTS):
+                    continue
+                # Parse event time — Finnhub returns HH:MM or full ISO
+                ev_time_str = ev.get("time", "")
+                try:
+                    if "T" in ev_time_str:
+                        ev_dt = datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
+                    else:
+                        # time is "HH:MM" on the date we queried
+                        h, m = map(int, ev_time_str.split(":"))
+                        ev_dt = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
+                    diff_min = (now_utc - ev_dt).total_seconds() / 60
+                    if -35 <= diff_min <= 65:    # 35 min before → 65 min after
+                        reason = f"High-impact event blackout: {ev_name} (Finnhub)"
+                        logger.warning(f"📅 {reason}")
+                        return True, reason
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Finnhub calendar fetch failed: {e}")
+
+    # ── 2. Hardcoded NFP (first Friday of month, 13:30 UTC) ────────────────────
+    weekday = now_utc.weekday()      # 0=Mon … 6=Sun
+    day     = now_utc.day
+    total_m = now_utc.hour * 60 + now_utc.minute
+
+    if weekday == 4 and day <= 7:    # first Friday
+        if 13 * 60 <= total_m <= 15 * 60:    # 13:00–15:00 UTC
+            reason = "NFP blackout — first Friday 13:00-15:00 UTC"
+            logger.warning(f"📅 {reason}")
+            return True, reason
+
+    # ── 3. Generic USD release window (Tue-Thu, 13:00-14:15 UTC, mid-month) ───
+    # CPI, PPI, Retail Sales, PCE all typically print at 13:30 UTC Tue-Thu
+    if weekday in (1, 2, 3) and 9 <= day <= 21:
+        if 13 * 60 <= total_m <= 14 * 60 + 15:
+            reason = "USD data window blackout (Tue-Thu 13:00-14:15 UTC, mid-month)"
+            logger.warning(f"📅 {reason}")
+            return True, reason
+
+    return False, ""
