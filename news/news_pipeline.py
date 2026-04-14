@@ -156,7 +156,7 @@ def get_economic_blackout(now_utc=None) -> tuple[bool, str]:
                 "Initial Jobless Claims", "Unemployment Rate",
             }
             for ev in events:
-                if ev.get("impact", 0) < 3:      # only HIGH impact
+                if ev.get("impact", "").lower() != "high":   # Finnhub returns string "high"/"medium"/"low"
                     continue
                 if ev.get("country", "").upper() != "US":
                     continue

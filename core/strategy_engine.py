@@ -529,18 +529,8 @@ class XAUMasterStrategy:
 
             if direction:
                 stake, tier = self._get_stake()
-                signal_type = "BUY" if direction == "CALL" else "SELL"
-                self.save_signal(signal_type, price, rsi, h1_bias,
-                    " | ".join(reasons), score)
 
-                logger.info(
-                    f"🚀 {direction} | ${stake:.2f} "
-                    f"({stake/self._current_balance*100:.1f}% | {tier}) | "
-                    f"confluence={score}/7 | ADX={adx:.1f}"
-                )
-                self._trade_in_progress = True
-
-                # ── News sentiment filter ──────────────────────────────────────────────
+                # ── News sentiment filter (before lock or signal save) ──────────────
                 sentiment     = self._get_cached_sentiment()
                 news_overall  = sentiment.get("overall", "Neutral")
                 sentiment_min = MIN_CONFLUENCE + 1   # raise bar when news disagrees
@@ -560,6 +550,18 @@ class XAUMasterStrategy:
                     logger.info(f"📰 News Bullish but PUT has high confluence ({score}/7) — proceeding")
                 elif news_overall != "Neutral":
                     logger.info(f"📰 Sentiment {news_overall} aligns with {direction}")
+
+                # ── All filters passed — lock, save, and trade ─────────────────────
+                signal_type = "BUY" if direction == "CALL" else "SELL"
+                self.save_signal(signal_type, price, rsi, h1_bias,
+                    " | ".join(reasons), score)
+
+                logger.info(
+                    f"🚀 {direction} | ${stake:.2f} "
+                    f"({stake/self._current_balance*100:.1f}% | {tier}) | "
+                    f"confluence={score}/7 | ADX={adx:.1f}"
+                )
+                self._trade_in_progress = True
 
                 result      = await service.place_order(direction, stake)
                 contract_id = result.get("buy", {}).get("contract_id", "unknown")
