@@ -116,13 +116,15 @@ def _get_user_token(username: str) -> str:
     Get Deriv token for this user.
     Falls back to the server-level DERIV_TOKEN env var for backwards
     compatibility (single-user mode / admin account).
+    Raises 400 with 'no_deriv_account' when neither source has a token.
     """
     user_token = db.get_deriv_token(username)
     if user_token:
         return user_token
-    # Fallback to server env var (your account, for backwards compat)
     from env_config import DERIV_TOKEN
-    return DERIV_TOKEN
+    if DERIV_TOKEN:
+        return DERIV_TOKEN
+    raise HTTPException(status_code=400, detail="no_deriv_account")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
