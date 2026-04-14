@@ -7,8 +7,8 @@ Timeframe stack:
   15M candles → primary entry/exit signals
 
 Confluence scoring (4/7 required):
-  1. 4H EMA trend  — price vs EMA200 on 4H
-  2. 1H EMA trend  — EMA50 vs EMA200 on 1H
+  1. 4H EMA trend  — price vs EMA50 on 4H
+  2. 1H EMA trend  — EMA50 vs EMA100 on 1H
   3. RSI 50-line   — RSI14 > 50 (bull) / < 50 (bear) on 15M
   4. MACD momentum — histogram direction + zero-line cross on 15M
   5. Bollinger Band — price below mid-band pullback in uptrend (bull)
@@ -150,14 +150,14 @@ class XAUMasterStrategy:
 
     # ── Indicator computation ──────────────────────────────────────────────────
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty or len(df) < 210:
+        if df.empty or len(df) < 110:
             logger.warning(f"Not enough candles: {len(df)}")
             return pd.DataFrame()
         c, h, l = df["close"], df["high"], df["low"]
 
-        # Trend
+        # Trend — EMA100 used (Deriv caps 15M history at ~139 rows)
         df["EMA_50"]  = EMAIndicator(close=c, window=50).ema_indicator()
-        df["EMA_200"] = EMAIndicator(close=c, window=200).ema_indicator()
+        df["EMA_100"] = EMAIndicator(close=c, window=100).ema_indicator()
 
         # Momentum
         df["RSI_14"]  = RSIIndicator(close=c, window=14).rsi()
@@ -186,34 +186,34 @@ class XAUMasterStrategy:
 
     # ── Multi-timeframe bias ───────────────────────────────────────────────────
     async def _get_4h_bias(self, service) -> str:
-        """Macro trend: price vs EMA200 on 4H candles."""
+        """Macro trend: price vs EMA50 on 4H candles (Deriv returns ~155 4H bars)."""
         try:
             df = await self._get_candles(service, gran=14400, count=220)
-            if df.empty or len(df) < 210:
+            if df.empty or len(df) < 60:
                 return "neutral"
-            df["EMA_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+            df["EMA_50"] = EMAIndicator(close=df["close"], window=50).ema_indicator()
             df.dropna(inplace=True)
             row  = df.iloc[-1]
-            bias = "bullish" if row["close"] > row["EMA_200"] else "bearish"
-            logger.info(f"📈 4H macro bias: {bias} | price={row['close']:.2f} EMA200={row['EMA_200']:.2f}")
+            bias = "bullish" if row["close"] > row["EMA_50"] else "bearish"
+            logger.info(f"📈 4H macro bias: {bias} | price={row['close']:.2f} EMA50={row['EMA_50']:.2f}")
             return bias
         except Exception as e:
             logger.warning(f"4H bias error: {e}")
             return "neutral"
 
     async def _get_1h_bias(self, service) -> str:
-        """Session trend: EMA50 vs EMA200 on 1H candles."""
+        """Session trend: EMA50 vs EMA100 on 1H candles (Deriv returns ~162 1H bars)."""
         try:
             df = await self._get_candles(service, gran=3600, count=220)
-            if df.empty or len(df) < 210:
+            if df.empty or len(df) < 110:
                 return "neutral"
             df["EMA_50"]  = EMAIndicator(close=df["close"], window=50).ema_indicator()
-            df["EMA_200"] = EMAIndicator(close=df["close"], window=200).ema_indicator()
+            df["EMA_100"] = EMAIndicator(close=df["close"], window=100).ema_indicator()
             df.dropna(inplace=True)
             row  = df.iloc[-1]
-            bias = "bullish" if row["EMA_50"] > row["EMA_200"] else \
-                   "bearish" if row["EMA_50"] < row["EMA_200"] else "neutral"
-            logger.info(f"📈 1H session bias: {bias} | EMA50={row['EMA_50']:.2f} EMA200={row['EMA_200']:.2f}")
+            bias = "bullish" if row["EMA_50"] > row["EMA_100"] else \
+                   "bearish" if row["EMA_50"] < row["EMA_100"] else "neutral"
+            logger.info(f"📈 1H session bias: {bias} | EMA50={row['EMA_50']:.2f} EMA100={row['EMA_100']:.2f}")
             return bias
         except Exception as e:
             logger.warning(f"1H bias error: {e}")
@@ -242,7 +242,7 @@ class XAUMasterStrategy:
         row     = df.iloc[-1]
         price   = float(row["close"])
         ema50   = float(row["EMA_50"])
-        ema200  = float(row["EMA_200"])
+        ema100  = float(row["EMA_100"])
         rsi     = float(row["RSI_14"])
         macd_h  = float(row["MACD_H"])
         macd_l  = float(row["MACD_L"])
@@ -254,21 +254,21 @@ class XAUMasterStrategy:
 
         logger.info(
             f"📊 Price={price:.2f} RSI={rsi:.1f} ADX={adx:.1f} "
-            f"EMA50={ema50:.2f} EMA200={ema200:.2f} "
+            f"EMA50={ema50:.2f} EMA100={ema100:.2f} "
             f"MACD_H={macd_h:.4f} BB%={bb_pct:.2f}"
         )
 
         # 1. 4H macro bias (strong trend filter)
         if h4_bias == "bullish":
-            bull_r.append(f"4H macro bullish (price > EMA200)")
+            bull_r.append(f"4H macro bullish (price > EMA50)")
         elif h4_bias == "bearish":
-            bear_r.append(f"4H macro bearish (price < EMA200)")
+            bear_r.append(f"4H macro bearish (price < EMA50)")
 
-        # 2. 1H session trend (EMA50 vs EMA200 cross)
+        # 2. 1H session trend (EMA50 vs EMA100 cross)
         if h1_bias == "bullish":
-            bull_r.append("1H EMA50 > EMA200 (uptrend)")
+            bull_r.append("1H EMA50 > EMA100 (uptrend)")
         elif h1_bias == "bearish":
-            bear_r.append("1H EMA50 < EMA200 (downtrend)")
+            bear_r.append("1H EMA50 < EMA100 (downtrend)")
 
         # 3. RSI 50-line momentum — crossing 50 is more reliable than extremes
         prev_rsi = float(df.iloc[-2]["RSI_14"])
