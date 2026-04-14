@@ -421,10 +421,25 @@ class XAUMasterStrategy:
             logger.info("🔓 Position lock released")
 
     # ── Main trade cycle ───────────────────────────────────────────────────────
+    def _get_active_token(self) -> str:
+        """
+        Returns the Deriv token to use for trading.
+        Prefers the first user who has connected their account.
+        Falls back to the DERIV_TOKEN env var (backwards compat).
+        """
+        from env_config import DERIV_TOKEN
+        users = db.get_all_users_with_tokens()
+        if users:
+            token = users[0].get("deriv_token", "")
+            if token:
+                return token
+        return DERIV_TOKEN
+
     async def execute_trade_cycle(self):
         now_utc = datetime.now(timezone.utc)
         logger.info(f"━━━ Cycle {now_utc:%H:%M:%S} UTC ━━━")
-        service = DerivTradingService()
+        active_token = self._get_active_token()
+        service = DerivTradingService(token=active_token)
         try:
             await service.authenticate()
 
@@ -568,7 +583,7 @@ class XAUMasterStrategy:
                 logger.info(f"✅ Placed | contract={contract_id}")
                 notif.notify_trade_executed(direction, ANALYSIS_SYMBOL, stake, score)
 
-                monitor_svc = DerivTradingService()
+                monitor_svc = DerivTradingService(token=active_token)
                 await monitor_svc.authenticate()
                 asyncio.create_task(
                     self._monitor_contract(monitor_svc, contract_id, stake)
