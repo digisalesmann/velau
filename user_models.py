@@ -38,6 +38,9 @@ class UserIn(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type:   str
+
+class FirebaseAuthRequest(BaseModel):
+    firebase_token: str
     is_admin:     bool = False
 
 
@@ -135,3 +138,47 @@ async def login(user_in: UserIn):
             status_code=500,
             detail=f"Login error: {traceback.format_exc()}",
         )
+
+
+FIREBASE_API_KEY = os.getenv(
+    "FIREBASE_API_KEY",
+    "AIzaSyCO9rb8XgAUAR_9b5q40xlXe_q1gTcnw_E",   # public key, same as in APK
+)
+
+@router.post("/auth/firebase", response_model=Token)
+async def auth_firebase(req: FirebaseAuthRequest):
+    """
+    Verify a Firebase ID token and return a backend JWT.
+    Creates the backend user on first login — no password sync needed.
+    """
+    import secrets
+    import requests as http_req
+    try:
+        resp = http_req.post(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:lookup"
+            f"?key={FIREBASE_API_KEY}",
+            json={"idToken": req.firebase_token},
+            timeout=10,
+        )
+        data = resp.json()
+        if "error" in data:
+            raise HTTPException(status_code=401, detail="Invalid Firebase token")
+        users = data.get("users", [])
+        if not users:
+            raise HTTPException(status_code=401, detail="Firebase user not found")
+        email = users[0].get("email", "")
+        if not email:
+            raise HTTPException(status_code=400, detail="No email on Firebase account")
+
+        # Create backend user on first login (random password — never used for login)
+        if not user_exists_in_db(email):
+            create_user_in_db(email, get_password_hash(secrets.token_hex(32)))
+
+        token    = create_access_token(data={"sub": email})
+        is_admin = db_is_admin(email)
+        return {"access_token": token, "token_type": "bearer", "is_admin": is_admin}
+    except HTTPException:
+        raise
+    except Exception:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"Firebase auth error: {traceback.format_exc()}")
