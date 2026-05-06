@@ -42,11 +42,23 @@ async def _bot_runner(delay: int = 10):
         traceback.print_exc()
 
 
+async def _db_keepalive():
+    """Ping the database every 12 hours so Supabase never pauses."""
+    while True:
+        await asyncio.sleep(12 * 3600)
+        try:
+            db.fetchone("SELECT 1")
+            logger.info("💓 DB keep-alive ping OK")
+        except Exception as e:
+            logger.warning(f"💓 DB keep-alive failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
     logger.info("🚀 FastAPI startup — queueing bot")
     bot_task = asyncio.create_task(_bot_runner(delay=10))
+    asyncio.create_task(_db_keepalive())
     yield
     logger.info("🛑 FastAPI shutdown — stopping bot")
     trading_bot.is_running = False
