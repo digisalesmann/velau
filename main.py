@@ -53,12 +53,31 @@ async def _db_keepalive():
             logger.warning(f"💓 DB keep-alive failed: {e}")
 
 
+async def _server_keepalive():
+    """
+    Ping this server's own root endpoint every 10 minutes so Render's
+    free tier never spins down due to inactivity.
+    """
+    import aiohttp
+    url = os.getenv("APP_BASE_URL", "https://velau.onrender.com") + "/"
+    await asyncio.sleep(60)          # let startup finish first
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    logger.debug(f"🏓 Self-ping {r.status}")
+        except Exception as e:
+            logger.debug(f"🏓 Self-ping failed: {e}")
+        await asyncio.sleep(10 * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
     logger.info("🚀 FastAPI startup — queueing bot")
     bot_task = asyncio.create_task(_bot_runner(delay=10))
     asyncio.create_task(_db_keepalive())
+    asyncio.create_task(_server_keepalive())
     yield
     logger.info("🛑 FastAPI shutdown — stopping bot")
     trading_bot.is_running = False
