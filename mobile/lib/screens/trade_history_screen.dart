@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 import '../services/api_service.dart';
+import 'home_shell.dart';
 
 class TradeHistoryScreen extends StatefulWidget {
   const TradeHistoryScreen({super.key});
@@ -390,7 +391,7 @@ class _TradeHistoryScreenState extends State<TradeHistoryScreen> {
           ),
           const SizedBox(height: 28),
           ElevatedButton(
-            onPressed: () => Navigator.of(context).pushNamed('/account'),
+            onPressed: () => HomeShell.tabNotifier.value = 3,
             style: ElevatedButton.styleFrom(
               backgroundColor: _primaryGreen,
               elevation: 0,

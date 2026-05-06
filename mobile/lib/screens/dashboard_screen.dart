@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/api_service.dart';
+import 'home_shell.dart';
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -238,7 +239,7 @@ class _DashboardScreenState extends State<DashboardScreen>
           ),
           const SizedBox(height: 28),
           ElevatedButton(
-            onPressed: () => Navigator.of(context).pushNamed('/account'),
+            onPressed: () => HomeShell.tabNotifier.value = 3,
             style: ElevatedButton.styleFrom(
               backgroundColor: _primaryGreen,
               elevation: 0,
