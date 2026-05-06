@@ -104,7 +104,7 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _isLoading = false);
-      _showError('Login failed. Check your credentials and try again.');
+      _showError(ApiService.friendlyError(e));
     }
   }
 
