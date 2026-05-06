@@ -140,10 +140,20 @@ async def login(user_in: UserIn):
         )
 
 
-FIREBASE_API_KEY = os.getenv(
-    "FIREBASE_API_KEY",
-    "AIzaSyCO9rb8XgAUAR_9b5q40xlXe_q1gTcnw_E",   # public key, same as in APK
-)
+def _get_firebase_app():
+    """Lazily initialise Firebase Admin SDK (once per process)."""
+    import firebase_admin
+    from firebase_admin import credentials as fb_creds
+    if not firebase_admin._apps:
+        sa_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+        if sa_json:
+            import json as _json
+            cred = fb_creds.Certificate(_json.loads(sa_json))
+        else:
+            cred = fb_creds.ApplicationDefault()
+        firebase_admin.initialize_app(cred)
+    return firebase_admin.get_app()
+
 
 @router.post("/auth/firebase", response_model=Token)
 async def auth_firebase(req: FirebaseAuthRequest):
@@ -152,21 +162,11 @@ async def auth_firebase(req: FirebaseAuthRequest):
     Creates the backend user on first login — no password sync needed.
     """
     import secrets
-    import requests as http_req
+    from firebase_admin import auth as fb_auth
     try:
-        resp = http_req.post(
-            f"https://identitytoolkit.googleapis.com/v1/accounts:lookup"
-            f"?key={FIREBASE_API_KEY}",
-            json={"idToken": req.firebase_token},
-            timeout=10,
-        )
-        data = resp.json()
-        if "error" in data:
-            raise HTTPException(status_code=401, detail="Invalid Firebase token")
-        users = data.get("users", [])
-        if not users:
-            raise HTTPException(status_code=401, detail="Firebase user not found")
-        email = users[0].get("email", "")
+        _get_firebase_app()
+        decoded = fb_auth.verify_id_token(req.firebase_token)
+        email = decoded.get("email", "")
         if not email:
             raise HTTPException(status_code=400, detail="No email on Firebase account")
 
