@@ -35,6 +35,13 @@ class _TradeHistoryScreenState extends State<TradeHistoryScreen> {
   void initState() {
     super.initState();
     _fetchHistory();
+    HomeShell.derivNotifier.addListener(_fetchHistory);
+  }
+
+  @override
+  void dispose() {
+    HomeShell.derivNotifier.removeListener(_fetchHistory);
+    super.dispose();
   }
 
   Future<void> _fetchHistory() async {

@@ -39,6 +39,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       duration: const Duration(milliseconds: 2400),
     )..repeat();
     _fetchDashboard();
+    HomeShell.derivNotifier.addListener(_onDerivChange);
     _contractTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       if (_dashboardData?['trade_in_progress'] == true) {
         _fetchOpenContracts();
@@ -46,8 +47,20 @@ class _DashboardScreenState extends State<DashboardScreen>
     });
   }
 
+  void _onDerivChange() => _fetchDashboard();
+
+  /// Wraps a non-scrollable widget so RefreshIndicator's pull gesture works.
+  Widget _scrollable(Widget child) => SingleChildScrollView(
+    physics: const AlwaysScrollableScrollPhysics(),
+    child: SizedBox(
+      height: MediaQuery.of(context).size.height * 0.8,
+      child: child,
+    ),
+  );
+
   @override
   void dispose() {
+    HomeShell.derivNotifier.removeListener(_onDerivChange);
     _contractTimer?.cancel();
     _scanController.dispose();
     super.dispose();
@@ -145,9 +158,9 @@ class _DashboardScreenState extends State<DashboardScreen>
           child: _loading
               ? Center(child: CircularProgressIndicator(color: _primaryGreen))
               : _error == 'no_deriv_account'
-              ? _buildConnectPrompt()
+              ? _scrollable(_buildConnectPrompt())
               : _error != null
-              ? _buildErrorState()
+              ? _scrollable(_buildErrorState())
               : _buildContent(hPadding),
         ),
       ),
@@ -471,7 +484,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                       .map((c) => _buildLiveContract(c))
                       .toList(),
                 )
-              : _buildEmptyTrades(tradeInProgress),
+              : _buildEmptyTrades(tradeInProgress, marketBias),
 
           const SizedBox(height: 40),
         ],
@@ -827,41 +840,87 @@ class _DashboardScreenState extends State<DashboardScreen>
         },
       );
 
-  Widget _buildEmptyTrades(bool tradeInProgress) {
+  Widget _buildEmptyTrades(bool tradeInProgress, String marketBias) {
     if (tradeInProgress) {
+      final bool isBull = marketBias.contains('BULL') || marketBias.contains('CALL');
+      final bool isBear = marketBias.contains('BEAR') || marketBias.contains('PUT');
+      final Color dirColor = isBull ? _primaryGreen : isBear ? _dangerRed : _amber;
+      final String dirLabel = isBull ? 'CALL ↑' : isBear ? 'PUT ↓' : 'ANALYZING';
+      final IconData dirIcon = isBull
+          ? Icons.trending_up_rounded
+          : isBear
+          ? Icons.trending_down_rounded
+          : Icons.bolt_rounded;
+
       return Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 36),
-        child: Column(
+        margin: const EdgeInsets.only(bottom: 12),
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: dirColor.withValues(alpha: 0.04),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: dirColor.withValues(alpha: 0.15)),
+        ),
+        child: Row(
           children: [
             AnimatedBuilder(
               animation: _scanController,
-              builder: (_, child) {
+              builder: (_, _) {
                 final pulse = 0.9 + 0.1 * (1 + sin(_scanController.value * 2 * pi)) / 2;
                 return Transform.scale(
                   scale: pulse,
                   child: Container(
-                    width: 52,
-                    height: 52,
+                    width: 44,
+                    height: 44,
                     decoration: BoxDecoration(
-                      color: _primaryGreen.withValues(alpha: 0.12),
-                      shape: BoxShape.circle,
-                      border: Border.all(color: _primaryGreen.withValues(alpha: 0.4)),
+                      color: dirColor.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: dirColor.withValues(alpha: 0.3)),
                     ),
-                    child: Icon(Icons.bolt_rounded, color: _primaryGreen, size: 26),
+                    child: Icon(dirIcon, color: dirColor, size: 22),
                   ),
                 );
               },
             ),
-            const SizedBox(height: 14),
-            Text(
-              'Position open',
-              style: _satoshi(color: _textDark, fontSize: 14, fontWeight: FontWeight.w800),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        dirLabel,
+                        style: _satoshi(color: dirColor, fontSize: 13, fontWeight: FontWeight.w900, letterSpacing: 0.3),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'XAU/USD',
+                        style: _satoshi(color: _textMuted, fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    '15 min contract · Awaiting settlement',
+                    style: _satoshi(color: _textMuted, fontSize: 12, fontWeight: FontWeight.w500),
+                  ),
+                ],
+              ),
             ),
-            const SizedBox(height: 4),
-            Text(
-              'Loading contract details...',
-              style: _satoshi(color: _textMuted, fontSize: 13, fontWeight: FontWeight.w500),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: _primaryGreen.withValues(alpha: 0.1),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(width: 6, height: 6, decoration: BoxDecoration(color: _primaryGreen, shape: BoxShape.circle)),
+                  const SizedBox(width: 5),
+                  Text('LIVE', style: _satoshi(color: _primaryGreen, fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 0.5)),
+                ],
+              ),
             ),
           ],
         ),

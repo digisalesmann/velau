@@ -12,6 +12,10 @@ class HomeShell extends StatefulWidget {
   /// Set this from anywhere to switch the active tab without pushing a route.
   static final tabNotifier = ValueNotifier<int>(0);
 
+  /// Increment this after a Deriv connect/disconnect to trigger a refresh on
+  /// all screens that depend on the connection state.
+  static final derivNotifier = ValueNotifier<int>(0);
+
   @override
   State<HomeShell> createState() => _HomeShellState();
 }
