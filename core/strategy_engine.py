@@ -355,7 +355,7 @@ class XAUMasterStrategy:
         return len(bull_r), len(bear_r), bull_r, bear_r
 
     # ── Contract monitor ───────────────────────────────────────────────────────
-    async def _monitor_contract(self, service, contract_id, stake):
+    async def _monitor_contract(self, service, contract_id, stake, username: str = ""):
         try:
             logger.info(f"👁  Monitoring {contract_id} | stake=${stake:.2f}")
             await service.ws.send({
@@ -380,7 +380,15 @@ class XAUMasterStrategy:
                 won    = status == "won"
                 self._daily_pnl += profit
                 self.save_trade_result(contract_id, won, profit)
-                notif.notify_trade_settled(contract_id, won, profit)
+                if username:
+                    notif.notify_user(
+                        username,
+                        f"Trade {'Won' if won else 'Lost'}  {'+' if won else '-'}${abs(profit):.2f}",
+                        f"Contract {contract_id} settled.",
+                        {"type": "trade_settled", "won": str(won), "pnl": str(profit)},
+                    )
+                else:
+                    notif.notify_trade_settled(contract_id, won, profit)
 
                 if won:
                     self._consecutive_losses  = 0
@@ -421,25 +429,66 @@ class XAUMasterStrategy:
             logger.info("🔓 Position lock released")
 
     # ── Main trade cycle ───────────────────────────────────────────────────────
-    def _get_active_token(self) -> str:
+    def _get_all_users(self) -> list[dict]:
         """
-        Returns the Deriv token to use for trading.
-        Prefers the first user who has connected their account.
-        Falls back to the DERIV_TOKEN env var (backwards compat).
+        Returns all users with a connected Deriv token.
+        Falls back to a synthetic entry using DERIV_TOKEN env var.
         """
         from env_config import DERIV_TOKEN
         users = db.get_all_users_with_tokens()
         if users:
-            token = users[0].get("deriv_token", "")
-            if token:
-                return token
-        return DERIV_TOKEN
+            return users
+        if DERIV_TOKEN:
+            return [{"username": "_server", "deriv_token": DERIV_TOKEN}]
+        return []
+
+    async def _place_for_user(self, username: str, token: str,
+                               direction: str, score: int) -> None:
+        """Place and monitor a trade on a single user's Deriv account."""
+        svc = DerivTradingService(token=token)
+        try:
+            await svc.authenticate()
+            info    = await svc.get_account_info()
+            balance = float(info.get("balance", 0.0))
+            stake, tier = calculate_stake(
+                balance          = balance,
+                win_rate         = self._win_rate,
+                in_recovery      = self._in_recovery,
+                consecutive_wins = self._consecutive_wins,
+            )
+            result      = await svc.place_order(direction, stake)
+            contract_id = result.get("buy", {}).get("contract_id", "unknown")
+            logger.info(f"✅ [{username}] {direction} ${stake:.2f} | contract={contract_id}")
+
+            notif.notify_user(
+                username,
+                f"Trade Placed {'CALL ↑' if direction == 'CALL' else 'PUT ↓'}",
+                f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/7",
+                {"type": "trade_executed", "direction": direction},
+            )
+
+            monitor_svc = DerivTradingService(token=token)
+            await monitor_svc.authenticate()
+            asyncio.create_task(
+                self._monitor_contract(monitor_svc, contract_id, stake, username)
+            )
+        except Exception as e:
+            logger.error(f"❌ [{username}] trade failed: {e}")
+        finally:
+            await svc.close()
 
     async def execute_trade_cycle(self):
         now_utc = datetime.now(timezone.utc)
         logger.info(f"━━━ Cycle {now_utc:%H:%M:%S} UTC ━━━")
-        active_token = self._get_active_token()
-        service = DerivTradingService(token=active_token)
+
+        all_users = self._get_all_users()
+        if not all_users:
+            logger.warning("No connected Deriv accounts — skipping cycle")
+            return
+
+        # Use first account for market analysis (candles are symbol-level, not per-user)
+        primary_token = all_users[0]["deriv_token"]
+        service = DerivTradingService(token=primary_token)
         try:
             await service.authenticate()
 
@@ -543,8 +592,6 @@ class XAUMasterStrategy:
                     return
 
             if direction:
-                stake, tier = self._get_stake()
-
                 # ── News sentiment filter (before lock or signal save) ──────────────
                 sentiment     = self._get_cached_sentiment()
                 news_overall  = sentiment.get("overall", "Neutral")
@@ -566,27 +613,21 @@ class XAUMasterStrategy:
                 elif news_overall != "Neutral":
                     logger.info(f"📰 Sentiment {news_overall} aligns with {direction}")
 
-                # ── All filters passed — lock, save, and trade ─────────────────────
+                # ── All filters passed — lock, save, and trade all accounts ────────
                 signal_type = "BUY" if direction == "CALL" else "SELL"
                 self.save_signal(signal_type, price, rsi, h1_bias,
                     " | ".join(reasons), score)
 
                 logger.info(
-                    f"🚀 {direction} | ${stake:.2f} "
-                    f"({stake/self._current_balance*100:.1f}% | {tier}) | "
-                    f"confluence={score}/7 | ADX={adx:.1f}"
+                    f"🚀 {direction} | confluence={score}/7 | ADX={adx:.1f} | "
+                    f"accounts={len(all_users)}"
                 )
                 self._trade_in_progress = True
 
-                result      = await service.place_order(direction, stake)
-                contract_id = result.get("buy", {}).get("contract_id", "unknown")
-                logger.info(f"✅ Placed | contract={contract_id}")
-                notif.notify_trade_executed(direction, ANALYSIS_SYMBOL, stake, score)
-
-                monitor_svc = DerivTradingService(token=active_token)
-                await monitor_svc.authenticate()
-                asyncio.create_task(
-                    self._monitor_contract(monitor_svc, contract_id, stake)
+                await asyncio.gather(
+                    *[self._place_for_user(u["username"], u["deriv_token"], direction, score)
+                      for u in all_users],
+                    return_exceptions=True,
                 )
             else:
                 top     = max(bull_score, bear_score)

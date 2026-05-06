@@ -171,12 +171,12 @@ async def root():
 
 @app.post("/notifications/register")
 async def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
-    notif.register_token(req.token)
+    notif.register_token(req.token, username=user.username)
     return {"status": "registered"}
 
 @app.post("/notifications/unregister")
 async def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
-    notif.unregister_token(req.token)
+    notif.unregister_token(req.token, username=user.username)
     return {"status": "unregistered"}
 
 

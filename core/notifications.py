@@ -15,9 +15,8 @@ logger = logging.getLogger("Notifications")
 FCM_PROJECT_ID = "velau-87edd"
 FCM_URL = f"https://fcm.googleapis.com/v1/projects/{FCM_PROJECT_ID}/messages:send"
 
-# In-memory token store. Tokens survive within a single process run.
-# They are re-registered each time the Flutter app starts.
-_device_tokens: set[str] = set()
+# Per-user FCM token store. Keys are usernames; re-populated on each app start.
+_user_tokens: dict[str, set[str]] = {}
 
 # ── Credential helpers ────────────────────────────────────────────────────────
 
@@ -44,22 +43,26 @@ def _get_access_token() -> str | None:
 
 # ── Token registration ────────────────────────────────────────────────────────
 
-def register_token(token: str):
-    if token:
-        _device_tokens.add(token)
-        logger.info(f"📱 FCM token registered ({len(_device_tokens)} total)")
+def register_token(token: str, username: str = ""):
+    if not token:
+        return
+    key = username or "_anonymous"
+    _user_tokens.setdefault(key, set()).add(token)
+    total = sum(len(v) for v in _user_tokens.values())
+    logger.info(f"📱 FCM registered for {key} ({total} total)")
 
 
-def unregister_token(token: str):
-    _device_tokens.discard(token)
+def unregister_token(token: str, username: str = ""):
+    key = username or "_anonymous"
+    if key in _user_tokens:
+        _user_tokens[key].discard(token)
 
 
 # ── Send ──────────────────────────────────────────────────────────────────────
 
-def _send(title: str, body: str, data: dict = None):
-    """Send a push notification to all registered devices (one request each)."""
-    if not _device_tokens:
-        logger.debug("No registered devices, skipping push")
+def _send_to(tokens: set[str], title: str, body: str, data: dict = None):
+    """Send a push notification to a specific set of device tokens."""
+    if not tokens:
         return
 
     access_token = _get_access_token()
@@ -72,7 +75,7 @@ def _send(title: str, body: str, data: dict = None):
     }
 
     stale = set()
-    for token in list(_device_tokens):
+    for token in list(tokens):
         payload = {
             "message": {
                 "token": token,
@@ -101,7 +104,21 @@ def _send(title: str, body: str, data: dict = None):
             logger.warning(f"FCM send error: {e}")
 
     for t in stale:
-        _device_tokens.discard(t)
+        tokens.discard(t)
+
+
+def _send(title: str, body: str, data: dict = None):
+    """Broadcast to all registered users (global events like session start)."""
+    all_tokens: set[str] = set()
+    for tokens in _user_tokens.values():
+        all_tokens.update(tokens)
+    _send_to(all_tokens, title, body, data)
+
+
+def notify_user(username: str, title: str, body: str, data: dict = None):
+    """Send notification to a specific user's devices only."""
+    tokens = _user_tokens.get(username, set())
+    _send_to(tokens, title, body, data)
 
 
 # ── Public helpers ────────────────────────────────────────────────────────────
