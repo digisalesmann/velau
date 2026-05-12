@@ -455,8 +455,8 @@ class XAUMasterStrategy:
         return []
 
     async def _place_for_user(self, username: str, token: str,
-                               direction: str, score: int) -> None:
-        """Place and monitor a trade on a single user's Deriv account."""
+                               direction: str, score: int) -> bool:
+        """Place a trade. Returns True if a monitor task was started, False on failure."""
         svc = DerivTradingService(token=token)
         try:
             await svc.authenticate()
@@ -483,8 +483,10 @@ class XAUMasterStrategy:
             asyncio.create_task(
                 self._monitor_contract(token, contract_id, stake, username)
             )
+            return True
         except Exception as e:
             logger.error(f"❌ [{username}] trade failed: {e}")
+            return False
         finally:
             await svc.close()
 
@@ -636,11 +638,17 @@ class XAUMasterStrategy:
                 )
                 self._trade_in_progress = True
 
-                await asyncio.gather(
+                results = await asyncio.gather(
                     *[self._place_for_user(u["username"], u["deriv_token"], direction, score)
                       for u in all_users],
                     return_exceptions=True,
                 )
+
+                # If every placement failed (no monitor started), release lock now.
+                # Otherwise the monitor's finally block will release it after settlement.
+                if not any(r is True for r in results):
+                    self._trade_in_progress = False
+                    logger.warning("⚠️  All trade placements failed — lock released")
             else:
                 top     = max(bull_score, bear_score)
                 leaning = "bullish" if bull_score >= bear_score else "bearish"
