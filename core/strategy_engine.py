@@ -145,9 +145,10 @@ class XAUMasterStrategy:
         except Exception as e:
             logger.error(f"Signal DB error: {e}")
 
-    def save_trade_result(self, contract_id, won, pnl):
+    def save_trade_result(self, contract_id, won, pnl, username: str = None):
         try:
-            db.insert_trade_result(str(contract_id), bool(won), float(pnl))
+            db.insert_trade_result(str(contract_id), bool(won), float(pnl),
+                                   username=username or None)
         except Exception as e:
             logger.error(f"Trade result DB error: {e}")
 
@@ -344,31 +345,51 @@ class XAUMasterStrategy:
         return len(bull_r), len(bear_r), bull_r, bear_r
 
     # ── Contract monitor ───────────────────────────────────────────────────────
-    async def _monitor_contract(self, service, contract_id, stake, username: str = ""):
+    async def _monitor_contract(self, token: str, contract_id, stake, username: str = ""):
+        """
+        Poll Deriv every 90 s with a fresh connection until the contract settles.
+        Polling is used instead of a long-lived subscription because Render's
+        network drops WebSocket connections within seconds, making subscriptions
+        unreliable and causing the position lock to be released prematurely.
+        """
+        logger.info(f"👁  Monitoring {contract_id} | stake=${stake:.2f}")
+        deadline = asyncio.get_running_loop().time() + 1200  # 20-min cap
+        poll_interval = 90  # seconds between polls — contract lasts 15 min
+
         try:
-            logger.info(f"👁  Monitoring {contract_id} | stake=${stake:.2f}")
-            await service.ws.send({
-                "proposal_open_contracts": 1,
-                "contract_id": contract_id,
-                "subscribe": 1,
-            })
-            deadline = asyncio.get_event_loop().time() + 1200   # 20-min max watch window
-            while asyncio.get_event_loop().time() < deadline:
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(poll_interval)
+
+                svc = DerivTradingService(token=token)
                 try:
-                    msg = await service.ws.receive(timeout=60.0)
-                except TimeoutError:
-                    break
+                    await svc.authenticate()
+                    await svc.ws.send({
+                        "proposal_open_contracts": 1,
+                        "contract_id": contract_id,
+                    })
+                    msg = await svc.ws.receive(timeout=20.0)
+                except Exception as poll_err:
+                    logger.warning(f"👁  Poll error (will retry): {poll_err}")
+                    continue
+                finally:
+                    await svc.close()
+
                 poc = msg.get("proposal_open_contracts") or msg.get("poc")
                 if not poc:
+                    logger.debug(f"👁  No poc in response, retrying…")
                     continue
+
                 status = poc.get("status", "")
+                logger.info(f"👁  Contract {contract_id} status={status!r}")
+
                 if status not in ("won", "lost", "sold"):
-                    continue
+                    continue  # still open — poll again
 
                 profit = float(poc.get("profit", 0))
                 won    = status == "won"
                 self._daily_pnl += profit
-                self.save_trade_result(contract_id, won, profit)
+                self.save_trade_result(contract_id, won, profit, username=username)
+
                 if username:
                     notif.notify_user(
                         username,
@@ -409,10 +430,12 @@ class XAUMasterStrategy:
                         self._circuit_broken = True
                         notif.notify_circuit_breaker(self._consecutive_losses)
                         logger.error(f"🚨 CIRCUIT BREAKER: drawdown {dd:.1f}%")
-                break
+                return  # settled — done
+
+            logger.warning(f"👁  Contract {contract_id} did not settle within 20 min")
 
         except Exception as e:
-            logger.error(f"Monitor error: {e}")
+            logger.error(f"Monitor fatal error: {e}")
         finally:
             self._trade_in_progress = False
             logger.info("🔓 Position lock released")
@@ -456,10 +479,9 @@ class XAUMasterStrategy:
                 {"type": "trade_executed", "direction": direction},
             )
 
-            monitor_svc = DerivTradingService(token=token)
-            await monitor_svc.authenticate()
+            # Pass the token — monitor opens its own fresh connections per poll
             asyncio.create_task(
-                self._monitor_contract(monitor_svc, contract_id, stake, username)
+                self._monitor_contract(token, contract_id, stake, username)
             )
         except Exception as e:
             logger.error(f"❌ [{username}] trade failed: {e}")
