@@ -585,28 +585,6 @@ class _DashboardScreenState extends State<DashboardScreen>
                   fontWeight: FontWeight.w900,
                 ),
               ),
-              Row(
-                children: [
-                  Container(
-                    width: 6,
-                    height: 6,
-                    decoration: BoxDecoration(
-                      color: _primaryGreen,
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    'LIVE',
-                    style: _satoshi(
-                      color: _primaryGreen,
-                      fontSize: 9,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: 0.6,
-                    ),
-                  ),
-                ],
-              ),
             ],
           ),
         ],
@@ -904,21 +882,6 @@ class _DashboardScreenState extends State<DashboardScreen>
                     '15 min contract · Awaiting settlement',
                     style: _satoshi(color: _textMuted, fontSize: 12, fontWeight: FontWeight.w500),
                   ),
-                ],
-              ),
-            ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: _primaryGreen.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(width: 6, height: 6, decoration: BoxDecoration(color: _primaryGreen, shape: BoxShape.circle)),
-                  const SizedBox(width: 5),
-                  Text('LIVE', style: _satoshi(color: _primaryGreen, fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 0.5)),
                 ],
               ),
             ),
