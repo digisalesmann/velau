@@ -6,15 +6,14 @@ Timeframe stack:
   1H  candles → session trend direction
   15M candles → primary entry/exit signals
 
-Confluence scoring (4/7 required):
-  1. 4H EMA trend  — price vs EMA50 on 4H
-  2. 1H EMA trend  — EMA50 vs EMA100 on 1H
-  3. RSI 50-line   — RSI14 > 50 (bull) / < 50 (bear) on 15M
-  4. MACD momentum — histogram direction + zero-line cross on 15M
-  5. Bollinger Band — price below mid-band pullback in uptrend (bull)
-                      price above mid-band pullback in downtrend (bear)
-  6. ADX trend     — ADX > 20 confirms a trending market (not scoring direction)
-  7. BOS structure — fresh break of swing high/low on 15M
+Confluence scoring (5/7 required):
+  1. 4H EMA trend  — price vs EMA50 on 4H  [REQUIRED — must match direction]
+  2. 1H EMA trend  — EMA50 vs EMA100 on 1H [REQUIRED — must match or be neutral]
+  3. RSI momentum  — RSI14 > 55 (bull) / < 45 (bear) on 15M (conviction zone)
+  4. MACD momentum — both histogram AND line above/below zero on 15M
+  5. Bollinger Band — price pulls back below/above mid-band in trend direction
+  6. ADX trend     — ADX > 25 + DI alignment confirms trending market
+  7. BOS structure — fresh break of 20-candle swing high/low on 15M
 
 Trade contract: frxXAUUSD CALL/PUT, 15-minute expiry (matches analysis candle).
 
@@ -50,14 +49,14 @@ from core import notifications as notif
 logger = logging.getLogger("XAUStrategy")
 
 ANALYSIS_SYMBOL        = "frxXAUUSD"
-MIN_CONFLUENCE         = 4          # 4/7 with better-quality indicators
+MIN_CONFLUENCE         = 5          # 5/7 — high-quality signals only
 LOOP_INTERVAL          = 300        # 5-minute cycles
 MAX_CONSECUTIVE_LOSSES = 3
 MAX_DAILY_DRAWDOWN_PCT = 10.0
-SESSIONS               = [(7, 17)]  # London + NY combined (UTC 7-17)
-SWING_LOOKBACK         = 12
+SESSIONS               = [(8, 17)]  # Skip volatile London open hour; NY close at 17
+SWING_LOOKBACK         = 20         # 5-hour structure look-back on 15M candles
 MAX_SAFE_ATR           = 20.0       # filter extreme volatility spikes
-ADX_TREND_THRESHOLD    = 20         # only enter when market is trending
+ADX_TREND_THRESHOLD    = 25         # industry standard: trending market threshold
 
 
 class XAUMasterStrategy:
@@ -305,35 +304,25 @@ class XAUMasterStrategy:
         elif h1_bias == "bearish":
             bear_r.append("1H EMA50 < EMA100 (downtrend)")
 
-        # 3. RSI 50-line momentum — crossing 50 is more reliable than extremes
-        prev_rsi = float(df.iloc[-2]["RSI_14"])
-        if rsi > 50:
-            bull_r.append(f"RSI {rsi:.1f} > 50 (bullish momentum)")
-        elif rsi < 50:
-            bear_r.append(f"RSI {rsi:.1f} < 50 (bearish momentum)")
+        # 3. RSI conviction zone — > 55 bullish, < 45 bearish (50-line is noise)
+        if rsi > 55:
+            bull_r.append(f"RSI {rsi:.1f} > 55 (bullish conviction)")
+        elif rsi < 45:
+            bear_r.append(f"RSI {rsi:.1f} < 45 (bearish conviction)")
 
-        # 4. MACD histogram direction + zero-line position
-        prev_macd_h = float(df.iloc[-2]["MACD_H"])
+        # 4. MACD — only score when both histogram AND signal line agree on same side of zero
+        # Weak "histogram rising but below zero" signals removed — too much noise
         if macd_h > 0 and macd_l > 0:
             bull_r.append(f"MACD above zero, histogram positive")
         elif macd_h < 0 and macd_l < 0:
             bear_r.append(f"MACD below zero, histogram negative")
-        elif macd_h > 0 and macd_h > prev_macd_h:
-            bull_r.append(f"MACD histogram rising (momentum building)")
-        elif macd_h < 0 and macd_h < prev_macd_h:
-            bear_r.append(f"MACD histogram falling (momentum dropping)")
 
-        # 5. Bollinger Band position — look for pullbacks to mid-band in trend direction
-        # In uptrend: buy when price pulls back below mid-band (BB% < 0.5)
-        # In downtrend: sell when price bounces above mid-band (BB% > 0.5)
+        # 5. Bollinger Band pullback-to-midband in trend direction only
+        # BB extremes (oversold/overbought) removed — catch falling knives in binary options
         if bb_pct < 0.45 and h1_bias == "bullish":
             bull_r.append(f"Price below BB mid in uptrend (pullback entry)")
         elif bb_pct > 0.55 and h1_bias == "bearish":
             bear_r.append(f"Price above BB mid in downtrend (pullback entry)")
-        elif bb_pct < 0.25:
-            bull_r.append(f"Price at lower BB band (oversold)")
-        elif bb_pct > 0.75:
-            bear_r.append(f"Price at upper BB band (overbought)")
 
         # 6. ADX + DI direction — trend strength
         if adx > ADX_TREND_THRESHOLD:
@@ -564,10 +553,11 @@ class XAUMasterStrategy:
             bull_score, bear_score, bull_r, bear_r = self._score(df, h1_bias, h4_bias)
             logger.info(f"🔢 BULL={bull_score}/7 BEAR={bear_score}/7 need {MIN_CONFLUENCE}")
 
-            # ── Hard bias filter — only trade WITH the trend, not against it ──
-            # Require 4H and 1H to agree before entering. This cuts noise trades.
-            biases_agree_bull = h4_bias in ("bullish", "neutral") and h1_bias in ("bullish", "neutral")
-            biases_agree_bear = h4_bias in ("bearish", "neutral") and h1_bias in ("bearish", "neutral")
+            # ── Hard bias filter — 4H macro trend must be directional ──────────
+            # 4H must be strictly bullish/bearish (no neutral allowed — that's sideways).
+            # 1H can be matching or neutral (lags 4H at session transitions).
+            biases_agree_bull = h4_bias == "bullish" and h1_bias in ("bullish", "neutral")
+            biases_agree_bear = h4_bias == "bearish" and h1_bias in ("bearish", "neutral")
 
             direction, reasons, score = None, [], 0
 
