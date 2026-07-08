@@ -84,6 +84,7 @@ def init_db():
                 ("totp_enabled",  "BOOLEAN DEFAULT FALSE"),
                 ("display_name",  "TEXT DEFAULT NULL"),
                 ("avatar_url",    "TEXT DEFAULT NULL"),
+                ("bot_enabled",   "BOOLEAN DEFAULT TRUE"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -140,6 +141,18 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_control (
+                    id             INTEGER PRIMARY KEY CHECK (id = 1),
+                    global_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_by     TEXT,
+                    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                INSERT INTO bot_control (id, global_enabled) VALUES (1, TRUE)
+                ON CONFLICT (id) DO NOTHING
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -152,6 +165,7 @@ def init_db():
                     totp_enabled    INTEGER DEFAULT 0,
                     display_name    TEXT DEFAULT NULL,
                     avatar_url      TEXT DEFAULT NULL,
+                    bot_enabled     INTEGER DEFAULT 1,
                     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -203,9 +217,21 @@ def init_db():
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_control (
+                    id             INTEGER PRIMARY KEY CHECK (id = 1),
+                    global_enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_by     TEXT,
+                    updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                INSERT OR IGNORE INTO bot_control (id, global_enabled) VALUES (1, 1)
+            """)
             for col, defn in [
                 ("display_name", "TEXT DEFAULT NULL"),
                 ("avatar_url",   "TEXT DEFAULT NULL"),
+                ("bot_enabled",  "INTEGER DEFAULT 1"),
             ]:
                 _add_col(cur, "users", col, defn)
             for col, defn in [
@@ -326,8 +352,30 @@ def disable_totp(username: str):
 def get_all_users_with_tokens() -> list[dict]:
     """Return all users who have connected a Deriv account."""
     return fetchall(
-        "SELECT username, deriv_token, deriv_account FROM users "
+        "SELECT username, deriv_token, deriv_account, bot_enabled FROM users "
         "WHERE deriv_token IS NOT NULL AND deriv_token != ''"
+    )
+
+
+# ── Bot control ─────────────────────────────────────────────────────────────────
+
+def get_global_bot_enabled() -> bool:
+    row = fetchone("SELECT global_enabled FROM bot_control WHERE id = 1")
+    if not row:
+        return True
+    return bool(row["global_enabled"])
+
+def set_global_bot_enabled(enabled: bool, updated_by: str):
+    execute(
+        "UPDATE bot_control SET global_enabled = ?, updated_by = ?, "
+        "updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+        (int(enabled), updated_by),
+    )
+
+def set_user_bot_enabled(username: str, enabled: bool):
+    execute(
+        "UPDATE users SET bot_enabled = ? WHERE username = ?",
+        (int(enabled), username),
     )
 
 

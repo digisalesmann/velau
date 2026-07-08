@@ -632,15 +632,24 @@ class XAUMasterStrategy:
                 self.save_signal(signal_type, price, rsi, h1_bias,
                     " | ".join(reasons), score)
 
+                eligible = [u for u in all_users if u.get("bot_enabled", True)]
+                if not eligible:
+                    logger.info(
+                        f"⛔ 0/{len(all_users)} users eligible to trade "
+                        f"(all disabled) — signal saved, no trades placed"
+                    )
+                    self._trade_in_progress = False
+                    return
+
                 logger.info(
                     f"🚀 {direction} | confluence={score}/7 | ADX={adx:.1f} | "
-                    f"accounts={len(all_users)}"
+                    f"accounts={len(eligible)}/{len(all_users)}"
                 )
                 self._trade_in_progress = True
 
                 results = await asyncio.gather(
                     *[self._place_for_user(u["username"], u["deriv_token"], direction, score)
-                      for u in all_users],
+                      for u in eligible],
                     return_exceptions=True,
                 )
 

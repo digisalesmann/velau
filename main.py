@@ -34,6 +34,10 @@ bot_task: Optional[asyncio.Task] = None
 async def _bot_runner(delay: int = 10):
     logger.info(f"⏳ Bot starts in {delay}s...")
     await asyncio.sleep(delay)
+    if not db.get_global_bot_enabled():
+        trading_bot.is_running = False
+        logger.info("🤖 Bot startup skipped — globally paused (persisted state).")
+        return
     logger.info("🤖 Bot loop starting now")
     try:
         await trading_bot.start_bot_loop()
@@ -119,6 +123,8 @@ class DashboardResponse(BaseModel):
     deriv_connected:     bool = False
     display_name:        Optional[str] = None
     avatar_url:           Optional[str] = None
+    global_bot_enabled:  bool = True
+    user_bot_enabled:    bool = True
 
 class DisplayNameRequest(BaseModel):
     display_name: str
@@ -279,10 +285,19 @@ async def deriv_status(user=Depends(get_current_user)):
 
 # ── Bot control ────────────────────────────────────────────────────────────────
 
+def _require_admin(user=Depends(get_current_user)):
+    if not db.is_admin(user.username):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
+    me = db.get_user(user.username) or {}
     return {
         "is_running":         trading_bot.is_running,
+        "global_enabled":     db.get_global_bot_enabled(),
+        "user_bot_enabled":   bool(me.get("bot_enabled", True)),
         "circuit_broken":     trading_bot._circuit_broken,
         "consecutive_losses": trading_bot._consecutive_losses,
         "trade_in_progress":  trading_bot._trade_in_progress,
@@ -290,20 +305,29 @@ async def get_bot_status(user=Depends(get_current_user)):
         "in_session":         trading_bot._in_trading_session(),
     }
 
+@app.post("/bot/my-toggle")
+async def toggle_my_bot(user=Depends(get_current_user)):
+    me = db.get_user(user.username) or {}
+    new_val = not bool(me.get("bot_enabled", True))
+    db.set_user_bot_enabled(user.username, new_val)
+    return {"user_bot_enabled": new_val}
+
 @app.post("/bot/toggle")
-async def toggle_bot(user=Depends(get_current_user)):
+async def toggle_bot(user=Depends(_require_admin)):
     global bot_task
     if trading_bot.is_running:
         trading_bot.is_running = False
+        db.set_global_bot_enabled(False, updated_by=user.username)
         if bot_task:
             bot_task.cancel()
-        return {"message": "Bot paused", "is_running": False}
+        return {"message": "Bot paused (platform-wide)", "is_running": False}
     else:
+        db.set_global_bot_enabled(True, updated_by=user.username)
         trading_bot.is_running          = True
         trading_bot._circuit_broken     = False
         trading_bot._consecutive_losses = 0
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
-        return {"message": "Bot started", "is_running": True}
+        return {"message": "Bot started (platform-wide)", "is_running": True}
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -335,9 +359,13 @@ async def get_dashboard(user=Depends(get_current_user)):
         deriv_token = db.get_deriv_token(user.username)
         profile     = db.get_user(user.username) or {}
 
+        global_enabled   = db.get_global_bot_enabled()
+        user_enabled     = bool(profile.get("bot_enabled", True))
+        effective_active = trading_bot.is_running and global_enabled and user_enabled
+
         return DashboardResponse(
             username=user.username,
-            bot_status="active" if trading_bot.is_running else "paused",
+            bot_status="active" if effective_active else "paused",
             balance=balance,
             currency=account_info.get("currency", "USD"),
             account_id=account_info.get("account_id"),
@@ -354,6 +382,8 @@ async def get_dashboard(user=Depends(get_current_user)):
             deriv_connected=bool(deriv_token),
             display_name=profile.get("display_name"),
             avatar_url=profile.get("avatar_url"),
+            global_bot_enabled=global_enabled,
+            user_bot_enabled=user_enabled,
         )
     except Exception as e:
         traceback.print_exc()
@@ -675,12 +705,6 @@ async def subscription_webhook(request: Request):
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────
-
-def _require_admin(user=Depends(get_current_user)):
-    if not db.is_admin(user.username):
-        raise HTTPException(status_code=403, detail="Admin access required.")
-    return user
-
 
 class AdminGrantRequest(BaseModel):
     username: str
