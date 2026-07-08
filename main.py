@@ -180,10 +180,9 @@ def _get_user_token(username: str) -> str:
 @app.get("/")
 async def root():
     return {
-        "status":         "ok",
-        "bot_running":    trading_bot.is_running,
-        "circuit_broken": trading_bot._circuit_broken,
-        "in_session":     trading_bot._in_trading_session(),
+        "status":      "ok",
+        "bot_running": trading_bot.is_running,
+        "in_session":  trading_bot._in_trading_session(),
     }
 
 @app.post("/notifications/register")
@@ -293,15 +292,16 @@ def _require_admin(user=Depends(get_current_user)):
 
 @app.get("/bot/status")
 async def get_bot_status(user=Depends(get_current_user)):
-    me = db.get_user(user.username) or {}
+    me   = db.get_user(user.username) or {}
+    risk = db.get_user_risk_state(user.username)
     return {
         "is_running":         trading_bot.is_running,
         "global_enabled":     db.get_global_bot_enabled(),
         "user_bot_enabled":   bool(me.get("bot_enabled", True)),
-        "circuit_broken":     trading_bot._circuit_broken,
-        "consecutive_losses": trading_bot._consecutive_losses,
+        "circuit_broken":     bool(risk["circuit_broken"]),
+        "consecutive_losses": int(risk["consecutive_losses"]),
         "trade_in_progress":  trading_bot._trade_in_progress,
-        "daily_pnl":          trading_bot._daily_pnl,
+        "daily_pnl":          float(risk["daily_pnl"]),
         "in_session":         trading_bot._in_trading_session(),
     }
 
@@ -323,9 +323,7 @@ async def toggle_bot(user=Depends(_require_admin)):
         return {"message": "Bot paused (platform-wide)", "is_running": False}
     else:
         db.set_global_bot_enabled(True, updated_by=user.username)
-        trading_bot.is_running          = True
-        trading_bot._circuit_broken     = False
-        trading_bot._consecutive_losses = 0
+        trading_bot.is_running = True
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started (platform-wide)", "is_running": True}
 
@@ -358,6 +356,7 @@ async def get_dashboard(user=Depends(get_current_user)):
         market_bias = db.get_latest_bias(username=user.username)
         deriv_token = db.get_deriv_token(user.username)
         profile     = db.get_user(user.username) or {}
+        risk        = db.get_user_risk_state(user.username)
 
         global_enabled   = db.get_global_bot_enabled()
         user_enabled     = bool(profile.get("bot_enabled", True))
@@ -375,8 +374,8 @@ async def get_dashboard(user=Depends(get_current_user)):
             daily_pnl=round(daily_pnl, 2),
             daily_pnl_percent=round(pnl_percent, 2),
             market_bias=market_bias,
-            circuit_broken=trading_bot._circuit_broken,
-            consecutive_losses=trading_bot._consecutive_losses,
+            circuit_broken=bool(risk["circuit_broken"]),
+            consecutive_losses=int(risk["consecutive_losses"]),
             trade_in_progress=trading_bot._trade_in_progress,
             in_session=trading_bot._in_trading_session(),
             deriv_connected=bool(deriv_token),
@@ -757,6 +756,21 @@ async def admin_set_admin(req: AdminSetAdminRequest, user=Depends(_require_admin
     if not db.get_user(req.username):
         raise HTTPException(status_code=404, detail="User not found.")
     db.set_admin(req.username, req.value)
+    return {"ok": True}
+
+
+class AdminResetCircuitBreakerRequest(BaseModel):
+    username: str
+
+
+@app.post("/admin/reset_circuit_breaker")
+async def admin_reset_circuit_breaker(
+    req: AdminResetCircuitBreakerRequest, user=Depends(_require_admin)
+):
+    if not db.get_user(req.username):
+        raise HTTPException(status_code=404, detail="User not found.")
+    db.reset_user_circuit_breaker(req.username)
+    logger.info(f"Admin {user.username} manually reset circuit breaker for {req.username}")
     return {"ok": True}
 
 

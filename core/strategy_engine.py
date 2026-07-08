@@ -41,7 +41,7 @@ from ta.volatility import AverageTrueRange, BollingerBands
 
 from brokers.deriv_trading_service import DerivTradingService
 from position_sizing               import (
-    calculate_stake, get_sizing_context, WINS_TO_EXIT_RECOVERY
+    calculate_stake, WINS_TO_EXIT_RECOVERY
 )
 import database as db
 from core import notifications as notif
@@ -63,33 +63,13 @@ class XAUMasterStrategy:
     def __init__(self):
         self.is_running          = False
         self._trade_in_progress  = False
-        self._consecutive_losses = 0
         self._consecutive_wins   = 0
         self._in_recovery        = False
-        self._circuit_broken     = False
-        self._daily_pnl          = 0.0
-        self._opening_balance    = None
-        self._last_reset_date    = None
         self._last_session_notif = None
         self._current_balance    = 0.0
         self._win_rate           = 0.0
         self._sentiment_cache: dict = {}
         self._sentiment_cache_time: datetime | None = None
-
-    # ── State management ───────────────────────────────────────────────────────
-    def _maybe_reset_daily(self, balance: float):
-        today = datetime.now(timezone.utc).date()
-        if self._last_reset_date != today:
-            self._last_reset_date    = today
-            self._opening_balance    = balance
-            self._daily_pnl          = 0.0
-            self._consecutive_losses = 0
-            self._circuit_broken     = False
-            ctx = get_sizing_context(balance, self._win_rate)
-            logger.info(
-                f"📅 Daily reset | balance=${balance:.2f} | "
-                f"tier={ctx['tier']} | stake=${ctx['normal_stake']:.2f}"
-            )
 
     def _in_trading_session(self) -> bool:
         hour = datetime.now(timezone.utc).hour
@@ -387,8 +367,11 @@ class XAUMasterStrategy:
 
                 profit = float(poc.get("profit", 0))
                 won    = status == "won"
-                self._daily_pnl += profit
                 self.save_trade_result(contract_id, won, profit, username=username)
+
+                state = db.record_trade_settlement(
+                    username, won, profit, MAX_CONSECUTIVE_LOSSES, MAX_DAILY_DRAWDOWN_PCT
+                )
 
                 if username:
                     notif.notify_user(
@@ -400,36 +383,42 @@ class XAUMasterStrategy:
                 else:
                     notif.notify_trade_settled(contract_id, won, profit)
 
+                # Global stake-sizing counters — explicitly out of scope for
+                # per-user isolation, unchanged logic.
                 if won:
-                    self._consecutive_losses  = 0
-                    self._consecutive_wins   += 1
+                    self._consecutive_wins += 1
                     if self._in_recovery and \
                             self._consecutive_wins >= WINS_TO_EXIT_RECOVERY:
                         self._in_recovery = False
                         logger.info(f"✅ Exiting recovery after {self._consecutive_wins} wins")
                     logger.info(
-                        f"✅ WON +${profit:.2f} | streak=+{self._consecutive_wins} | daily={self._daily_pnl:+.2f}"
+                        f"✅ [{username}] WON +${profit:.2f} | streak=+{self._consecutive_wins} | "
+                        f"user_daily={state['daily_pnl']:+.2f}"
                     )
                 else:
-                    self._consecutive_wins    = 0
-                    self._consecutive_losses += 1
-                    self._in_recovery         = True
+                    self._consecutive_wins = 0
+                    self._in_recovery       = True
                     logger.warning(
-                        f"❌ LOST -${stake:.2f} | streak=-{self._consecutive_losses} | "
+                        f"❌ [{username}] LOST -${stake:.2f} | user_streak=-{state['consecutive_losses']} | "
                         f"→ recovery (need {WINS_TO_EXIT_RECOVERY} wins)"
                     )
 
-                if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                    self._circuit_broken = True
-                    notif.notify_circuit_breaker(self._consecutive_losses)
-                    logger.error(f"🚨 CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses")
-
-                if self._opening_balance and self._opening_balance > 0:
-                    dd = abs(self._daily_pnl) / self._opening_balance * 100
-                    if self._daily_pnl < 0 and dd >= MAX_DAILY_DRAWDOWN_PCT:
-                        self._circuit_broken = True
-                        notif.notify_circuit_breaker(self._consecutive_losses)
-                        logger.error(f"🚨 CIRCUIT BREAKER: drawdown {dd:.1f}%")
+                if state["newly_tripped"]:
+                    logger.error(
+                        f"🚨 [{username}] CIRCUIT BREAKER tripped | "
+                        f"losses={state['consecutive_losses']} | daily={state['daily_pnl']:+.2f}"
+                    )
+                    body = (
+                        f"{state['consecutive_losses']} consecutive losses or daily drawdown "
+                        f"limit hit. Your bot has paused for today, resumes at midnight UTC."
+                    )
+                    if username:
+                        notif.notify_user(
+                            username, "Circuit Breaker Triggered", body,
+                            {"type": "circuit_breaker"},
+                        )
+                    else:
+                        notif.notify_circuit_breaker(state["consecutive_losses"])
                 return  # settled — done
 
             logger.warning(f"👁  Contract {contract_id} did not settle within 20 min")
@@ -462,6 +451,7 @@ class XAUMasterStrategy:
             await svc.authenticate()
             info    = await svc.get_account_info()
             balance = float(info.get("balance", 0.0))
+            db.maybe_set_opening_balance(username, balance)
             stake, tier = calculate_stake(
                 balance          = balance,
                 win_rate         = self._win_rate,
@@ -499,6 +489,14 @@ class XAUMasterStrategy:
             logger.warning("No connected Deriv accounts — skipping cycle")
             return
 
+        # Cheap, DB-only daily reset for every connected user (no Deriv API
+        # call) — must run for everyone, not just users who end up trading,
+        # otherwise a circuit-broken user excluded from trading would never
+        # get unstuck at UTC midnight.
+        db.reset_daily_risk_flags(
+            [u["username"] for u in all_users], now_utc.date().isoformat()
+        )
+
         # Use first account for market analysis (candles are symbol-level, not per-user)
         primary_token = all_users[0]["deriv_token"]
         service = DerivTradingService(token=primary_token)
@@ -508,7 +506,6 @@ class XAUMasterStrategy:
             try:
                 info = await service.get_account_info()
                 self._current_balance = float(info.get("balance", 0.0))
-                self._maybe_reset_daily(self._current_balance)
                 self._refresh_win_rate()
                 logger.info(
                     f"💰 ${self._current_balance:.2f} | "
@@ -522,14 +519,8 @@ class XAUMasterStrategy:
 
             logger.info(
                 f"🔍 session={'✅' if self._in_trading_session() else '❌'} "
-                f"circuit={'🚨' if self._circuit_broken else '✅'} "
                 f"lock={'🔒' if self._trade_in_progress else '🔓'}"
             )
-
-            if self._circuit_broken:
-                self.save_signal("NEUTRAL", 0, 0, "N/A",
-                    "Circuit breaker active — resumes next trading day.", 0)
-                return
 
             if self._trade_in_progress:
                 return
@@ -632,11 +623,14 @@ class XAUMasterStrategy:
                 self.save_signal(signal_type, price, rsi, h1_bias,
                     " | ".join(reasons), score)
 
-                eligible = [u for u in all_users if u.get("bot_enabled", True)]
+                eligible = [
+                    u for u in all_users
+                    if u.get("bot_enabled", True) and not u.get("circuit_broken", False)
+                ]
                 if not eligible:
                     logger.info(
                         f"⛔ 0/{len(all_users)} users eligible to trade "
-                        f"(all disabled) — signal saved, no trades placed"
+                        f"(disabled or circuit-broken) — signal saved, no trades placed"
                     )
                     self._trade_in_progress = False
                     return

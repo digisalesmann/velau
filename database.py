@@ -153,6 +153,17 @@ def init_db():
                 INSERT INTO bot_control (id, global_enabled) VALUES (1, TRUE)
                 ON CONFLICT (id) DO NOTHING
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_risk_state (
+                    username           TEXT PRIMARY KEY,
+                    consecutive_losses INTEGER  NOT NULL DEFAULT 0,
+                    circuit_broken     BOOLEAN  NOT NULL DEFAULT FALSE,
+                    daily_pnl          REAL     NOT NULL DEFAULT 0,
+                    opening_balance    REAL     DEFAULT NULL,
+                    last_reset_date    DATE     DEFAULT NULL,
+                    updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -227,6 +238,17 @@ def init_db():
             """)
             cur.execute("""
                 INSERT OR IGNORE INTO bot_control (id, global_enabled) VALUES (1, 1)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_risk_state (
+                    username           TEXT PRIMARY KEY,
+                    consecutive_losses INTEGER NOT NULL DEFAULT 0,
+                    circuit_broken     INTEGER NOT NULL DEFAULT 0,
+                    daily_pnl          REAL    NOT NULL DEFAULT 0,
+                    opening_balance    REAL    DEFAULT NULL,
+                    last_reset_date    TEXT    DEFAULT NULL,
+                    updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
             """)
             for col, defn in [
                 ("display_name", "TEXT DEFAULT NULL"),
@@ -350,11 +372,17 @@ def disable_totp(username: str):
     )
 
 def get_all_users_with_tokens() -> list[dict]:
-    """Return all users who have connected a Deriv account."""
-    return fetchall(
-        "SELECT username, deriv_token, deriv_account, bot_enabled FROM users "
-        "WHERE deriv_token IS NOT NULL AND deriv_token != ''"
-    )
+    """Return all users who have connected a Deriv account, with their
+    current circuit-breaker state (defaults to not-broken if no risk-state
+    row exists yet)."""
+    default = "FALSE" if _USE_POSTGRES else "0"
+    return fetchall(f"""
+        SELECT u.username, u.deriv_token, u.deriv_account, u.bot_enabled,
+               COALESCE(s.circuit_broken, {default}) AS circuit_broken
+        FROM users u
+        LEFT JOIN user_risk_state s ON s.username = u.username
+        WHERE u.deriv_token IS NOT NULL AND u.deriv_token != ''
+    """)
 
 
 # ── Bot control ─────────────────────────────────────────────────────────────────
@@ -376,6 +404,171 @@ def set_user_bot_enabled(username: str, enabled: bool):
     execute(
         "UPDATE users SET bot_enabled = ? WHERE username = ?",
         (int(enabled), username),
+    )
+
+
+# ── Per-user risk state (circuit breaker / daily PnL) ────────────────────────────
+# Isolated per user so one account's losing streak can't pause trading for
+# everyone else — see project_bot_control_switches memory for the history.
+
+def get_user_risk_state(username: str) -> dict:
+    row = fetchone("SELECT * FROM user_risk_state WHERE username = ?", (username,))
+    if not row:
+        return {
+            "username": username,
+            "consecutive_losses": 0,
+            "circuit_broken": False,
+            "daily_pnl": 0.0,
+            "opening_balance": None,
+            "last_reset_date": None,
+        }
+    return row
+
+
+def reset_daily_risk_flags(usernames: list[str], today_iso: str):
+    """Cheap, DB-only daily reset (no Deriv API call) run once per cycle over
+    every connected user, not just ones who end up trading — otherwise a
+    circuit-broken user who's excluded from trading would never get a chance
+    to be unstuck at UTC midnight."""
+    if not usernames:
+        return
+    with get_conn() as (conn, cur):
+        if _USE_POSTGRES:
+            cur.executemany(
+                "INSERT INTO user_risk_state (username) VALUES (%s) "
+                "ON CONFLICT (username) DO NOTHING",
+                [(u,) for u in usernames],
+            )
+            placeholders = ",".join(["%s"] * len(usernames))
+            cur.execute(
+                f"""UPDATE user_risk_state
+                    SET daily_pnl = 0, consecutive_losses = 0, circuit_broken = FALSE,
+                        opening_balance = NULL, last_reset_date = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE username IN ({placeholders})
+                      AND (last_reset_date IS NULL OR last_reset_date <> %s)""",
+                [today_iso, *usernames, today_iso],
+            )
+        else:
+            cur.executemany(
+                "INSERT OR IGNORE INTO user_risk_state (username) VALUES (?)",
+                [(u,) for u in usernames],
+            )
+            placeholders = ",".join(["?"] * len(usernames))
+            cur.execute(
+                f"""UPDATE user_risk_state
+                    SET daily_pnl = 0, consecutive_losses = 0, circuit_broken = 0,
+                        opening_balance = NULL, last_reset_date = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE username IN ({placeholders})
+                      AND (last_reset_date IS NULL OR last_reset_date <> ?)""",
+                [today_iso, *usernames, today_iso],
+            )
+
+
+def maybe_set_opening_balance(username: str, balance: float):
+    """Stamps the day's opening balance the first time it's known — a single
+    atomic UPDATE, no read-modify-write, safe regardless of concurrent callers."""
+    if _USE_POSTGRES:
+        execute(
+            "INSERT INTO user_risk_state (username) VALUES (?) "
+            "ON CONFLICT (username) DO NOTHING", (username,)
+        )
+    else:
+        execute("INSERT OR IGNORE INTO user_risk_state (username) VALUES (?)", (username,))
+    execute(
+        "UPDATE user_risk_state SET opening_balance = ? "
+        "WHERE username = ? AND opening_balance IS NULL",
+        (float(balance), username),
+    )
+
+
+def record_trade_settlement(
+    username: str, won: bool, profit: float,
+    max_consecutive_losses: int, max_daily_drawdown_pct: float,
+) -> dict:
+    """
+    Atomically updates one user's consecutive_losses/daily_pnl/circuit_broken
+    after a trade settles. Does NOT touch trade_results — that's handled
+    separately by insert_trade_result, unchanged.
+
+    Uses SELECT ... FOR UPDATE (Postgres) to hold the row lock for the whole
+    transaction, so two settlements for the SAME user overlapping in time
+    (possible since contract monitors are fire-and-forget and can outlive a
+    single trade cycle) are serialized by the database, not by Python.
+    """
+    with get_conn() as (conn, cur):
+        if _USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO user_risk_state (username) VALUES (%s) "
+                "ON CONFLICT (username) DO NOTHING", (username,)
+            )
+            cur.execute(
+                "SELECT consecutive_losses, circuit_broken, daily_pnl, opening_balance "
+                "FROM user_risk_state WHERE username = %s FOR UPDATE",
+                (username,),
+            )
+        else:
+            cur.execute(
+                "INSERT OR IGNORE INTO user_risk_state (username) VALUES (?)", (username,)
+            )
+            cur.execute(
+                "SELECT consecutive_losses, circuit_broken, daily_pnl, opening_balance "
+                "FROM user_risk_state WHERE username = ?",
+                (username,),
+            )
+
+        old = dict(cur.fetchone())
+        new_losses    = 0 if won else int(old["consecutive_losses"]) + 1
+        new_daily_pnl = float(old["daily_pnl"]) + float(profit)
+        was_broken    = bool(old["circuit_broken"])
+        circuit_broken, newly_tripped = was_broken, False
+
+        if not was_broken:
+            if not won and new_losses >= max_consecutive_losses:
+                circuit_broken, newly_tripped = True, True
+            elif old["opening_balance"] and float(old["opening_balance"]) > 0 and new_daily_pnl < 0:
+                dd = abs(new_daily_pnl) / float(old["opening_balance"]) * 100
+                if dd >= max_daily_drawdown_pct:
+                    circuit_broken, newly_tripped = True, True
+
+        ph = "%s" if _USE_POSTGRES else "?"
+        cur.execute(
+            f"UPDATE user_risk_state SET consecutive_losses = {ph}, daily_pnl = {ph}, "
+            f"circuit_broken = {ph} WHERE username = {ph}",
+            (
+                new_losses,
+                new_daily_pnl,
+                circuit_broken if _USE_POSTGRES else int(circuit_broken),
+                username,
+            ),
+        )
+
+    return {
+        "consecutive_losses": new_losses,
+        "daily_pnl": new_daily_pnl,
+        "circuit_broken": circuit_broken,
+        "newly_tripped": newly_tripped,
+    }
+
+
+def reset_user_circuit_breaker(username: str):
+    """Admin manual unstick — clears one user's breaker without waiting for
+    the UTC daily reset. Also clears daily_pnl/opening_balance, not just the
+    breaker flag: leaving daily_pnl deeply negative would immediately re-trip
+    the drawdown check on the very next settlement, making a partial reset
+    pointless."""
+    if _USE_POSTGRES:
+        execute(
+            "INSERT INTO user_risk_state (username) VALUES (?) "
+            "ON CONFLICT (username) DO NOTHING", (username,)
+        )
+    else:
+        execute("INSERT OR IGNORE INTO user_risk_state (username) VALUES (?)", (username,))
+    execute(
+        "UPDATE user_risk_state SET circuit_broken = ?, consecutive_losses = ?, "
+        "daily_pnl = ?, opening_balance = NULL WHERE username = ?",
+        (0, 0, 0.0, username),
     )
 
 
