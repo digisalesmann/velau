@@ -131,6 +131,13 @@ def init_db():
                     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fcm_tokens (
+                    token      TEXT PRIMARY KEY,
+                    username   TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -183,6 +190,13 @@ def init_db():
                     price_usd    REAL,
                     expires_at   DATETIME,
                     created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fcm_tokens (
+                    token      TEXT PRIMARY KEY,
+                    username   TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             for col, defn in [
@@ -291,6 +305,29 @@ def get_all_users_with_tokens() -> list[dict]:
         "SELECT username, deriv_token, deriv_account FROM users "
         "WHERE deriv_token IS NOT NULL AND deriv_token != ''"
     )
+
+
+# ── FCM push tokens ─────────────────────────────────────────────────────────────
+# Persisted (not in-memory) so tokens survive process restarts/redeploys —
+# otherwise a Render restart silently drops everyone's push notifications
+# until they reopen the app and re-register.
+
+def save_fcm_token(username: str, token: str):
+    execute(
+        """INSERT INTO fcm_tokens (token, username) VALUES (?, ?)
+           ON CONFLICT (token) DO UPDATE SET username = excluded.username""",
+        (token, username),
+    )
+
+def delete_fcm_token(token: str):
+    execute("DELETE FROM fcm_tokens WHERE token = ?", (token,))
+
+def get_fcm_tokens(username: str = None) -> list[str]:
+    if username:
+        rows = fetchall("SELECT token FROM fcm_tokens WHERE username = ?", (username,))
+    else:
+        rows = fetchall("SELECT token FROM fcm_tokens")
+    return [r["token"] for r in rows]
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
