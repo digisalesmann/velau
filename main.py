@@ -177,8 +177,12 @@ def _get_user_token(username: str) -> str:
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
+    # HEAD support matters here: uptime monitors (UptimeRobot's default HTTP(s)
+    # monitor, among others) send HEAD requests, not GET, to keep checks cheap.
+    # A GET-only route 405s every HEAD check, making the monitor falsely
+    # report "down" regardless of whether the server is actually healthy.
     return {
         "status":      "ok",
         "bot_running": trading_bot.is_running,
