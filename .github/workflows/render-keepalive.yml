@@ -15,9 +15,25 @@ jobs:
         env:
           APP_URL: https://velau.onrender.com/
         run: |
-          status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL")
-          echo "Render responded with HTTP $status"
-          if [ "$status" -lt 200 ] || [ "$status" -ge 400 ]; then
-            echo "Unexpected status code, failing job so GitHub notifies via email."
-            exit 1
-          fi
+          # A cold-started Render free instance can take longer than 30s to
+          # answer its very first request, so a single short-timeout ping
+          # isn't reliable evidence the app is actually down. Retry with a
+          # generous per-attempt timeout before treating it as a real failure.
+          max_attempts=3
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt of $max_attempts..."
+            status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$APP_URL" || echo "000")
+            echo "Render responded with HTTP $status"
+            if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
+              echo "Success."
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+            if [ $attempt -le $max_attempts ]; then
+              echo "Retrying in 10s (Render may still be cold-starting)..."
+              sleep 10
+            fi
+          done
+          echo "All $max_attempts attempts failed, failing job so GitHub notifies via email."
+          exit 1
