@@ -82,6 +82,8 @@ def init_db():
                 ("is_admin",      "BOOLEAN DEFAULT FALSE"),
                 ("totp_secret",   "TEXT DEFAULT NULL"),
                 ("totp_enabled",  "BOOLEAN DEFAULT FALSE"),
+                ("display_name",  "TEXT DEFAULT NULL"),
+                ("avatar_url",    "TEXT DEFAULT NULL"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -148,6 +150,8 @@ def init_db():
                     is_admin        INTEGER DEFAULT 0,
                     totp_secret     TEXT DEFAULT NULL,
                     totp_enabled    INTEGER DEFAULT 0,
+                    display_name    TEXT DEFAULT NULL,
+                    avatar_url      TEXT DEFAULT NULL,
                     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -199,6 +203,11 @@ def init_db():
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            for col, defn in [
+                ("display_name", "TEXT DEFAULT NULL"),
+                ("avatar_url",   "TEXT DEFAULT NULL"),
+            ]:
+                _add_col(cur, "users", col, defn)
             for col, defn in [
                 ("confluence_score", "INTEGER DEFAULT 0"),
                 ("username",         "TEXT DEFAULT NULL"),
@@ -277,6 +286,21 @@ def is_admin(username: str) -> bool:
 
 def set_admin(username: str, value: bool):
     execute("UPDATE users SET is_admin = ? WHERE username = ?", (int(value), username))
+
+
+# ── Profile ──────────────────────────────────────────────────────────────────
+
+def update_display_name(username: str, display_name: str):
+    execute(
+        "UPDATE users SET display_name = ? WHERE username = ?",
+        (display_name, username),
+    )
+
+def update_avatar_url(username: str, avatar_url: str):
+    execute(
+        "UPDATE users SET avatar_url = ? WHERE username = ?",
+        (avatar_url, username),
+    )
 
 
 # ── TOTP / 2FA ────────────────────────────────────────────────────────────────

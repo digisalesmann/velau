@@ -1,5 +1,6 @@
 import json
 import hmac
+import base64
 import hashlib
 import logging
 import asyncio
@@ -24,6 +25,7 @@ from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
 from core import notifications as notif
+import storage
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
@@ -115,6 +117,15 @@ class DashboardResponse(BaseModel):
     trade_in_progress:   bool = False
     in_session:          bool = True
     deriv_connected:     bool = False
+    display_name:        Optional[str] = None
+    avatar_url:           Optional[str] = None
+
+class DisplayNameRequest(BaseModel):
+    display_name: str
+
+class AvatarUploadRequest(BaseModel):
+    image_base64: str
+    content_type: str = "image/jpeg"
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
@@ -322,6 +333,7 @@ async def get_dashboard(user=Depends(get_current_user)):
         pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
         market_bias = db.get_latest_bias(username=user.username)
         deriv_token = db.get_deriv_token(user.username)
+        profile     = db.get_user(user.username) or {}
 
         return DashboardResponse(
             username=user.username,
@@ -340,12 +352,46 @@ async def get_dashboard(user=Depends(get_current_user)):
             trade_in_progress=trading_bot._trade_in_progress,
             in_session=trading_bot._in_trading_session(),
             deriv_connected=bool(deriv_token),
+            display_name=profile.get("display_name"),
+            avatar_url=profile.get("avatar_url"),
         )
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Dashboard error: {e}")
     finally:
         await service.close()
+
+
+@app.post("/account/display-name")
+async def set_display_name(req: DisplayNameRequest, user=Depends(get_current_user)):
+    name = req.display_name.strip()
+    if not name or len(name) > 40:
+        raise HTTPException(
+            status_code=400,
+            detail="Display name must be between 1 and 40 characters.",
+        )
+    db.update_display_name(user.username, name)
+    return {"display_name": name}
+
+
+@app.post("/account/avatar")
+async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)):
+    try:
+        image_bytes = base64.b64decode(req.image_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image data.")
+
+    if len(image_bytes) > 3 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image must be under 3MB.")
+
+    try:
+        avatar_url = storage.upload_avatar(user.username, image_bytes, req.content_type)
+    except Exception as e:
+        logger.warning(f"Avatar upload failed for {user.username}: {e}")
+        raise HTTPException(status_code=502, detail="Avatar upload failed. Please try again.")
+
+    db.update_avatar_url(user.username, avatar_url)
+    return {"avatar_url": avatar_url}
 
 
 @app.get("/open_contracts")
