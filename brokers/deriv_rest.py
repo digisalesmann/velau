@@ -29,13 +29,13 @@ class DerivREST:
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
-    def get_account_info(self) -> dict:
-        """GET /trading/v1/options/accounts/me — returns account id, balance, currency."""
-        url = f"{BASE_URL}/trading/v1/options/accounts/me"
+    def get_accounts(self) -> list:
+        """GET /trading/v1/options/accounts — returns all accounts (demo + real) for this token."""
+        url = f"{BASE_URL}/trading/v1/options/accounts"
         resp = self.session.get(url, headers=self.headers, timeout=10)
         resp.raise_for_status()
-        logger.info("Fetched account info.")
-        return resp.json()
+        logger.info("Fetched account list.")
+        return resp.json().get("data", [])
 
     def generate_otp(self, account_id: str) -> dict:
         """POST /trading/v1/options/accounts/{accountId}/otp — returns OTP + WebSocket URL."""

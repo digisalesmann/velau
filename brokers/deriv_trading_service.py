@@ -1,7 +1,6 @@
 """
 Deriv Trading Service — Python 3.14 compatible, Render-tuned timeouts.
 """
-import asyncio
 import logging
 
 from brokers.deriv_ws import DerivWebSocket
@@ -19,52 +18,31 @@ CONTRACT_DURATION_UNIT = "m"
 class DerivTradingService:
     def __init__(self, token: str = None):
         self.token       = token or DERIV_TOKEN
-        self.ws          = DerivWebSocket()
+        self.ws          = DerivWebSocket(token=self.token)
         self._authorized = False
 
     # ── AUTH ───────────────────────────────────────────────────────────────────
     async def authenticate(self):
-        await self.ws.connect()
-        await asyncio.sleep(2.0)
-        await self.ws.send({"authorize": self.token})
+        """
+        The WebSocket URL itself is single-use and OTP-authenticated
+        (see brokers/deriv_ws.py), so a successful connect() means the
+        session is already authorized — no in-band {"authorize": token}
+        handshake exists on the new API.
+        """
+        try:
+            await self.ws.connect()
+        except ConnectionError as e:
+            raise Exception(
+                f"Deriv auth failed: {e}. Check DERIV_TOKEN and DERIV_APP_ID env vars."
+            )
 
-        for attempt in range(15):
-            try:
-                raw = await self.ws.receive(timeout=20.0)
-            except TimeoutError:
-                raise Exception(
-                    "Deriv auth timed out — no response after 20s. "
-                    "Check DERIV_TOKEN and DERIV_APP_ID env vars on Render."
-                )
-            except asyncio.CancelledError:
-                raise
-
-            msg_type = raw.get("msg_type", "")
-            error    = raw.get("error")
-
-            if error:
-                code = error.get("code", "")
-                msg  = error.get("message", "Unknown error")
-                if code == "WrongResponse" and attempt < 5:
-                    logger.warning(f"Skipping stale frame {attempt}: [{code}] {msg}")
-                    continue
-                logger.error(f"Auth error [{code}]: {msg}")
-                raise Exception(f"Deriv auth failed [{code}]: {msg}")
-
-            if msg_type == "authorize" or raw.get("authorize"):
-                self._authorized = True
-                info     = raw.get("authorize", {})
-                loginid  = info.get("loginid", "unknown")
-                balance  = info.get("balance", "?")
-                currency = info.get("currency", "")
-                logger.info(
-                    f"✅ Auth OK | account={loginid} balance={balance} {currency}"
-                )
-                return raw
-
-            logger.debug(f"Skipping non-auth frame {attempt}: {msg_type}")
-
-        raise Exception("Deriv auth failed: no authorize response after 15 frames.")
+        self._authorized = True
+        info = self.ws.account_info or {}
+        logger.info(
+            f"✅ Auth OK | account={info.get('account_id', 'unknown')} "
+            f"balance={info.get('balance', '?')} {info.get('currency', '')}"
+        )
+        return info
 
     # ── ACCOUNT ────────────────────────────────────────────────────────────────
     async def get_account_info(self) -> dict:

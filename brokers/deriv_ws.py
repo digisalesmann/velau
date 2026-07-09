@@ -1,6 +1,18 @@
 """
 Deriv WebSocket client — Python 3.14 safe.
 
+Connection model (Deriv retired the legacy `wss://ws.binaryws.com` +
+in-band `{"authorize": token}` flow):
+  1. REST: GET  /trading/v1/options/accounts        -> list of accounts for this token
+  2. REST: POST /trading/v1/options/accounts/{id}/otp -> single-use WebSocket URL
+  3. Connect directly to that URL — the OTP in the query string authenticates
+     the session, so no further auth frame is sent or expected. Every other
+     message (balance, ticks_history, proposal, buy, ...) uses the exact same
+     JSON protocol as before.
+
+  OTPs are short-lived and single-use, so a fresh one is fetched on every
+  connection attempt (including retries), not just the first.
+
 Root cause of all timeout issues:
   Python 3.14 changed how CancelledError propagates through async generators.
   websockets uses an async generator internally for recv(). Both
@@ -20,42 +32,60 @@ import websockets
 import json
 import logging
 
+from brokers.deriv_rest import DerivREST
 from env_config import DERIV_APP_ID
 
 logger = logging.getLogger("DerivWebSocket")
 
 
 class DerivWebSocket:
-    def __init__(self, ws_url: str = None, max_retries: int = 7):
-        if ws_url:
-            self.ws_url = ws_url
-        else:
-            if not DERIV_APP_ID:
-                raise ValueError(
-                    "DERIV_APP_ID missing — set it in Render environment variables."
-                )
-            self.ws_url = (
-                f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    def __init__(self, token: str, app_id: str = None, max_retries: int = 7):
+        self.app_id = app_id or DERIV_APP_ID
+        if not self.app_id:
+            raise ValueError(
+                "DERIV_APP_ID missing — set it in Render environment variables."
             )
-        self.connection  = None
+        if not token:
+            raise ValueError("Deriv API token missing.")
+
+        self.token       = token
         self.max_retries = max_retries
+        self.connection  = None
+        self.account_id   = None
+        self.account_info = None
+
+    def _fetch_ws_url(self) -> str:
+        """Blocking REST calls (accounts -> OTP) run off the event loop via asyncio.to_thread."""
+        rest = DerivREST(app_id=self.app_id, token=self.token)
+        accounts = rest.get_accounts()
+        if not accounts:
+            raise ConnectionError("Deriv token has no accessible trading accounts.")
+
+        active = [a for a in accounts if a.get("status") == "active"] or accounts
+        chosen = next((a for a in active if a.get("account_type") == "real"), active[0])
+
+        self.account_id   = chosen.get("account_id")
+        self.account_info = chosen
+
+        otp = rest.generate_otp(self.account_id)
+        return otp["data"]["url"]
 
     async def connect(self):
         last_error = None
         for attempt in range(self.max_retries):
             try:
+                ws_url = await asyncio.to_thread(self._fetch_ws_url)
                 self.connection = await websockets.connect(
-                    self.ws_url,
+                    ws_url,
                     ping_interval=20,
                     ping_timeout=15,
                     close_timeout=10,
                     open_timeout=15,
-                    additional_headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Origin":     "https://app.deriv.com",
-                    },
                 )
-                logger.info(f"✅ WebSocket connected (attempt {attempt + 1})")
+                logger.info(
+                    f"✅ WebSocket connected (attempt {attempt + 1}) | "
+                    f"account={self.account_id}"
+                )
                 return self.connection
             except Exception as e:
                 last_error = e
