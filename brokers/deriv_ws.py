@@ -56,19 +56,6 @@ class DerivWebSocket:
         self.account_id    = None
         self.account_info  = None
 
-        # TEMPORARY — remove once the "Invalid token format" mystery is solved.
-        # Logs shape, not content: length, first/last few chars, whitespace/
-        # non-ASCII flags. Screenshots of the Render dashboard can't reveal
-        # invisible characters or lookalike Unicode, so this checks what
-        # Python actually received at runtime instead.
-        stripped = token.strip()
-        logger.warning(
-            "🔎 TOKEN DEBUG | len=%d | stripped_len=%d | repr_head=%r | repr_tail=%r | "
-            "has_surrounding_ws=%s | all_ascii=%s",
-            len(token), len(stripped), token[:10], token[-6:],
-            token != stripped, token.isascii(),
-        )
-
     def _fetch_ws_url(self) -> str:
         """Blocking REST calls (accounts -> OTP) run off the event loop via asyncio.to_thread."""
         rest = DerivREST(app_id=self.app_id, token=self.token)
