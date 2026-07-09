@@ -14,7 +14,8 @@ import os
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
 from database import get_user, user_exists, create_user, is_admin as db_is_admin
-from rate_limit import login_limiter, register_limiter
+import database as db
+from rate_limit import login_limiter, register_limiter, forgot_password_limiter, reset_password_limiter
 
 logger = logging.getLogger("Auth")
 pwd_context = PasswordHash([BcryptHasher()])
@@ -45,6 +46,14 @@ class Token(BaseModel):
 class FirebaseAuthRequest(BaseModel):
     firebase_token: str
     is_admin:     bool = False
+
+class ForgotPasswordRequest(BaseModel):
+    username: str
+
+class ResetPasswordRequest(BaseModel):
+    username:     str
+    code:         str
+    new_password: str
 
 
 # ── Password ───────────────────────────────────────────────────────────────────
@@ -140,6 +149,56 @@ async def login(user_in: UserIn):
     except Exception:
         logger.exception(f"Login error for {user_in.username}")
         raise HTTPException(status_code=500, detail="Login failed. Please try again.")
+
+
+@router.post("/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest):
+    """
+    Always returns the same generic response regardless of whether the
+    account exists — a distinguishable response here would let anyone probe
+    which emails are registered (user enumeration).
+    """
+    import secrets
+    import hashlib
+    from datetime import datetime, timedelta
+
+    forgot_password_limiter.check(req.username.lower())
+
+    if user_exists_in_db(req.username):
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        code_hash = hashlib.sha256(code.encode()).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(minutes=15)
+        db.create_password_reset(req.username, code_hash, expires_at)
+        try:
+            from email_service import send_password_reset_email
+            send_password_reset_email(req.username, code, expiry_minutes=15)
+        except Exception:
+            # The code is already stored — a delivery failure shouldn't
+            # surface as an enumeration signal, and the user can retry.
+            logger.exception(f"Password reset email failed for {req.username}")
+
+    return {"ok": True}
+
+
+@router.post("/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest):
+    import hashlib
+    from datetime import datetime
+
+    reset_password_limiter.check(req.username.lower())
+
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    code_hash = hashlib.sha256(req.code.encode()).hexdigest()
+    row = db.get_valid_password_reset(req.username, code_hash, datetime.utcnow())
+    if not row:
+        raise HTTPException(status_code=400, detail="Invalid or expired code.")
+
+    db.set_password(req.username, get_password_hash(req.new_password))
+    db.mark_password_reset_used(row["id"])
+    reset_password_limiter.reset(req.username.lower())
+    return {"ok": True}
 
 
 def _get_firebase_app():

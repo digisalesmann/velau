@@ -165,6 +165,16 @@ def init_db():
                     updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    id         SERIAL PRIMARY KEY,
+                    username   TEXT NOT NULL,
+                    code_hash  TEXT NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    used       BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -249,6 +259,16 @@ def init_db():
                     opening_balance    REAL    DEFAULT NULL,
                     last_reset_date    TEXT    DEFAULT NULL,
                     updated_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username   TEXT NOT NULL,
+                    code_hash  TEXT NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    used       INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             for col, defn in [
@@ -342,6 +362,12 @@ def set_admin(username: str, value: bool):
     # SQLite has no such restriction either way. bool works natively on both.
     execute("UPDATE users SET is_admin = ? WHERE username = ?", (bool(value), username))
 
+def set_password(username: str, hashed_password: str):
+    execute(
+        "UPDATE users SET hashed_password = ? WHERE username = ?",
+        (hashed_password, username),
+    )
+
 
 # ── Profile ──────────────────────────────────────────────────────────────────
 
@@ -356,6 +382,31 @@ def update_avatar_url(username: str, avatar_url: str):
         "UPDATE users SET avatar_url = ? WHERE username = ?",
         (avatar_url, username),
     )
+
+
+# ── Password reset ─────────────────────────────────────────────────────────────
+
+def create_password_reset(username: str, code_hash: str, expires_at):
+    """Invalidate any prior unused codes for this user, then store the new one —
+    only the most recently requested code is ever valid."""
+    execute(
+        "DELETE FROM password_resets WHERE username = ? AND used = ?",
+        (username, False),
+    )
+    execute(
+        "INSERT INTO password_resets (username, code_hash, expires_at) VALUES (?, ?, ?)",
+        (username, code_hash, expires_at),
+    )
+
+def get_valid_password_reset(username: str, code_hash: str, now) -> dict | None:
+    return fetchone(
+        "SELECT * FROM password_resets WHERE username = ? AND code_hash = ? "
+        "AND used = ? AND expires_at > ?",
+        (username, code_hash, False, now),
+    )
+
+def mark_password_reset_used(reset_id: int):
+    execute("UPDATE password_resets SET used = ? WHERE id = ?", (True, reset_id))
 
 
 # ── TOTP / 2FA ────────────────────────────────────────────────────────────────
