@@ -480,6 +480,29 @@ class XAUMasterStrategy:
         finally:
             await svc.close()
 
+    async def _get_market_data_service(self, all_users: list[dict]):
+        """
+        Find one working account to use for cycle-wide market data.
+        Candles/bias are symbol-level, not per-user, so any authenticated
+        account works — scans in order with a short retry budget per
+        account (2 instead of the default 7) so a single stale/broken
+        token burns seconds, not ~2 minutes of the 5-minute cycle, before
+        moving on to the next one.
+        """
+        for u in all_users:
+            service = DerivTradingService(
+                token=u["deriv_token"],
+                account_type=u.get("trade_account_type", "real"),
+            )
+            service.ws.max_retries = 2
+            try:
+                await service.authenticate()
+                return service
+            except Exception as e:
+                logger.warning(f"⚠️  Market-data account [{u['username']}] unusable: {e}")
+                await service.close()
+        return None
+
     async def execute_trade_cycle(self):
         now_utc = datetime.now(timezone.utc)
         logger.info(f"━━━ Cycle {now_utc:%H:%M:%S} UTC ━━━")
@@ -497,13 +520,15 @@ class XAUMasterStrategy:
             [u["username"] for u in all_users], now_utc.date().isoformat()
         )
 
-        # Use first account for market analysis (candles are symbol-level, not per-user)
-        primary_token = all_users[0]["deriv_token"]
-        primary_account_type = all_users[0].get("trade_account_type", "real")
-        service = DerivTradingService(token=primary_token, account_type=primary_account_type)
-        try:
-            await service.authenticate()
+        # Any authenticated account works for market data (candles/bias are
+        # symbol-level, not per-user) — scan until one works so a single
+        # broken/stale token can't block the whole cycle for every user.
+        service = await self._get_market_data_service(all_users)
+        if service is None:
+            logger.error("❌ No usable Deriv account for market data — skipping cycle")
+            return
 
+        try:
             try:
                 info = await service.get_account_info()
                 self._current_balance = float(info.get("balance", 0.0))
