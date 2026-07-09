@@ -585,6 +585,34 @@ async def get_subscription_status(user=Depends(get_current_user)):
     return {"active": False, "is_admin": False}
 
 
+@app.get("/session")
+async def get_session(user=Depends(get_current_user)):
+    """
+    Consolidated post-login info: 2FA status + subscription status in one
+    round trip instead of two separate requests. The splash-screen biometric
+    flow and the login screen both used to fire /2fa/status and
+    /subscription/status as two calls (even when parallelized, that's still
+    two full request/response round trips) — every extra request adds real
+    latency on a cold Render start, where connection setup dominates.
+    """
+    tfa_data = db.get_totp_data(user.username)
+    tfa_enabled = bool(tfa_data and tfa_data.get("totp_enabled"))
+
+    admin = db.is_admin(user.username)
+    if admin:
+        subscription_active, plan = True, "admin"
+    else:
+        sub = db.get_active_subscription(user.username)
+        subscription_active, plan = bool(sub), (sub["plan"] if sub else None)
+
+    return {
+        "tfa_enabled":         tfa_enabled,
+        "subscription_active": subscription_active,
+        "plan":                plan,
+        "is_admin":            admin,
+    }
+
+
 @app.post("/subscription/create")
 async def create_subscription(req: SubscriptionCreateRequest,
                               user=Depends(get_current_user)):
