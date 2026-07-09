@@ -2,18 +2,21 @@
 User and session management — now uses database.py for persistence.
 PostgreSQL on Render, SQLite fallback for local dev.
 """
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
+import logging
 import os
 
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
 from database import get_user, user_exists, create_user, is_admin as db_is_admin
+from rate_limit import login_limiter, register_limiter
 
+logger = logging.getLogger("Auth")
 pwd_context = PasswordHash([BcryptHasher()])
 SECRET_KEY  = os.getenv("SECRET_KEY", "REPLACE_WITH_A_SECURE_RANDOM_KEY")
 ALGORITHM   = "HS256"
@@ -103,7 +106,8 @@ async def get_current_user(
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @router.post("/register", response_model=Token)
-async def register(user_in: UserIn):
+async def register(user_in: UserIn, request: Request):
+    register_limiter.check(request.client.host if request.client else "unknown")
     try:
         if user_exists_in_db(user_in.username):
             raise HTTPException(status_code=400, detail="Username already registered")
@@ -114,30 +118,26 @@ async def register(user_in: UserIn):
     except HTTPException:
         raise
     except Exception:
-        import traceback
-        raise HTTPException(
-            status_code=500,
-            detail=f"Register error: {traceback.format_exc()}",
-        )
+        logger.exception(f"Register error for {user_in.username}")
+        raise HTTPException(status_code=500, detail="Registration failed. Please try again.")
 
 
 @router.post("/login", response_model=Token)
 async def login(user_in: UserIn):
+    login_limiter.check(user_in.username.lower())
     try:
         user = get_user_from_db(user_in.username)
         if not user or not verify_password(user_in.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Incorrect username or password")
+        login_limiter.reset(user_in.username.lower())
         token    = create_access_token(data={"sub": user.username})
         is_admin = db_is_admin(user.username)
         return {"access_token": token, "token_type": "bearer", "is_admin": is_admin}
     except HTTPException:
         raise
     except Exception:
-        import traceback
-        raise HTTPException(
-            status_code=500,
-            detail=f"Login error: {traceback.format_exc()}",
-        )
+        logger.exception(f"Login error for {user_in.username}")
+        raise HTTPException(status_code=500, detail="Login failed. Please try again.")
 
 
 def _get_firebase_app():
@@ -180,5 +180,5 @@ async def auth_firebase(req: FirebaseAuthRequest):
     except HTTPException:
         raise
     except Exception:
-        import traceback
-        raise HTTPException(status_code=500, detail=f"Firebase auth error: {traceback.format_exc()}")
+        logger.exception("Firebase auth error")
+        raise HTTPException(status_code=500, detail="Sign-in failed. Please try again.")

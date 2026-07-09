@@ -63,6 +63,10 @@ Pipfile.lock
 .env
 .env.*
 
+# Database dumps — contain real password hashes and Deriv API tokens
+*.sql
+render_logs.txt
+
 # Flutter/Dart
 .dart_tool/
 build/

@@ -22,6 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger("Main")
 
 from user_models import User, router as users_router, get_current_user
+from rate_limit import twofa_limiter
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
@@ -585,10 +586,24 @@ async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
 @app.post("/trade")
 async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
+    from position_sizing import MAX_STAKE
+
     if not req.contract_type or req.contract_type.upper() not in ("CALL", "PUT"):
         raise HTTPException(status_code=400, detail="Invalid contract_type.")
     if not req.amount or req.amount <= 0:
         raise HTTPException(status_code=400, detail="amount must be positive.")
+    if req.amount > MAX_STAKE:
+        raise HTTPException(status_code=400, detail=f"Stake cannot exceed ${MAX_STAKE:.2f}.")
+
+    # Manual trades must respect the same circuit breaker the bot enforces
+    # on itself — otherwise a tripped user could route around it by hand.
+    risk = db.get_user_risk_state(user.username)
+    if risk["circuit_broken"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Trading is paused for today after hitting your risk limit. Resumes at midnight UTC.",
+        )
+
     token, account_type = _get_user_deriv_context(user.username)
     service = DerivTradingService(token=token, account_type=account_type)
     try:
@@ -597,6 +612,16 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
             contract_type=req.contract_type.upper(),
             amount=req.amount, duration=5, symbol=req.symbol,
         )
+        # Hand off to the bot's own settlement path so this trade counts
+        # toward daily P&L / consecutive-loss tracking exactly like an
+        # automated one — monitor opens its own fresh connections per poll.
+        contract_id = result.get("buy", {}).get("contract_id")
+        if contract_id:
+            asyncio.create_task(
+                trading_bot._monitor_contract(
+                    token, account_type, contract_id, req.amount, user.username
+                )
+            )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
@@ -875,11 +900,13 @@ async def setup_2fa(user=Depends(get_current_user)):
 @app.post("/2fa/enable")
 async def enable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     import pyotp
+    twofa_limiter.check(user.username)
     data = db.get_totp_data(user.username)
     if not data or not data.get("totp_secret"):
         raise HTTPException(status_code=400, detail="Run /2fa/setup first.")
     if not pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid code.")
+    twofa_limiter.reset(user.username)
     db.enable_totp(user.username)
     return {"ok": True}
 
@@ -890,17 +917,22 @@ async def verify_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     data = db.get_totp_data(user.username)
     if not data or not data.get("totp_enabled"):
         return {"valid": True}
+    twofa_limiter.check(user.username)
     valid = pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1)
+    if valid:
+        twofa_limiter.reset(user.username)
     return {"valid": valid}
 
 
 @app.post("/2fa/disable")
 async def disable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     import pyotp
+    twofa_limiter.check(user.username)
     data = db.get_totp_data(user.username)
     if not data or not data.get("totp_secret"):
         raise HTTPException(status_code=400, detail="2FA is not set up.")
     if not pyotp.TOTP(data["totp_secret"]).verify(req.code, valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid code.")
+    twofa_limiter.reset(user.username)
     db.disable_totp(user.username)
     return {"ok": True}
