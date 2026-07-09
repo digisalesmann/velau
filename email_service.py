@@ -1,10 +1,15 @@
 """
-Outbound transactional email — SendGrid REST API via plain requests, no SDK
+Outbound transactional email — Resend REST API via plain requests, no SDK
 dependency (same lightweight-client style as brokers/deriv_rest.py).
 
 Templates use __TOKEN__ placeholders substituted with str.replace(), not
 .format()/f-strings — the HTML contains literal CSS braces ({ }) that would
 collide with Python's format-string syntax.
+
+Without a verified domain on Resend, RESEND_FROM_EMAIL must stay
+"onboarding@resend.dev" — and Resend then only delivers to the email address
+on the Resend account itself, not arbitrary recipients. Verifying a real
+domain lifts that restriction.
 """
 import os
 import logging
@@ -13,7 +18,7 @@ import requests
 
 logger = logging.getLogger("EmailService")
 
-SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
+RESEND_API_URL = "https://api.resend.com/emails"
 LOGO_URL = "https://velau.onrender.com/static/velau-logo.png"
 
 
@@ -21,30 +26,28 @@ def send_email(to: str, subject: str, html: str, text: str):
     """Raises on failure — callers should catch and log, not let a broken
     email provider 500 an unrelated request (e.g. password reset should
     still create the reset code even if the send itself fails)."""
-    api_key = os.getenv("SENDGRID_API_KEY", "")
-    from_email = os.getenv("SENDGRID_FROM_EMAIL", "")
+    api_key = os.getenv("RESEND_API_KEY", "")
+    from_email = os.getenv("RESEND_FROM_EMAIL", "")
     if not api_key or not from_email:
-        raise RuntimeError("SENDGRID_API_KEY / SENDGRID_FROM_EMAIL not configured.")
+        raise RuntimeError("RESEND_API_KEY / RESEND_FROM_EMAIL not configured.")
 
     resp = requests.post(
-        SENDGRID_API_URL,
+        RESEND_API_URL,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         json={
-            "personalizations": [{"to": [{"email": to}]}],
-            "from": {"email": from_email, "name": "Velau"},
+            "from": f"Velau <{from_email}>",
+            "to": [to],
             "subject": subject,
-            "content": [
-                {"type": "text/plain", "value": text},
-                {"type": "text/html", "value": html},
-            ],
+            "html": html,
+            "text": text,
         },
         timeout=10,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"SendGrid {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Resend {resp.status_code}: {resp.text[:300]}")
     logger.info(f"Sent '{subject}' to {to}")
 
 
