@@ -106,6 +106,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
 
+from fastapi.staticfiles import StaticFiles
+# Serves static/velau-logo.png at /static/velau-logo.png — used as a stable,
+# publicly hosted logo URL for outbound emails (SendGrid, etc.), since email
+# clients need a real HTTPS image URL, not a bundled app asset.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # ── Models ─────────────────────────────────────────────────────────────────────
 class NewsResponse(BaseModel):
