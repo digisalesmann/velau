@@ -108,6 +108,8 @@ async def get_current_user(
 @router.post("/register", response_model=Token)
 async def register(user_in: UserIn, request: Request):
     register_limiter.check(request.client.host if request.client else "unknown")
+    if len(user_in.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
     try:
         if user_exists_in_db(user_in.username):
             raise HTTPException(status_code=400, detail="Username already registered")

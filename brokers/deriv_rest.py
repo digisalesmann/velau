@@ -6,16 +6,15 @@ Auth: Deriv-App-ID header + Authorization: Bearer <token>
 import requests
 import logging
 from requests.adapters import HTTPAdapter, Retry
-from config import settings
 
 BASE_URL = "https://api.derivws.com"
 logger = logging.getLogger("DerivREST")
 
 
 class DerivREST:
-    def __init__(self, app_id: str = None, token: str = None):
-        self.app_id = app_id or settings.DERIV_APP_ID
-        self.token = token or settings.DERIV_API_TOKEN
+    def __init__(self, app_id: str, token: str):
+        self.app_id = app_id
+        self.token = token
         self.headers = {
             "Deriv-App-ID": self.app_id,
             "Authorization": f"Bearer {self.token}",
