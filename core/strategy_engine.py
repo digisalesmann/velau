@@ -325,7 +325,7 @@ class XAUMasterStrategy:
         return len(bull_r), len(bear_r), bull_r, bear_r
 
     # ── Contract monitor ───────────────────────────────────────────────────────
-    async def _monitor_contract(self, token: str, contract_id, stake, username: str = ""):
+    async def _monitor_contract(self, token: str, account_type: str, contract_id, stake, username: str = ""):
         """
         Poll Deriv every 90 s with a fresh connection until the contract settles.
         Polling is used instead of a long-lived subscription because Render's
@@ -340,7 +340,7 @@ class XAUMasterStrategy:
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(poll_interval)
 
-                svc = DerivTradingService(token=token)
+                svc = DerivTradingService(token=token, account_type=account_type)
                 try:
                     await svc.authenticate()
                     await svc.ws.send({
@@ -440,13 +440,13 @@ class XAUMasterStrategy:
         if users:
             return users
         if DERIV_TOKEN:
-            return [{"username": "_server", "deriv_token": DERIV_TOKEN}]
+            return [{"username": "_server", "deriv_token": DERIV_TOKEN, "trade_account_type": "real"}]
         return []
 
-    async def _place_for_user(self, username: str, token: str,
+    async def _place_for_user(self, username: str, token: str, account_type: str,
                                direction: str, score: int) -> bool:
         """Place a trade. Returns True if a monitor task was started, False on failure."""
-        svc = DerivTradingService(token=token)
+        svc = DerivTradingService(token=token, account_type=account_type)
         try:
             await svc.authenticate()
             info    = await svc.get_account_info()
@@ -471,7 +471,7 @@ class XAUMasterStrategy:
 
             # Pass the token — monitor opens its own fresh connections per poll
             asyncio.create_task(
-                self._monitor_contract(token, contract_id, stake, username)
+                self._monitor_contract(token, account_type, contract_id, stake, username)
             )
             return True
         except Exception as e:
@@ -499,7 +499,8 @@ class XAUMasterStrategy:
 
         # Use first account for market analysis (candles are symbol-level, not per-user)
         primary_token = all_users[0]["deriv_token"]
-        service = DerivTradingService(token=primary_token)
+        primary_account_type = all_users[0].get("trade_account_type", "real")
+        service = DerivTradingService(token=primary_token, account_type=primary_account_type)
         try:
             await service.authenticate()
 
@@ -642,8 +643,10 @@ class XAUMasterStrategy:
                 self._trade_in_progress = True
 
                 results = await asyncio.gather(
-                    *[self._place_for_user(u["username"], u["deriv_token"], direction, score)
-                      for u in eligible],
+                    *[self._place_for_user(
+                        u["username"], u["deriv_token"],
+                        u.get("trade_account_type", "real"), direction, score,
+                      ) for u in eligible],
                     return_exceptions=True,
                 )
 

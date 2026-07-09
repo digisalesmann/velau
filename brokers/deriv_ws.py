@@ -39,7 +39,8 @@ logger = logging.getLogger("DerivWebSocket")
 
 
 class DerivWebSocket:
-    def __init__(self, token: str, app_id: str = None, max_retries: int = 7):
+    def __init__(self, token: str, app_id: str = None, account_type: str = "real",
+                 max_retries: int = 7):
         self.app_id = app_id or DERIV_APP_ID
         if not self.app_id:
             raise ValueError(
@@ -48,11 +49,12 @@ class DerivWebSocket:
         if not token:
             raise ValueError("Deriv API token missing.")
 
-        self.token       = token
-        self.max_retries = max_retries
-        self.connection  = None
-        self.account_id   = None
-        self.account_info = None
+        self.token        = token
+        self.account_type = account_type  # "real" or "demo" — user's choice
+        self.max_retries  = max_retries
+        self.connection   = None
+        self.account_id    = None
+        self.account_info  = None
 
     def _fetch_ws_url(self) -> str:
         """Blocking REST calls (accounts -> OTP) run off the event loop via asyncio.to_thread."""
@@ -62,7 +64,13 @@ class DerivWebSocket:
             raise ConnectionError("Deriv token has no accessible trading accounts.")
 
         active = [a for a in accounts if a.get("status") == "active"] or accounts
-        chosen = next((a for a in active if a.get("account_type") == "real"), active[0])
+        chosen = next((a for a in active if a.get("account_type") == self.account_type), None)
+        if chosen is None:
+            chosen = active[0]
+            logger.warning(
+                f"No active '{self.account_type}' account for this token — "
+                f"falling back to '{chosen.get('account_type')}' ({chosen.get('account_id')})"
+            )
 
         self.account_id   = chosen.get("account_id")
         self.account_info = chosen

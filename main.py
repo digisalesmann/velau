@@ -135,6 +135,9 @@ class AvatarUploadRequest(BaseModel):
     image_base64: str
     content_type: str = "image/jpeg"
 
+class TradeModeRequest(BaseModel):
+    mode: str  # "demo" or "real"
+
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
 
@@ -268,8 +271,9 @@ async def deriv_status(user=Depends(get_current_user)):
     if not token:
         return {"connected": False, "account_id": None, "balance": None}
 
+    me = db.get_user(user.username) or {}
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService(token=token)
+    service = DerivTradingService(token=token, account_type=me.get("trade_account_type") or "real")
     try:
         await service.authenticate()
         info = await service.get_account_info()
@@ -278,6 +282,7 @@ async def deriv_status(user=Depends(get_current_user)):
             "account_id": info.get("account_id"),
             "balance":    info.get("balance"),
             "currency":   info.get("currency", "USD"),
+            "trade_account_type": me.get("trade_account_type") or "real",
         }
     except Exception as e:
         return {
@@ -309,6 +314,7 @@ async def get_bot_status(user=Depends(get_current_user)):
         "trade_in_progress":  trading_bot._trade_in_progress,
         "daily_pnl":          float(risk["daily_pnl"]),
         "in_session":         trading_bot._in_trading_session(),
+        "trade_account_type": me.get("trade_account_type") or "real",
     }
 
 @app.post("/bot/my-toggle")
@@ -317,6 +323,13 @@ async def toggle_my_bot(user=Depends(get_current_user)):
     new_val = not bool(me.get("bot_enabled", True))
     db.set_user_bot_enabled(user.username, new_val)
     return {"user_bot_enabled": new_val}
+
+@app.post("/account/trade-mode")
+async def set_trade_mode(req: TradeModeRequest, user=Depends(get_current_user)):
+    if req.mode not in ("demo", "real"):
+        raise HTTPException(status_code=400, detail="mode must be 'demo' or 'real'.")
+    db.set_trade_account_type(user.username, req.mode)
+    return {"trade_account_type": req.mode}
 
 @app.post("/bot/toggle")
 async def toggle_bot(user=Depends(_require_admin)):

@@ -85,6 +85,7 @@ def init_db():
                 ("display_name",  "TEXT DEFAULT NULL"),
                 ("avatar_url",    "TEXT DEFAULT NULL"),
                 ("bot_enabled",   "BOOLEAN DEFAULT TRUE"),
+                ("trade_account_type", "TEXT DEFAULT 'real'"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -254,6 +255,7 @@ def init_db():
                 ("display_name", "TEXT DEFAULT NULL"),
                 ("avatar_url",   "TEXT DEFAULT NULL"),
                 ("bot_enabled",  "INTEGER DEFAULT 1"),
+                ("trade_account_type", "TEXT DEFAULT 'real'"),
             ]:
                 _add_col(cur, "users", col, defn)
             for col, defn in [
@@ -383,11 +385,19 @@ def get_all_users_with_tokens() -> list[dict]:
     default = "FALSE" if _USE_POSTGRES else "0"
     return fetchall(f"""
         SELECT u.username, u.deriv_token, u.deriv_account, u.bot_enabled,
+               u.trade_account_type,
                COALESCE(s.circuit_broken, {default}) AS circuit_broken
         FROM users u
         LEFT JOIN user_risk_state s ON s.username = u.username
         WHERE u.deriv_token IS NOT NULL AND u.deriv_token != ''
     """)
+
+def set_trade_account_type(username: str, account_type: str):
+    """account_type must be 'demo' or 'real' — validated by the caller."""
+    execute(
+        "UPDATE users SET trade_account_type = ? WHERE username = ?",
+        (account_type, username),
+    )
 
 
 # ── Bot control ─────────────────────────────────────────────────────────────────
