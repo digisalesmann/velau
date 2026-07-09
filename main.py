@@ -164,20 +164,18 @@ class CandleRequest(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def _get_user_token(username: str) -> str:
+def _get_user_deriv_context(username: str) -> tuple[str, str]:
     """
-    Get Deriv token for this user.
-    Falls back to the server-level DERIV_TOKEN env var for backwards
-    compatibility (single-user mode / admin account).
-    Raises 400 with 'no_deriv_account' when neither source has a token.
+    Get this user's own connected Deriv token and their demo/real preference.
+    Raises 400 with 'no_deriv_account' if they haven't connected one —
+    deliberately no server-level fallback: these endpoints (including
+    /trade) must never let one user act on another account's money.
     """
-    user_token = db.get_deriv_token(username)
-    if user_token:
-        return user_token
-    from env_config import DERIV_TOKEN
-    if DERIV_TOKEN:
-        return DERIV_TOKEN
-    raise HTTPException(status_code=400, detail="no_deriv_account")
+    me = db.get_user(username) or {}
+    token = me.get("deriv_token")
+    if not token:
+        raise HTTPException(status_code=400, detail="no_deriv_account")
+    return token, (me.get("trade_account_type") or "real")
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -470,8 +468,8 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
 @app.get("/open_contracts")
 async def get_open_contracts(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
+    token, account_type = _get_user_deriv_context(user.username)
+    service = DerivTradingService(token=token, account_type=account_type)
     try:
         await service.authenticate()
         await service.ws.send({
@@ -543,8 +541,8 @@ async def get_signals(user=Depends(get_current_user)):
 @app.get("/dashboard/history")
 async def get_history(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
+    token, account_type = _get_user_deriv_context(user.username)
+    service = DerivTradingService(token=token, account_type=account_type)
     try:
         await service.authenticate()
         return await service.get_statement()
@@ -556,8 +554,8 @@ async def get_history(user=Depends(get_current_user)):
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
+    token, account_type = _get_user_deriv_context(user.username)
+    service = DerivTradingService(token=token, account_type=account_type)
     try:
         await service.authenticate()
         return await service.subscribe_ticks(symbol=req.symbol)
@@ -569,8 +567,8 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
 @app.post("/candles")
 async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
+    token, account_type = _get_user_deriv_context(user.username)
+    service = DerivTradingService(token=token, account_type=account_type)
     try:
         await service.authenticate()
         raw = await service.get_candles(
@@ -591,8 +589,8 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Invalid contract_type.")
     if not req.amount or req.amount <= 0:
         raise HTTPException(status_code=400, detail="amount must be positive.")
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
+    token, account_type = _get_user_deriv_context(user.username)
+    service = DerivTradingService(token=token, account_type=account_type)
     try:
         await service.authenticate()
         result = await service.place_order(
