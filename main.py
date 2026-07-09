@@ -382,7 +382,9 @@ async def get_dashboard(user=Depends(get_current_user)):
 
     if deriv_token:
         from brokers.deriv_trading_service import DerivTradingService
-        service = DerivTradingService(token=deriv_token)
+        service = DerivTradingService(
+            token=deriv_token, account_type=profile.get("trade_account_type") or "real"
+        )
         try:
             await service.authenticate()
             account_info = await service.get_account_info()
