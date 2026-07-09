@@ -125,6 +125,7 @@ class DashboardResponse(BaseModel):
     avatar_url:           Optional[str] = None
     global_bot_enabled:  bool = True
     user_bot_enabled:    bool = True
+    is_admin:            bool = False
 
 class DisplayNameRequest(BaseModel):
     display_name: str
@@ -336,63 +337,88 @@ async def toggle_bot(user=Depends(_require_admin)):
 
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user)):
-    from brokers.deriv_trading_service import DerivTradingService
-    token   = _get_user_token(user.username)
-    service = DerivTradingService(token=token)
-    try:
-        await service.authenticate()
-        account_info = await service.get_account_info()
-        history_data = await service.get_statement()
-        trades_list  = history_data.get("history", [])
+    """
+    Profile/admin/bot-status data is DB-only and has nothing to do with
+    Deriv connectivity — it must always be returned even if the broker
+    connection is missing, disabled, or erroring. Only the Deriv-dependent
+    fields (balance, trade history, win rate) degrade to defaults on
+    failure instead of taking down the whole response. Previously a single
+    Deriv auth failure (no token connected, or a disabled account) 500'd
+    the entire endpoint, silently breaking profile display, admin-section
+    visibility, and bot-status accuracy on screens that don't even touch
+    Deriv data.
+    """
+    market_bias = db.get_latest_bias(username=user.username)
+    deriv_token = db.get_deriv_token(user.username)
+    profile     = db.get_user(user.username) or {}
+    risk        = db.get_user_risk_state(user.username)
+    is_admin    = db.is_admin(user.username)
 
-        balance      = account_info.get("balance", 0.0)
-        total_trades = len(trades_list)
-        wins         = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
-        win_rate     = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+    global_enabled   = db.get_global_bot_enabled()
+    user_enabled     = bool(profile.get("bot_enabled", True))
+    effective_active = trading_bot.is_running and global_enabled and user_enabled
 
-        today_trades = [
-            t for t in trades_list
-            if t.get("time") and
-            datetime.fromtimestamp(int(t["time"])).date() == date.today()
-        ]
-        daily_pnl   = sum(float(t.get("pnl", 0)) for t in today_trades)
-        pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
-        market_bias = db.get_latest_bias(username=user.username)
-        deriv_token = db.get_deriv_token(user.username)
-        profile     = db.get_user(user.username) or {}
-        risk        = db.get_user_risk_state(user.username)
+    balance = 0.0
+    currency = "USD"
+    account_id = None
+    win_rate = 0.0
+    trades_today = 0
+    total_trades = 0
+    daily_pnl = 0.0
+    pnl_percent = 0.0
 
-        global_enabled   = db.get_global_bot_enabled()
-        user_enabled     = bool(profile.get("bot_enabled", True))
-        effective_active = trading_bot.is_running and global_enabled and user_enabled
+    if deriv_token:
+        from brokers.deriv_trading_service import DerivTradingService
+        service = DerivTradingService(token=deriv_token)
+        try:
+            await service.authenticate()
+            account_info = await service.get_account_info()
+            history_data = await service.get_statement()
+            trades_list  = history_data.get("history", [])
 
-        return DashboardResponse(
-            username=user.username,
-            bot_status="active" if effective_active else "paused",
-            balance=balance,
-            currency=account_info.get("currency", "USD"),
-            account_id=account_info.get("account_id"),
-            win_rate=win_rate,
-            trades_today=len(today_trades),
-            total_trades=total_trades,
-            daily_pnl=round(daily_pnl, 2),
-            daily_pnl_percent=round(pnl_percent, 2),
-            market_bias=market_bias,
-            circuit_broken=bool(risk["circuit_broken"]),
-            consecutive_losses=int(risk["consecutive_losses"]),
-            trade_in_progress=trading_bot._trade_in_progress,
-            in_session=trading_bot._in_trading_session(),
-            deriv_connected=bool(deriv_token),
-            display_name=profile.get("display_name"),
-            avatar_url=profile.get("avatar_url"),
-            global_bot_enabled=global_enabled,
-            user_bot_enabled=user_enabled,
-        )
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Dashboard error: {e}")
-    finally:
-        await service.close()
+            balance    = account_info.get("balance", 0.0)
+            currency   = account_info.get("currency", "USD")
+            account_id = account_info.get("account_id")
+            total_trades = len(trades_list)
+            wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
+            win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+
+            today_trades = [
+                t for t in trades_list
+                if t.get("time") and
+                datetime.fromtimestamp(int(t["time"])).date() == date.today()
+            ]
+            daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
+            pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
+            trades_today = len(today_trades)
+        except Exception as e:
+            logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
+        finally:
+            await service.close()
+
+    return DashboardResponse(
+        username=user.username,
+        bot_status="active" if effective_active else "paused",
+        balance=balance,
+        currency=currency,
+        account_id=account_id,
+        win_rate=win_rate,
+        trades_today=trades_today,
+        total_trades=total_trades,
+        daily_pnl=round(daily_pnl, 2),
+        daily_pnl_percent=round(pnl_percent, 2),
+        market_bias=market_bias,
+        circuit_broken=bool(risk["circuit_broken"]),
+        consecutive_losses=int(risk["consecutive_losses"]),
+        trade_in_progress=trading_bot._trade_in_progress,
+        in_session=trading_bot._in_trading_session(),
+        deriv_connected=bool(deriv_token),
+        display_name=profile.get("display_name"),
+        avatar_url=profile.get("avatar_url"),
+        global_bot_enabled=global_enabled,
+        user_bot_enabled=user_enabled,
+        is_admin=is_admin,
+    )
 
 
 @app.post("/account/display-name")
