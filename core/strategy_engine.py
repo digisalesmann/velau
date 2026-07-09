@@ -493,8 +493,8 @@ class XAUMasterStrategy:
             service = DerivTradingService(
                 token=u["deriv_token"],
                 account_type=u.get("trade_account_type", "real"),
+                max_retries=2,
             )
-            service.ws.max_retries = 2
             try:
                 await service.authenticate()
                 return service

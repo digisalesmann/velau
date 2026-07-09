@@ -16,9 +16,9 @@ CONTRACT_DURATION_UNIT = "m"
 
 
 class DerivTradingService:
-    def __init__(self, token: str = None, account_type: str = "real"):
+    def __init__(self, token: str = None, account_type: str = "real", max_retries: int = 7):
         self.token       = token or DERIV_TOKEN
-        self.ws          = DerivWebSocket(token=self.token, account_type=account_type)
+        self.ws          = DerivWebSocket(token=self.token, account_type=account_type, max_retries=max_retries)
         self._authorized = False
 
     # ── AUTH ───────────────────────────────────────────────────────────────────

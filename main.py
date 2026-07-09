@@ -26,11 +26,17 @@ from rate_limit import twofa_limiter
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy
 import database as db
+import deriv_cache
 from core import notifications as notif
 import storage
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
+
+# Short-TTL cache for expensive Deriv-derived display data — balance/history
+# only, never anything trade-execution related. See deriv_cache.py.
+DASHBOARD_CACHE_TTL = 30
+HISTORY_CACHE_TTL   = 30
 
 
 async def _bot_runner(delay: int = 10):
@@ -216,7 +222,7 @@ async def connect_deriv(
     Validates the token by attempting authentication, then stores it.
     """
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService(token=req.api_token)
+    service = DerivTradingService(token=req.api_token, max_retries=2)
     try:
         await service.authenticate()
         info = await service.get_account_info()
@@ -272,7 +278,9 @@ async def deriv_status(user=Depends(get_current_user)):
 
     me = db.get_user(user.username) or {}
     from brokers.deriv_trading_service import DerivTradingService
-    service = DerivTradingService(token=token, account_type=me.get("trade_account_type") or "real")
+    service = DerivTradingService(
+        token=token, account_type=me.get("trade_account_type") or "real", max_retries=2
+    )
     try:
         await service.authenticate()
         info = await service.get_account_info()
@@ -381,35 +389,60 @@ async def get_dashboard(user=Depends(get_current_user)):
     pnl_percent = 0.0
 
     if deriv_token:
-        from brokers.deriv_trading_service import DerivTradingService
-        service = DerivTradingService(
-            token=deriv_token, account_type=profile.get("trade_account_type") or "real"
-        )
-        try:
-            await service.authenticate()
-            account_info = await service.get_account_info()
-            history_data = await service.get_statement()
-            trades_list  = history_data.get("history", [])
+        account_type = profile.get("trade_account_type") or "real"
+        cache_key = f"dashboard:{user.username}:{account_type}"
+        cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
 
-            balance    = account_info.get("balance", 0.0)
-            currency   = account_info.get("currency", "USD")
-            account_id = account_info.get("account_id")
-            total_trades = len(trades_list)
-            wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
-            win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+        if cached is not None:
+            balance, currency, account_id = cached["balance"], cached["currency"], cached["account_id"]
+            win_rate, total_trades   = cached["win_rate"], cached["total_trades"]
+            trades_today, daily_pnl = cached["trades_today"], cached["daily_pnl"]
+            pnl_percent = cached["pnl_percent"]
+        else:
+            from brokers.deriv_trading_service import DerivTradingService
+            # Fast retry budget — this is a screen someone's waiting on, not
+            # a background job. See deriv_ws.py's default for why 7 is right
+            # for unattended retries but wrong here.
+            service = DerivTradingService(token=deriv_token, account_type=account_type, max_retries=2)
+            try:
+                await service.authenticate()
+                account_info = await service.get_account_info()
+                history_data = await service.get_statement()
+                trades_list  = history_data.get("history", [])
 
-            today_trades = [
-                t for t in trades_list
-                if t.get("time") and
-                datetime.fromtimestamp(int(t["time"])).date() == date.today()
-            ]
-            daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
-            pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
-            trades_today = len(today_trades)
-        except Exception as e:
-            logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
-        finally:
-            await service.close()
+                balance    = account_info.get("balance", 0.0)
+                currency   = account_info.get("currency", "USD")
+                account_id = account_info.get("account_id")
+                total_trades = len(trades_list)
+                wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
+                win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+
+                today_trades = [
+                    t for t in trades_list
+                    if t.get("time") and
+                    datetime.fromtimestamp(int(t["time"])).date() == date.today()
+                ]
+                daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
+                pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
+                trades_today = len(today_trades)
+
+                deriv_cache.set(cache_key, {
+                    "balance": balance, "currency": currency, "account_id": account_id,
+                    "win_rate": win_rate, "total_trades": total_trades,
+                    "trades_today": trades_today, "daily_pnl": daily_pnl,
+                    "pnl_percent": pnl_percent,
+                })
+            except Exception as e:
+                logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
+                # Minutes-old real data beats showing zeros on a transient blip.
+                stale = deriv_cache.get_stale(cache_key)
+                if stale is not None:
+                    balance, currency, account_id = stale["balance"], stale["currency"], stale["account_id"]
+                    win_rate, total_trades   = stale["win_rate"], stale["total_trades"]
+                    trades_today, daily_pnl = stale["trades_today"], stale["daily_pnl"]
+                    pnl_percent = stale["pnl_percent"]
+            finally:
+                await service.close()
 
     return DashboardResponse(
         username=user.username,
@@ -472,7 +505,7 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
 async def get_open_contracts(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type)
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
         await service.ws.send({
@@ -545,11 +578,23 @@ async def get_signals(user=Depends(get_current_user)):
 async def get_history(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type)
+
+    cache_key = f"history:{user.username}:{account_type}"
+    cached = deriv_cache.get(cache_key, HISTORY_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
-        return await service.get_statement()
+        result = await service.get_statement()
+        deriv_cache.set(cache_key, result)
+        return result
     except Exception as e:
+        # Minutes-old history beats a hard failure on a transient blip.
+        stale = deriv_cache.get_stale(cache_key)
+        if stale is not None:
+            return stale
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         await service.close()
@@ -558,7 +603,7 @@ async def get_history(user=Depends(get_current_user)):
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type)
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
         return await service.subscribe_ticks(symbol=req.symbol)
@@ -571,7 +616,7 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
 async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type)
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
         raw = await service.get_candles(
@@ -607,7 +652,7 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
         )
 
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type)
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
         result = await service.place_order(
