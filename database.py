@@ -333,7 +333,12 @@ def is_admin(username: str) -> bool:
     return bool(val) if val is not None else False
 
 def set_admin(username: str, value: bool):
-    execute("UPDATE users SET is_admin = ? WHERE username = ?", (int(value), username))
+    # Pass the raw bool, not int(value) — psycopg2 does client-side SQL text
+    # substitution, so int(True) becomes the literal `1` in the query text,
+    # and Postgres rejects assigning a bare integer to a BOOLEAN column
+    # ("column is of type boolean but expression is of type integer").
+    # SQLite has no such restriction either way. bool works natively on both.
+    execute("UPDATE users SET is_admin = ? WHERE username = ?", (bool(value), username))
 
 
 # ── Profile ──────────────────────────────────────────────────────────────────
@@ -394,16 +399,18 @@ def get_global_bot_enabled() -> bool:
     return bool(row["global_enabled"])
 
 def set_global_bot_enabled(enabled: bool, updated_by: str):
+    # Raw bool, not int() — see set_admin for why int() breaks on Postgres.
     execute(
         "UPDATE bot_control SET global_enabled = ?, updated_by = ?, "
         "updated_at = CURRENT_TIMESTAMP WHERE id = 1",
-        (int(enabled), updated_by),
+        (bool(enabled), updated_by),
     )
 
 def set_user_bot_enabled(username: str, enabled: bool):
+    # Raw bool, not int() — see set_admin for why int() breaks on Postgres.
     execute(
         "UPDATE users SET bot_enabled = ? WHERE username = ?",
-        (int(enabled), username),
+        (bool(enabled), username),
     )
 
 
