@@ -514,29 +514,25 @@ async def get_open_contracts(user=Depends(get_current_user)):
     service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
-        await service.ws.send({
-            "proposal_open_contracts": 1,
-            "subscribe": 0,
-        })
+        await service.ws.send({"proposal_open_contract": 1})
         response = await service.ws.receive(timeout=20.0)
         if response.get("error"):
             return {"contracts": []}
-        contracts = response.get("proposal_open_contracts", {})
-        if not contracts:
+        # This account can only ever have one contract in flight at a time
+        # (the bot's trade lock enforces that), and the new API returns a
+        # single object here rather than the old dict-of-contracts.
+        c = response.get("proposal_open_contract")
+        if not c or c.get("is_expired") or c.get("is_settleable"):
             return {"contracts": []}
-        open_list = []
-        for cid, c in contracts.items():
-            if c.get("is_expired") or c.get("is_settleable"):
-                continue
-            open_list.append({
-                "contract_id":   cid,
-                "symbol":        c.get("display_name", "Volatility 100 (1s)"),
-                "contract_type": c.get("contract_type", ""),
-                "buy_price":     c.get("buy_price", 0),
-                "current_spot":  c.get("current_spot", 0),
-                "profit":        c.get("profit", 0),
-                "entry_spot":    c.get("entry_spot", 0),
-            })
+        open_list = [{
+            "contract_id":   c.get("contract_id"),
+            "symbol":        c.get("underlying_symbol", "frxXAUUSD"),
+            "contract_type": c.get("contract_type", ""),
+            "buy_price":     c.get("buy_price", 0),
+            "current_spot":  c.get("current_spot", 0),
+            "profit":        c.get("profit", 0),
+            "entry_spot":    c.get("entry_spot", 0),
+        }]
         return {"contracts": open_list}
     except Exception as e:
         return {"contracts": [], "error": str(e)}

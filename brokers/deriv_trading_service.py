@@ -94,18 +94,18 @@ class DerivTradingService:
     async def get_available_symbols(self) -> list:
         if not self._authorized:
             await self.authenticate()
-        await self.ws.send({"active_symbols": "brief", "product_type": "basic"})
+        await self.ws.send({"active_symbols": "brief"})
         response = await self.ws.receive(timeout=20.0)
         if response.get("error"):
             raise Exception(response["error"].get("message", "Symbol fetch failed"))
         return [
             {
-                "symbol":       s.get("symbol"),
-                "display_name": s.get("display_name"),
+                "symbol":       s.get("underlying_symbol"),
+                "display_name": s.get("underlying_symbol_name"),
                 "is_open":      s.get("exchange_is_open"),
             }
             for s in response.get("active_symbols", [])
-            if any(x in s.get("symbol", "") for x in ["XAU", "frx", "R_", "1HZ", "BOOM", "CRASH"])
+            if any(x in s.get("underlying_symbol", "") for x in ["XAU", "frx", "R_", "1HZ", "BOOM", "CRASH"])
         ]
 
     # ── STATEMENT ──────────────────────────────────────────────────────────────
@@ -238,14 +238,14 @@ class DerivTradingService:
         )
 
         await self.ws.send({
-            "proposal":      1,
-            "amount":        amount,
-            "basis":         "stake",
-            "contract_type": contract_type,
-            "currency":      "USD",
-            "duration":      duration,
-            "duration_unit": duration_unit,
-            "symbol":        exec_symbol,
+            "proposal":         1,
+            "amount":           amount,
+            "basis":            "stake",
+            "contract_type":    contract_type,
+            "currency":         "USD",
+            "duration":         duration,
+            "duration_unit":    duration_unit,
+            "underlying_symbol": exec_symbol,
         })
 
         proposal = await self._wait_for("proposal", timeout=20.0)

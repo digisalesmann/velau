@@ -344,7 +344,7 @@ class XAUMasterStrategy:
                 try:
                     await svc.authenticate()
                     await svc.ws.send({
-                        "proposal_open_contracts": 1,
+                        "proposal_open_contract": 1,
                         "contract_id": contract_id,
                     })
                     msg = await svc.ws.receive(timeout=20.0)
@@ -354,7 +354,7 @@ class XAUMasterStrategy:
                 finally:
                     await svc.close()
 
-                poc = msg.get("proposal_open_contracts") or msg.get("poc")
+                poc = msg.get("proposal_open_contract") or msg.get("poc")
                 if not poc:
                     logger.debug(f"👁  No poc in response, retrying…")
                     continue
