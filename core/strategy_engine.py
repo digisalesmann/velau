@@ -553,7 +553,8 @@ class XAUMasterStrategy:
                 return
 
             if not self._in_trading_session():
-                logger.info(f"😴 Outside session (UTC {now_utc.hour}:00) | Active: 07:00-17:00 UTC")
+                s_start, s_end = SESSIONS[0]
+                logger.info(f"😴 Outside session (UTC {now_utc.hour}:00) | Active: {s_start:02d}:00-{s_end:02d}:00 UTC")
                 return
 
             # ── Economic calendar blackout ─────────────────────────────────────────

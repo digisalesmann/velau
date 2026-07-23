@@ -552,15 +552,17 @@ async def get_news():
 async def get_signals(user=Depends(get_current_user)):
     try:
         from datetime import timezone as tz
+        from core.strategy_engine import SESSIONS
         now_utc  = datetime.now(tz.utc)
         hour_utc = now_utc.hour
         in_session = trading_bot._in_trading_session()
 
-        # Minutes until next session opens (UTC 07:00)
-        session_start_utc = 7
+        # Single source of truth for the trading window — must match SESSIONS
+        # in core/strategy_engine.py, which is what actually gates the bot.
+        session_start_utc, session_end_utc = SESSIONS[0]
         if hour_utc < session_start_utc:
             mins_to_session = (session_start_utc - hour_utc) * 60 - now_utc.minute
-        elif hour_utc >= 17:
+        elif hour_utc >= session_end_utc:
             # After NY session — next is tomorrow London
             mins_to_session = (24 - hour_utc + session_start_utc) * 60 - now_utc.minute
         else:
@@ -569,7 +571,7 @@ async def get_signals(user=Depends(get_current_user)):
         return {
             "signals":         db.get_signals(limit=30, username=user.username),
             "in_session":      in_session,
-            "session_hours":   "07:00-17:00 UTC (London + NY)",
+            "session_hours":   f"{session_start_utc:02d}:00-{session_end_utc:02d}:00 UTC (London + NY)",
             "mins_to_session": mins_to_session if not in_session else 0,
             "bot_running":     trading_bot.is_running,
         }
