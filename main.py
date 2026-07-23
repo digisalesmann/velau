@@ -539,6 +539,9 @@ async def get_open_contracts(user=Depends(get_current_user)):
             "current_spot":  c.get("current_spot", 0),
             "profit":        c.get("profit", 0),
             "entry_spot":    c.get("entry_spot", 0),
+            "payout":        c.get("payout", 0),
+            "date_start":    c.get("date_start"),
+            "date_expiry":   c.get("date_expiry"),
         }]
         return {"contracts": open_list}
     except Exception as e:
