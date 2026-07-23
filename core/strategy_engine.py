@@ -115,15 +115,16 @@ class XAUMasterStrategy:
         return stake, tier
 
     # ── DB helpers ─────────────────────────────────────────────────────────────
-    def save_signal(self, sig_type, price, rsi, bias, reason, score=0):
+    def save_signal(self, sig_type, price, rsi, bias, reason, score=0) -> int | None:
         try:
-            db.insert_signal(
+            return db.insert_signal(
                 ANALYSIS_SYMBOL, sig_type,
                 float(price), float(rsi), str(bias),
                 f"[{int(score)}/7] {reason}", int(score),
             )
         except Exception as e:
             logger.error(f"Signal DB error: {e}")
+            return None
 
     def save_trade_result(self, contract_id, won, pnl, username: str = None):
         try:
@@ -646,7 +647,10 @@ class XAUMasterStrategy:
 
                 # ── All filters passed — lock, save, and trade all accounts ────────
                 signal_type = "BUY" if direction == "CALL" else "SELL"
-                self.save_signal(signal_type, price, rsi, h1_bias,
+                # id used below to record whether this signal actually resulted in
+                # an executed trade — "qualified" and "executed" are not the same
+                # thing, and the mobile app's badge must reflect the latter.
+                signal_id = self.save_signal(signal_type, price, rsi, h1_bias,
                     " | ".join(reasons), score)
 
                 eligible = [
@@ -658,6 +662,8 @@ class XAUMasterStrategy:
                         f"⛔ 0/{len(all_users)} users eligible to trade "
                         f"(disabled or circuit-broken) — signal saved, no trades placed"
                     )
+                    if signal_id:
+                        db.update_signal_executed(signal_id, False)
                     self._trade_in_progress = False
                     return
 
@@ -675,9 +681,13 @@ class XAUMasterStrategy:
                     return_exceptions=True,
                 )
 
+                executed = any(r is True for r in results)
+                if signal_id:
+                    db.update_signal_executed(signal_id, executed)
+
                 # If every placement failed (no monitor started), release lock now.
                 # Otherwise the monitor's finally block will release it after settlement.
-                if not any(r is True for r in results):
+                if not executed:
                     self._trade_in_progress = False
                     logger.warning("⚠️  All trade placements failed — lock released")
             else:

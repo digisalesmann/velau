@@ -108,6 +108,15 @@ def init_db():
                     timestamp        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            for col, defn in [
+                ("executed", "BOOLEAN DEFAULT NULL"),
+            ]:
+                try:
+                    cur.execute("SAVEPOINT add_col")
+                    cur.execute(f"ALTER TABLE signals ADD COLUMN {col} {defn}")
+                    cur.execute("RELEASE SAVEPOINT add_col")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT add_col")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trade_results (
                     id          SERIAL PRIMARY KEY,
@@ -281,6 +290,7 @@ def init_db():
             for col, defn in [
                 ("confluence_score", "INTEGER DEFAULT 0"),
                 ("username",         "TEXT DEFAULT NULL"),
+                ("executed",         "INTEGER DEFAULT NULL"),
             ]:
                 _add_col(cur, "signals", col, defn)
             for col, defn in [
@@ -666,17 +676,39 @@ def get_fcm_tokens(username: str = None) -> list[str]:
 # ── Signals ────────────────────────────────────────────────────────────────────
 
 def insert_signal(symbol, sig_type, price, rsi, bias, reason,
-                  confluence_score=0, username=None):
-    execute(
-        """
-        INSERT INTO signals
-          (symbol, type, price, rsi, bias, reason, confluence_score, username)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (str(symbol), str(sig_type), float(price), float(rsi),
-         str(bias), str(reason), int(confluence_score),
-         str(username) if username else None),
-    )
+                  confluence_score=0, username=None) -> int | None:
+    """Returns the new row's id so the caller can later record whether a
+    BUY/SELL signal actually resulted in an executed trade (see
+    update_signal_executed) — the signal is saved before that's known."""
+    params = (str(symbol), str(sig_type), float(price), float(rsi),
+              str(bias), str(reason), int(confluence_score),
+              str(username) if username else None)
+    with get_conn() as (conn, cur):
+        if _USE_POSTGRES:
+            cur.execute(
+                """
+                INSERT INTO signals
+                  (symbol, type, price, rsi, bias, reason, confluence_score, username)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
+        else:
+            cur.execute(
+                """
+                INSERT INTO signals
+                  (symbol, type, price, rsi, bias, reason, confluence_score, username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            return cur.lastrowid
+
+def update_signal_executed(signal_id: int, executed: bool):
+    execute("UPDATE signals SET executed = ? WHERE id = ?", (bool(executed), signal_id))
 
 def get_signals(limit: int = 30, username: str = None) -> list[dict]:
     """Return signals for this user OR legacy signals with no username."""
