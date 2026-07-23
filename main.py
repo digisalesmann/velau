@@ -406,10 +406,17 @@ async def get_dashboard(user=Depends(get_current_user)):
             pnl_percent = cached["pnl_percent"]
         else:
             from brokers.deriv_trading_service import DerivTradingService
-            # Fast retry budget — this is a screen someone's waiting on, not
-            # a background job. See deriv_ws.py's default for why 7 is right
-            # for unattended retries but wrong here.
-            service = DerivTradingService(token=deriv_token, account_type=account_type, max_retries=2)
+            # Single attempt, no retry — this is a screen someone's waiting
+            # on. A retry-with-backoff here can itself take ~30s (open_timeout
+            # + backoff + open_timeout again), which blows past the mobile
+            # app's own 20s request timeout — so the client hits its timeout
+            # and shows a hard error before this function ever gets to fall
+            # back to the stale cache below. Failing fast lets that fallback
+            # actually reach the user instead of racing (and losing) against
+            # the client's own timeout. See deriv_ws.py's default of 7 for
+            # why a higher retry budget is right for unattended jobs but
+            # wrong here.
+            service = DerivTradingService(token=deriv_token, account_type=account_type, max_retries=1)
             try:
                 await service.authenticate()
                 account_info = await service.get_account_info()
@@ -588,7 +595,10 @@ async def get_history(user=Depends(get_current_user)):
     if cached is not None:
         return cached
 
-    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
+    # Single attempt, no retry — see the /dashboard endpoint's comment above
+    # for why a retry-with-backoff here defeats the stale-cache fallback by
+    # outrunning the mobile client's own request timeout.
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
     try:
         await service.authenticate()
         result = await service.get_statement()
