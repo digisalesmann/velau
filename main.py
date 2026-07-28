@@ -28,6 +28,7 @@ import database as db
 import deriv_cache
 from core import notifications as notif
 import storage
+import coingecko
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
@@ -836,6 +837,8 @@ async def create_subscription(req: SubscriptionCreateRequest,
         "method_type":  method["type"],
         "instructions": method.get("instructions"),
         "bank_name":    method.get("bank_name"),
+        "crypto_currency": method.get("crypto_currency"),
+        "logo_url":     method.get("logo_url"),
     }
 
 
@@ -1039,13 +1042,14 @@ async def admin_list_payment_methods(user=Depends(_require_admin)):
 @app.post("/admin/payment_methods/create")
 async def admin_create_payment_method(req: AdminPaymentMethodRequest, user=Depends(_require_admin)):
     _validate_payment_method_fields(req)
+    logo_url = coingecko.fetch_logo_url(req.crypto_currency) if req.type == "crypto" else None
     method_id = db.create_payment_method(
         type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
         crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
         bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
         bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
-        bank_currency=req.bank_currency,
+        bank_currency=req.bank_currency, logo_url=logo_url,
     )
     return {"id": method_id}
 
@@ -1055,13 +1059,14 @@ async def admin_update_payment_method(req: AdminPaymentMethodUpdateRequest, user
     if not db.get_payment_method(req.id):
         raise HTTPException(status_code=404, detail="Payment method not found.")
     _validate_payment_method_fields(req)
+    logo_url = coingecko.fetch_logo_url(req.crypto_currency) if req.type == "crypto" else None
     db.update_payment_method(
         req.id, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
         crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
         bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
         bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
-        bank_currency=req.bank_currency,
+        bank_currency=req.bank_currency, logo_url=logo_url,
     )
     return {"ok": True}
 

@@ -239,6 +239,15 @@ def init_db():
                     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            for col, defn in [
+                ("logo_url", "TEXT DEFAULT NULL"),
+            ]:
+                try:
+                    cur.execute("SAVEPOINT add_col")
+                    cur.execute(f"ALTER TABLE payment_methods ADD COLUMN {col} {defn}")
+                    cur.execute("RELEASE SAVEPOINT add_col")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT add_col")
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -385,6 +394,10 @@ def init_db():
                 ("rejection_reason",  "TEXT DEFAULT NULL"),
             ]:
                 _add_col(cur, "subscriptions", col, defn)
+            for col, defn in [
+                ("logo_url", "TEXT DEFAULT NULL"),
+            ]:
+                _add_col(cur, "payment_methods", col, defn)
 
     logger.info(f"✅ DB ready ({'PostgreSQL' if _USE_POSTGRES else 'SQLite'})")
 
@@ -1034,13 +1047,13 @@ def create_payment_method(
     crypto_address: str = None, crypto_network: str = None, crypto_currency: str = None,
     bank_name: str = None, bank_account_name: str = None, bank_account_number: str = None,
     bank_routing_number: str = None, bank_swift: str = None, bank_iban: str = None,
-    bank_currency: str = None,
+    bank_currency: str = None, logo_url: str = None,
 ) -> int | None:
     params = (
         type, label, bool(enabled), int(sort_order), instructions,
         crypto_address, crypto_network, crypto_currency,
         bank_name, bank_account_name, bank_account_number,
-        bank_routing_number, bank_swift, bank_iban, bank_currency,
+        bank_routing_number, bank_swift, bank_iban, bank_currency, logo_url,
     )
     with get_conn() as (conn, cur):
         if _USE_POSTGRES:
@@ -1050,8 +1063,8 @@ def create_payment_method(
                   (type, label, enabled, sort_order, instructions,
                    crypto_address, crypto_network, crypto_currency,
                    bank_name, bank_account_name, bank_account_number,
-                   bank_routing_number, bank_swift, bank_iban, bank_currency)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   bank_routing_number, bank_swift, bank_iban, bank_currency, logo_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 params,
@@ -1065,8 +1078,8 @@ def create_payment_method(
                   (type, label, enabled, sort_order, instructions,
                    crypto_address, crypto_network, crypto_currency,
                    bank_name, bank_account_name, bank_account_number,
-                   bank_routing_number, bank_swift, bank_iban, bank_currency)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   bank_routing_number, bank_swift, bank_iban, bank_currency, logo_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 params,
             )
@@ -1079,7 +1092,7 @@ def update_payment_method(
     crypto_address: str = None, crypto_network: str = None, crypto_currency: str = None,
     bank_name: str = None, bank_account_name: str = None, bank_account_number: str = None,
     bank_routing_number: str = None, bank_swift: str = None, bank_iban: str = None,
-    bank_currency: str = None,
+    bank_currency: str = None, logo_url: str = None,
 ):
     execute(
         """
@@ -1088,13 +1101,13 @@ def update_payment_method(
             crypto_address = ?, crypto_network = ?, crypto_currency = ?,
             bank_name = ?, bank_account_name = ?, bank_account_number = ?,
             bank_routing_number = ?, bank_swift = ?, bank_iban = ?, bank_currency = ?,
-            updated_at = CURRENT_TIMESTAMP
+            logo_url = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
         (type, label, bool(enabled), int(sort_order), instructions,
          crypto_address, crypto_network, crypto_currency,
          bank_name, bank_account_name, bank_account_number,
-         bank_routing_number, bank_swift, bank_iban, bank_currency,
+         bank_routing_number, bank_swift, bank_iban, bank_currency, logo_url,
          method_id),
     )
 
