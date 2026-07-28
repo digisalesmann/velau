@@ -835,6 +835,7 @@ async def create_subscription(req: SubscriptionCreateRequest,
         "pay_address":  pay_address,
         "method_type":  method["type"],
         "instructions": method.get("instructions"),
+        "bank_name":    method.get("bank_name"),
     }
 
 
