@@ -1,0 +1,32 @@
+name: Deploy to Render on push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          # Bypasses Render's own GitHub webhook integration entirely (which
+          # has been unreliable — Auto-Deploy kept silently not firing even
+          # while correctly enabled). This hook URL directly and
+          # deterministically triggers a deploy of the latest commit,
+          # independent of whatever's flaky about that integration.
+          if [ -z "$DEPLOY_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK secret is not set. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          status=$(curl -s -o /tmp/deploy_response.json -w "%{http_code}" "$DEPLOY_HOOK_URL")
+          echo "Response: $(cat /tmp/deploy_response.json)"
+          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+            echo "Deploy triggered successfully (HTTP $status)."
+            exit 0
+          fi
+          echo "Deploy hook call failed with HTTP $status."
+          exit 1
