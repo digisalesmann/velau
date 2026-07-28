@@ -909,7 +909,7 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
 
     notif.notify_admins(
         "New Payment Submitted for Review",
-        f"{user.username} — {sub['plan']} plan — ${sub['price_usd']:.2f}",
+        f"{user.username} · {sub['plan'].capitalize()} Plan · ${sub['price_usd']:.2f}",
         {"type": "payment_review", "payment_id": req.payment_id},
     )
 
