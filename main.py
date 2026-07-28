@@ -518,31 +518,49 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
 async def get_open_contracts(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
     token, account_type = _get_user_deriv_context(user.username)
-    service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
     try:
         await service.authenticate()
-        await service.ws.send({"proposal_open_contract": 1})
-        response = await service.ws.receive(timeout=20.0)
-        if response.get("error"):
+        # Manual trades can stack on top of (or alongside) an automated one,
+        # so this account is no longer guaranteed to have at most one open
+        # contract — querying proposal_open_contract without a contract_id
+        # silently returns only one of them. portfolio lists every open
+        # contract_id; each is then fetched individually for its live
+        # price/profit, which portfolio itself doesn't include.
+        await service.ws.send({"portfolio": 1})
+        portfolio_resp = await service.ws.receive(timeout=20.0)
+        if portfolio_resp.get("error"):
             return {"contracts": []}
-        # This account can only ever have one contract in flight at a time
-        # (the bot's trade lock enforces that), and the new API returns a
-        # single object here rather than the old dict-of-contracts.
-        c = response.get("proposal_open_contract")
-        if not c or c.get("is_expired") or c.get("is_settleable"):
-            return {"contracts": []}
-        open_list = [{
-            "contract_id":   c.get("contract_id"),
-            "symbol":        c.get("underlying_symbol", "frxXAUUSD"),
-            "contract_type": c.get("contract_type", ""),
-            "buy_price":     c.get("buy_price", 0),
-            "current_spot":  c.get("current_spot", 0),
-            "profit":        c.get("profit", 0),
-            "entry_spot":    c.get("entry_spot", 0),
-            "payout":        c.get("payout", 0),
-            "date_start":    c.get("date_start"),
-            "date_expiry":   c.get("date_expiry"),
-        }]
+        contract_ids = [
+            c.get("contract_id")
+            for c in portfolio_resp.get("portfolio", {}).get("contracts", [])
+            if c.get("contract_id")
+        ]
+
+        open_list = []
+        for cid in contract_ids:
+            try:
+                await service.ws.send({"proposal_open_contract": 1, "contract_id": cid})
+                response = await service.ws.receive(timeout=20.0)
+            except Exception:
+                continue
+            if response.get("error"):
+                continue
+            c = response.get("proposal_open_contract")
+            if not c or c.get("is_expired") or c.get("is_settleable"):
+                continue
+            open_list.append({
+                "contract_id":   c.get("contract_id"),
+                "symbol":        c.get("underlying_symbol", "frxXAUUSD"),
+                "contract_type": c.get("contract_type", ""),
+                "buy_price":     c.get("buy_price", 0),
+                "current_spot":  c.get("current_spot", 0),
+                "profit":        c.get("profit", 0),
+                "entry_spot":    c.get("entry_spot", 0),
+                "payout":        c.get("payout", 0),
+                "date_start":    c.get("date_start"),
+                "date_expiry":   c.get("date_expiry"),
+            })
         return {"contracts": open_list}
     except Exception as e:
         return {"contracts": [], "error": str(e)}
