@@ -1094,7 +1094,7 @@ def admin_get_users() -> list[dict]:
     """All users with their latest subscription status."""
     if _USE_POSTGRES:
         return fetchall("""
-            SELECT u.username, u.deriv_account, u.created_at,
+            SELECT u.username, u.deriv_account, u.created_at, u.avatar_url,
                    s.plan, s.status AS sub_status, s.expires_at, s.price_usd
             FROM users u
             LEFT JOIN (
@@ -1105,7 +1105,7 @@ def admin_get_users() -> list[dict]:
             ORDER BY u.created_at DESC
         """)
     return fetchall("""
-        SELECT u.username, u.deriv_account, u.created_at,
+        SELECT u.username, u.deriv_account, u.created_at, u.avatar_url,
                s.plan, s.status AS sub_status, s.expires_at, s.price_usd
         FROM users u
         LEFT JOIN (
