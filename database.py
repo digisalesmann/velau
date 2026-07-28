@@ -144,6 +144,21 @@ def init_db():
                     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            for col, defn in [
+                ("payment_method_id", "INTEGER DEFAULT NULL"),
+                ("method_type",       "TEXT DEFAULT NULL"),
+                ("proof_reference",   "TEXT DEFAULT NULL"),
+                ("proof_image_url",   "TEXT DEFAULT NULL"),
+                ("reviewed_by",       "TEXT DEFAULT NULL"),
+                ("reviewed_at",       "TIMESTAMP DEFAULT NULL"),
+                ("rejection_reason",  "TEXT DEFAULT NULL"),
+            ]:
+                try:
+                    cur.execute("SAVEPOINT add_col")
+                    cur.execute(f"ALTER TABLE subscriptions ADD COLUMN {col} {defn}")
+                    cur.execute("RELEASE SAVEPOINT add_col")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT add_col")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fcm_tokens (
                     token      TEXT PRIMARY KEY,
@@ -182,6 +197,28 @@ def init_db():
                     expires_at TIMESTAMP NOT NULL,
                     used       BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payment_methods (
+                    id                  SERIAL PRIMARY KEY,
+                    type                TEXT NOT NULL,
+                    label               TEXT NOT NULL,
+                    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+                    sort_order          INTEGER NOT NULL DEFAULT 0,
+                    instructions        TEXT DEFAULT NULL,
+                    crypto_address      TEXT DEFAULT NULL,
+                    crypto_network      TEXT DEFAULT NULL,
+                    crypto_currency     TEXT DEFAULT NULL,
+                    bank_name           TEXT DEFAULT NULL,
+                    bank_account_name   TEXT DEFAULT NULL,
+                    bank_account_number TEXT DEFAULT NULL,
+                    bank_routing_number TEXT DEFAULT NULL,
+                    bank_swift          TEXT DEFAULT NULL,
+                    bank_iban           TEXT DEFAULT NULL,
+                    bank_currency       TEXT DEFAULT NULL,
+                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
         else:
@@ -280,6 +317,28 @@ def init_db():
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payment_methods (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type                TEXT NOT NULL,
+                    label               TEXT NOT NULL,
+                    enabled             INTEGER NOT NULL DEFAULT 1,
+                    sort_order          INTEGER NOT NULL DEFAULT 0,
+                    instructions        TEXT DEFAULT NULL,
+                    crypto_address      TEXT DEFAULT NULL,
+                    crypto_network      TEXT DEFAULT NULL,
+                    crypto_currency     TEXT DEFAULT NULL,
+                    bank_name           TEXT DEFAULT NULL,
+                    bank_account_name   TEXT DEFAULT NULL,
+                    bank_account_number TEXT DEFAULT NULL,
+                    bank_routing_number TEXT DEFAULT NULL,
+                    bank_swift          TEXT DEFAULT NULL,
+                    bank_iban           TEXT DEFAULT NULL,
+                    bank_currency       TEXT DEFAULT NULL,
+                    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             for col, defn in [
                 ("display_name", "TEXT DEFAULT NULL"),
                 ("avatar_url",   "TEXT DEFAULT NULL"),
@@ -298,6 +357,16 @@ def init_db():
                 ("username", "TEXT DEFAULT NULL"),
             ]:
                 _add_col(cur, "trade_results", col, defn)
+            for col, defn in [
+                ("payment_method_id", "INTEGER DEFAULT NULL"),
+                ("method_type",       "TEXT DEFAULT NULL"),
+                ("proof_reference",   "TEXT DEFAULT NULL"),
+                ("proof_image_url",   "TEXT DEFAULT NULL"),
+                ("reviewed_by",       "TEXT DEFAULT NULL"),
+                ("reviewed_at",       "DATETIME DEFAULT NULL"),
+                ("rejection_reason",  "TEXT DEFAULT NULL"),
+            ]:
+                _add_col(cur, "subscriptions", col, defn)
 
     logger.info(f"✅ DB ready ({'PostgreSQL' if _USE_POSTGRES else 'SQLite'})")
 
@@ -828,16 +897,18 @@ def get_active_subscription(username: str) -> dict | None:
 
 
 def create_pending_subscription(
-    username: str, plan: str, payment_id: str,
+    username: str, plan: str, payment_id: str, payment_method_id: int, method_type: str,
     pay_address: str, pay_amount: float, pay_currency: str, price_usd: float,
 ):
     execute(
         """
         INSERT INTO subscriptions
-          (username, plan, status, payment_id, pay_address, pay_amount, pay_currency, price_usd)
-        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+          (username, plan, status, payment_id, payment_method_id, method_type,
+           pay_address, pay_amount, pay_currency, price_usd)
+        VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
         """,
-        (username, plan, payment_id, pay_address, pay_amount, pay_currency, price_usd),
+        (username, plan, payment_id, payment_method_id, method_type,
+         pay_address, pay_amount, pay_currency, price_usd),
     )
 
 
@@ -847,32 +918,174 @@ def get_subscription_by_payment(payment_id: str) -> dict | None:
     )
 
 
+def get_subscription_by_id(sub_id: int) -> dict | None:
+    return fetchone(
+        "SELECT * FROM subscriptions WHERE id = ?", (sub_id,)
+    )
+
+
+def get_pending_subscription_for_user(username: str) -> dict | None:
+    """A subscription this user has already started paying for (created or
+    proof submitted, not yet resolved) — used to block starting a second
+    order while one is already in flight."""
+    return fetchone(
+        """
+        SELECT * FROM subscriptions
+        WHERE username = ? AND status IN ('pending', 'pending_review')
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (username,),
+    )
+
+
 def cancel_pending_subscription(payment_id: str, username: str):
-    """Mark a pending subscription as cancelled. Only cancels if still pending and owned by user."""
+    """Mark a pending subscription as cancelled. Only cancels if still pending and owned by user.
+    Deliberately does NOT cancel 'pending_review' — once proof is submitted,
+    only admin approve/reject should resolve it, preserving an audit trail."""
     execute(
         "UPDATE subscriptions SET status = 'cancelled' WHERE payment_id = ? AND username = ? AND status = 'pending'",
         (payment_id, username),
     )
 
 
-def activate_subscription(payment_id: str, plan: str):
-    """Set subscription to active with the correct expiry for the plan."""
+def submit_payment_proof(payment_id: str, reference: str, image_url: str | None):
+    """Moves an order into the admin review queue. Allowed from 'pending' (first
+    submission) or 'rejected' (correcting and resubmitting on the same order) —
+    clears any prior rejection so it reads as a fresh review request."""
+    execute(
+        """
+        UPDATE subscriptions
+        SET status = 'pending_review', proof_reference = ?, proof_image_url = ?,
+            rejection_reason = NULL, reviewed_by = NULL, reviewed_at = NULL
+        WHERE payment_id = ? AND status IN ('pending', 'rejected')
+        """,
+        (reference, image_url, payment_id),
+    )
+
+
+def _expiry_for_plan(plan: str):
+    """Shared by admin_approve_subscription and admin_grant_subscription."""
     from datetime import datetime, timedelta
     from payments import PLANS
-
     days = PLANS[plan]["days"]
-    expires_at = datetime.utcnow() + timedelta(days=days) if days else None
+    return datetime.utcnow() + timedelta(days=days) if days else None
 
-    if expires_at:
-        execute(
-            "UPDATE subscriptions SET status = 'active', expires_at = ? WHERE payment_id = ?",
-            (expires_at, payment_id),
+
+def admin_approve_subscription(sub_id: int, plan: str, admin_username: str):
+    """Approve a pending_review order — activates the subscription with the correct expiry."""
+    expires_at = _expiry_for_plan(plan)
+    execute(
+        """
+        UPDATE subscriptions
+        SET status = 'active', expires_at = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (expires_at, admin_username, sub_id),
+    )
+
+
+def admin_reject_subscription(sub_id: int, admin_username: str, reason: str):
+    execute(
+        """
+        UPDATE subscriptions
+        SET status = 'rejected', rejection_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (reason, admin_username, sub_id),
+    )
+
+
+# ── Payment methods ────────────────────────────────────────────────────────────
+
+def get_payment_methods(enabled_only: bool = True) -> list[dict]:
+    if enabled_only:
+        return fetchall(
+            "SELECT * FROM payment_methods WHERE enabled = ? ORDER BY sort_order, id",
+            (True,),
         )
-    else:
-        execute(
-            "UPDATE subscriptions SET status = 'active', expires_at = NULL WHERE payment_id = ?",
-            (payment_id,),
-        )
+    return fetchall("SELECT * FROM payment_methods ORDER BY sort_order, id")
+
+
+def get_payment_method(method_id: int) -> dict | None:
+    return fetchone("SELECT * FROM payment_methods WHERE id = ?", (method_id,))
+
+
+def create_payment_method(
+    type: str, label: str, enabled: bool = True, sort_order: int = 0,
+    instructions: str = None,
+    crypto_address: str = None, crypto_network: str = None, crypto_currency: str = None,
+    bank_name: str = None, bank_account_name: str = None, bank_account_number: str = None,
+    bank_routing_number: str = None, bank_swift: str = None, bank_iban: str = None,
+    bank_currency: str = None,
+) -> int | None:
+    params = (
+        type, label, bool(enabled), int(sort_order), instructions,
+        crypto_address, crypto_network, crypto_currency,
+        bank_name, bank_account_name, bank_account_number,
+        bank_routing_number, bank_swift, bank_iban, bank_currency,
+    )
+    with get_conn() as (conn, cur):
+        if _USE_POSTGRES:
+            cur.execute(
+                """
+                INSERT INTO payment_methods
+                  (type, label, enabled, sort_order, instructions,
+                   crypto_address, crypto_network, crypto_currency,
+                   bank_name, bank_account_name, bank_account_number,
+                   bank_routing_number, bank_swift, bank_iban, bank_currency)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            return row["id"] if row else None
+        else:
+            cur.execute(
+                """
+                INSERT INTO payment_methods
+                  (type, label, enabled, sort_order, instructions,
+                   crypto_address, crypto_network, crypto_currency,
+                   bank_name, bank_account_name, bank_account_number,
+                   bank_routing_number, bank_swift, bank_iban, bank_currency)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            return cur.lastrowid
+
+
+def update_payment_method(
+    method_id: int, type: str, label: str, enabled: bool, sort_order: int,
+    instructions: str = None,
+    crypto_address: str = None, crypto_network: str = None, crypto_currency: str = None,
+    bank_name: str = None, bank_account_name: str = None, bank_account_number: str = None,
+    bank_routing_number: str = None, bank_swift: str = None, bank_iban: str = None,
+    bank_currency: str = None,
+):
+    execute(
+        """
+        UPDATE payment_methods
+        SET type = ?, label = ?, enabled = ?, sort_order = ?, instructions = ?,
+            crypto_address = ?, crypto_network = ?, crypto_currency = ?,
+            bank_name = ?, bank_account_name = ?, bank_account_number = ?,
+            bank_routing_number = ?, bank_swift = ?, bank_iban = ?, bank_currency = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (type, label, bool(enabled), int(sort_order), instructions,
+         crypto_address, crypto_network, crypto_currency,
+         bank_name, bank_account_name, bank_account_number,
+         bank_routing_number, bank_swift, bank_iban, bank_currency,
+         method_id),
+    )
+
+
+def delete_payment_method(method_id: int):
+    """Safe to delete regardless of history — subscriptions snapshot their own
+    copy of the destination details (pay_address/pay_currency/method_type) at
+    creation time, so deleting the source method never corrupts past orders."""
+    execute("DELETE FROM payment_methods WHERE id = ?", (method_id,))
 
 
 # ── Admin queries ──────────────────────────────────────────────────────────────
@@ -938,10 +1151,7 @@ def admin_revoke_subscription(sub_id: int):
 def admin_grant_subscription(username: str, plan: str):
     """Manually grant a free subscription (no payment required)."""
     import time as _time
-    from datetime import datetime, timedelta
-    from payments import PLANS
-    days       = PLANS[plan]["days"]
-    expires_at = datetime.utcnow() + timedelta(days=days) if days else None
+    expires_at = _expiry_for_plan(plan)
     execute(
         """
         INSERT INTO subscriptions
@@ -950,6 +1160,11 @@ def admin_grant_subscription(username: str, plan: str):
         """,
         (username, plan, f"manual_{username}_{int(_time.time())}", expires_at),
     )
+
+
+def get_admin_usernames() -> list[str]:
+    rows = fetchall("SELECT username FROM users WHERE is_admin = ?", (True,))
+    return [r["username"] for r in rows]
 
 
 init_db()

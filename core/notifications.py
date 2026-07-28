@@ -111,6 +111,15 @@ def notify_user(username: str, title: str, body: str, data: dict = None):
     _send_to(db.get_fcm_tokens(username), title, body, data)
 
 
+def notify_admins(title: str, body: str, data: dict = None):
+    """Send notification to every admin's devices — used when a user submits
+    a payment proof that needs review."""
+    tokens = []
+    for admin_username in db.get_admin_usernames():
+        tokens.extend(db.get_fcm_tokens(admin_username))
+    _send_to(tokens, title, body, data)
+
+
 # ── Public helpers ────────────────────────────────────────────────────────────
 
 def notify_trade_executed(direction: str, symbol: str, amount: float, score: int):

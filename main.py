@@ -1,8 +1,6 @@
 import os
-import json
-import hmac
+import uuid
 import base64
-import hashlib
 import logging
 import asyncio
 import traceback
@@ -10,7 +8,8 @@ from datetime import datetime, date
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -169,6 +168,13 @@ class DerivConnectRequest(BaseModel):
 
 class SubscriptionCreateRequest(BaseModel):
     plan: str  # "monthly" | "yearly" | "lifetime"
+    payment_method_id: int
+
+class SubmitProofRequest(BaseModel):
+    payment_id: str
+    reference: str
+    image_base64: Optional[str] = None
+    content_type: str = "image/jpeg"
 
 class CandleRequest(BaseModel):
     symbol:      str = "frxXAUUSD"
@@ -758,75 +764,96 @@ async def get_session(user=Depends(get_current_user)):
     }
 
 
+@app.get("/subscription/methods")
+async def list_payment_methods(user=Depends(get_current_user)):
+    """Enabled payment methods for the checkout picker."""
+    return {"methods": db.get_payment_methods(enabled_only=True)}
+
+
 @app.post("/subscription/create")
 async def create_subscription(req: SubscriptionCreateRequest,
                               user=Depends(get_current_user)):
-    """Create a crypto payment invoice for the requested plan."""
-    from payments import create_payment, PLANS
+    """Create a pending order against an admin-configured payment method.
+    No external processor — the user pays externally and submits proof for
+    admin review via /subscription/proof."""
+    from payments import PLANS
 
     if req.plan not in PLANS:
         raise HTTPException(status_code=400, detail="Invalid plan. Choose monthly, yearly, or lifetime.")
 
-    # Don't allow double-subscribing while still active
-    existing = db.get_active_subscription(user.username)
-    if existing:
+    if db.get_active_subscription(user.username):
         raise HTTPException(status_code=400, detail="You already have an active subscription.")
 
-    try:
-        payment = create_payment(req.plan, user.username)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Payment creation failed for {user.username}: {e}")
-        raise HTTPException(status_code=500, detail="Could not create payment. Please try again.")
+    if db.get_pending_subscription_for_user(user.username):
+        raise HTTPException(
+            status_code=400,
+            detail="You already have a payment in progress. Cancel it or wait for review.",
+        )
+
+    method = db.get_payment_method(req.payment_method_id)
+    if not method:
+        raise HTTPException(status_code=404, detail="Payment method not found.")
+    if not method["enabled"]:
+        raise HTTPException(status_code=400, detail="This payment method is no longer available.")
+
+    price_usd = PLANS[req.plan]["usd"]
+    payment_id = uuid.uuid4().hex
+
+    if method["type"] == "crypto":
+        pay_address  = method["crypto_address"] or ""
+        pay_currency = f'{method["crypto_currency"]} ({method["crypto_network"]})'
+    else:  # bank_transfer
+        lines = [f'Bank: {method["bank_name"]}', f'Account Name: {method["bank_account_name"]}',
+                  f'Account Number: {method["bank_account_number"]}']
+        if method.get("bank_routing_number"):
+            lines.append(f'Routing Number: {method["bank_routing_number"]}')
+        if method.get("bank_swift"):
+            lines.append(f'SWIFT: {method["bank_swift"]}')
+        if method.get("bank_iban"):
+            lines.append(f'IBAN: {method["bank_iban"]}')
+        pay_address  = "\n".join(lines)
+        pay_currency = f'Bank Transfer ({method["bank_currency"]})'
 
     db.create_pending_subscription(
         username=user.username,
         plan=req.plan,
-        payment_id=str(payment["payment_id"]),
-        pay_address=payment.get("pay_address", ""),
-        pay_amount=float(payment.get("pay_amount", 0)),
-        pay_currency=payment.get("pay_currency", ""),
-        price_usd=float(payment.get("price_amount", 0)),
+        payment_id=payment_id,
+        payment_method_id=method["id"],
+        method_type=method["type"],
+        pay_address=pay_address,
+        pay_amount=price_usd,
+        pay_currency=pay_currency,
+        price_usd=price_usd,
     )
 
     return {
-        "payment_id":  str(payment["payment_id"]),
-        "pay_address": payment["pay_address"],
-        "pay_amount":  payment["pay_amount"],
-        "pay_currency": payment["pay_currency"],
-        "price_usd":   payment["price_amount"],
-        "plan":        req.plan,
+        "payment_id":   payment_id,
+        "plan":         req.plan,
+        "price_usd":    price_usd,
+        "pay_amount":   price_usd,
+        "pay_currency": pay_currency,
+        "pay_address":  pay_address,
+        "method_type":  method["type"],
+        "instructions": method.get("instructions"),
     }
 
 
 @app.get("/subscription/poll/{payment_id}")
 async def poll_payment(payment_id: str, user=Depends(get_current_user)):
-    """
-    Client polls this endpoint every ~15 s to detect payment confirmation.
-    Returns {"status": "active"|"waiting"|"confirming"|...}.
-    """
-    from payments import get_payment_status, is_confirmed
-
+    """Client polls this every ~15s while a payment is in progress. Returns
+    the order's own status — 'pending'|'pending_review'|'active'|'rejected'|'cancelled'."""
     sub = db.get_subscription_by_payment(payment_id)
     if not sub:
         raise HTTPException(status_code=404, detail="Payment not found.")
+    if sub["username"] != user.username and not db.is_admin(user.username):
+        raise HTTPException(status_code=403, detail="Not your payment.")
 
-    if sub["status"] == "active":
-        return {"status": "active", "plan": sub["plan"]}
-
-    # Double-check with NOWPayments in case webhook was missed
-    try:
-        np = get_payment_status(payment_id)
-        np_status = np.get("payment_status", "waiting")
-        if is_confirmed(np_status):
-            db.activate_subscription(payment_id, sub["plan"])
-            logger.info(f"Subscription activated (poll) for {user.username} — plan {sub['plan']}")
-            return {"status": "active", "plan": sub["plan"]}
-        return {"status": np_status}
-    except Exception as e:
-        logger.warning(f"NOWPayments poll error: {e}")
-        return {"status": sub["status"]}
+    return {
+        "status":           sub["status"],
+        "plan":             sub["plan"],
+        "expires_at":       sub.get("expires_at"),
+        "rejection_reason": sub.get("rejection_reason"),
+    }
 
 
 class CancelPaymentRequest(BaseModel):
@@ -834,7 +861,9 @@ class CancelPaymentRequest(BaseModel):
 
 @app.post("/subscription/cancel")
 async def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_current_user)):
-    """User-initiated cancel of a pending payment they no longer want to complete."""
+    """User-initiated cancel of a pending payment they no longer want to complete.
+    Deliberately only works while status=='pending' — once proof is submitted
+    (status=='pending_review'), only admin approve/reject should resolve it."""
     sub = db.get_subscription_by_payment(req.payment_id)
     if not sub:
         raise HTTPException(status_code=404, detail="Payment not found.")
@@ -846,38 +875,65 @@ async def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_curren
     return {"ok": True}
 
 
-@app.post("/subscription/webhook")
-async def subscription_webhook(request: Request):
-    """
-    NOWPayments IPN webhook — called when a payment status changes.
-    Verifies the HMAC-SHA512 signature if NOWPAYMENTS_IPN_SECRET is set.
-    """
-    import os
-    body = await request.body()
+@app.post("/subscription/proof")
+async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current_user)):
+    """User submits a tx hash/reference (+ optional screenshot) for admin review."""
+    from rate_limit import payment_proof_limiter
+    payment_proof_limiter.check(user.username.lower())
 
-    ipn_secret = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-    if ipn_secret:
-        sig      = request.headers.get("x-nowpayments-sig", "")
-        expected = hmac.new(ipn_secret.encode(), body, hashlib.sha512).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            raise HTTPException(status_code=401, detail="Invalid IPN signature.")
+    sub = db.get_subscription_by_payment(req.payment_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if sub["username"] != user.username:
+        raise HTTPException(status_code=403, detail="Not your payment.")
+    if sub["status"] not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail=f"Cannot submit proof for a {sub['status']} payment.")
+    if not req.reference.strip():
+        raise HTTPException(status_code=400, detail="A payment reference is required.")
+
+    image_url = None
+    if req.image_base64:
+        try:
+            image_bytes = base64.b64decode(req.image_base64, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image data.")
+        if len(image_bytes) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Image must be under 5MB.")
+        try:
+            image_url = storage.upload_payment_proof(req.payment_id, image_bytes, req.content_type)
+        except Exception as e:
+            logger.warning(f"Proof upload failed for {req.payment_id}: {e}")
+            raise HTTPException(status_code=502, detail="Screenshot upload failed. Please try again.")
+
+    db.submit_payment_proof(req.payment_id, req.reference.strip(), image_url)
+
+    notif.notify_admins(
+        "New Payment Submitted for Review",
+        f"{user.username} — {sub['plan']} plan — ${sub['price_usd']:.2f}",
+        {"type": "payment_review", "payment_id": req.payment_id},
+    )
+
+    return {"status": "pending_review"}
+
+
+@app.get("/subscription/proof_image/{payment_id}")
+async def get_payment_proof_image(payment_id: str, user=Depends(get_current_user)):
+    """Authorized proxy for a proof screenshot — the storage bucket is private."""
+    sub = db.get_subscription_by_payment(payment_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    if sub["username"] != user.username and not db.is_admin(user.username):
+        raise HTTPException(status_code=403, detail="Not your payment.")
+    if not sub.get("proof_image_url"):
+        raise HTTPException(status_code=404, detail="No screenshot was submitted for this payment.")
 
     try:
-        data = json.loads(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON.")
+        image_bytes, content_type = storage.get_payment_proof_bytes(sub["proof_image_url"])
+    except Exception as e:
+        logger.warning(f"Proof retrieval failed for {payment_id}: {e}")
+        raise HTTPException(status_code=502, detail="Could not retrieve screenshot.")
 
-    payment_id     = str(data.get("payment_id", ""))
-    payment_status = data.get("payment_status", "")
-
-    from payments import is_confirmed
-    if is_confirmed(payment_status):
-        sub = db.get_subscription_by_payment(payment_id)
-        if sub and sub["status"] == "pending":
-            db.activate_subscription(payment_id, sub["plan"])
-            logger.info(f"Subscription activated (webhook) payment_id={payment_id}")
-
-    return {"received": True}
+    return Response(content=image_bytes, media_type=content_type)
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────
@@ -892,6 +948,36 @@ class AdminRevokeRequest(BaseModel):
 class AdminSetAdminRequest(BaseModel):
     username: str
     value:    bool
+
+class AdminPaymentMethodRequest(BaseModel):
+    type:  str  # "crypto" | "bank_transfer"
+    label: str
+    enabled: bool = True
+    sort_order: int = 0
+    instructions: Optional[str] = None
+    crypto_address:  Optional[str] = None
+    crypto_network:  Optional[str] = None
+    crypto_currency: Optional[str] = None
+    bank_name:           Optional[str] = None
+    bank_account_name:   Optional[str] = None
+    bank_account_number: Optional[str] = None
+    bank_routing_number: Optional[str] = None
+    bank_swift:          Optional[str] = None
+    bank_iban:           Optional[str] = None
+    bank_currency:       Optional[str] = None
+
+class AdminPaymentMethodUpdateRequest(AdminPaymentMethodRequest):
+    id: int
+
+class AdminPaymentMethodDeleteRequest(BaseModel):
+    id: int
+
+class AdminSubActionRequest(BaseModel):
+    sub_id: int
+
+class AdminSubRejectRequest(BaseModel):
+    sub_id: int
+    reason: str
 
 
 @app.get("/admin/stats")
@@ -925,6 +1011,99 @@ async def admin_grant(req: AdminGrantRequest, user=Depends(_require_admin)):
 async def admin_revoke(req: AdminRevokeRequest, user=Depends(_require_admin)):
     db.admin_revoke_subscription(req.sub_id)
     logger.info(f"Admin {user.username} revoked subscription {req.sub_id}")
+    return {"ok": True}
+
+
+def _validate_payment_method_fields(req: AdminPaymentMethodRequest):
+    if req.type not in ("crypto", "bank_transfer"):
+        raise HTTPException(status_code=400, detail="type must be 'crypto' or 'bank_transfer'.")
+    if not req.label.strip():
+        raise HTTPException(status_code=400, detail="label is required.")
+    if req.type == "crypto":
+        if not req.crypto_address or not req.crypto_currency:
+            raise HTTPException(status_code=400, detail="crypto_address and crypto_currency are required.")
+    else:
+        if not req.bank_name or not req.bank_account_name or not req.bank_account_number:
+            raise HTTPException(
+                status_code=400,
+                detail="bank_name, bank_account_name, and bank_account_number are required.",
+            )
+
+
+@app.get("/admin/payment_methods")
+async def admin_list_payment_methods(user=Depends(_require_admin)):
+    return {"methods": db.get_payment_methods(enabled_only=False)}
+
+
+@app.post("/admin/payment_methods/create")
+async def admin_create_payment_method(req: AdminPaymentMethodRequest, user=Depends(_require_admin)):
+    _validate_payment_method_fields(req)
+    method_id = db.create_payment_method(
+        type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
+        instructions=req.instructions,
+        crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
+        bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
+        bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
+        bank_currency=req.bank_currency,
+    )
+    return {"id": method_id}
+
+
+@app.post("/admin/payment_methods/update")
+async def admin_update_payment_method(req: AdminPaymentMethodUpdateRequest, user=Depends(_require_admin)):
+    if not db.get_payment_method(req.id):
+        raise HTTPException(status_code=404, detail="Payment method not found.")
+    _validate_payment_method_fields(req)
+    db.update_payment_method(
+        req.id, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
+        instructions=req.instructions,
+        crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
+        bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
+        bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
+        bank_currency=req.bank_currency,
+    )
+    return {"ok": True}
+
+
+@app.post("/admin/payment_methods/delete")
+async def admin_delete_payment_method(req: AdminPaymentMethodDeleteRequest, user=Depends(_require_admin)):
+    db.delete_payment_method(req.id)
+    return {"ok": True}
+
+
+@app.post("/admin/subscriptions/approve")
+async def admin_approve_subscription(req: AdminSubActionRequest, user=Depends(_require_admin)):
+    sub = db.get_subscription_by_id(req.sub_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found.")
+    if sub["status"] != "pending_review":
+        raise HTTPException(status_code=400, detail=f"Cannot approve a {sub['status']} payment.")
+    db.admin_approve_subscription(req.sub_id, sub["plan"], user.username)
+    logger.info(f"Admin {user.username} approved subscription {req.sub_id} ({sub['username']}, {sub['plan']})")
+    notif.notify_user(
+        sub["username"], "Subscription Activated",
+        f"Your {sub['plan']} subscription is now active. Welcome to Velau.",
+        {"type": "subscription_approved"},
+    )
+    return {"ok": True}
+
+
+@app.post("/admin/subscriptions/reject")
+async def admin_reject_subscription(req: AdminSubRejectRequest, user=Depends(_require_admin)):
+    sub = db.get_subscription_by_id(req.sub_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found.")
+    if sub["status"] != "pending_review":
+        raise HTTPException(status_code=400, detail=f"Cannot reject a {sub['status']} payment.")
+    if not req.reason.strip():
+        raise HTTPException(status_code=400, detail="A rejection reason is required.")
+    db.admin_reject_subscription(req.sub_id, user.username, req.reason.strip())
+    logger.info(f"Admin {user.username} rejected subscription {req.sub_id} ({sub['username']}): {req.reason}")
+    notif.notify_user(
+        sub["username"], "Payment Rejected",
+        req.reason.strip(),
+        {"type": "subscription_rejected"},
+    )
     return {"ok": True}
 
 
