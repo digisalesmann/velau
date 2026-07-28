@@ -90,13 +90,20 @@ class XAUMasterStrategy:
                 logger.warning(f"Sentiment refresh failed: {e}")
         return self._sentiment_cache
 
-    def _maybe_notify_session_start(self):
+    async def _maybe_notify_session_start(self):
         today = datetime.now(timezone.utc).date()
         hour  = datetime.now(timezone.utc).hour
         key   = (today, hour // 5)
         if self._last_session_notif != key and self._in_trading_session():
             self._last_session_notif = key
-            notif.notify_session_start()
+            # notif.notify_session_start broadcasts to every registered
+            # device via a blocking `requests` call per token — offload it
+            # so a slow/large broadcast doesn't stall the event loop and
+            # every concurrent HTTP request the whole app is serving.
+            try:
+                await asyncio.to_thread(notif.notify_session_start)
+            except Exception as e:
+                logger.warning(f"notify_session_start failed: {e}")
 
     def _refresh_win_rate(self):
         try:
@@ -374,15 +381,19 @@ class XAUMasterStrategy:
                     username, won, profit, MAX_CONSECUTIVE_LOSSES, MAX_DAILY_DRAWDOWN_PCT
                 )
 
-                if username:
-                    notif.notify_user(
-                        username,
-                        f"Trade {'Won' if won else 'Lost'}  {'+' if won else '-'}${abs(profit):.2f}",
-                        f"Contract {contract_id} settled.",
-                        {"type": "trade_settled", "won": str(won), "pnl": str(profit)},
-                    )
-                else:
-                    notif.notify_trade_settled(contract_id, won, profit)
+                try:
+                    if username:
+                        await asyncio.to_thread(
+                            notif.notify_user,
+                            username,
+                            f"Trade {'Won' if won else 'Lost'}  {'+' if won else '-'}${abs(profit):.2f}",
+                            f"Contract {contract_id} settled.",
+                            {"type": "trade_settled", "won": str(won), "pnl": str(profit)},
+                        )
+                    else:
+                        await asyncio.to_thread(notif.notify_trade_settled, contract_id, won, profit)
+                except Exception as e:
+                    logger.warning(f"Trade-settled notification failed for contract {contract_id}: {e}")
 
                 # Global stake-sizing counters — explicitly out of scope for
                 # per-user isolation, unchanged logic.
@@ -413,13 +424,17 @@ class XAUMasterStrategy:
                         f"{state['consecutive_losses']} consecutive losses or daily drawdown "
                         f"limit hit. Your bot has paused for today, resumes at midnight UTC."
                     )
-                    if username:
-                        notif.notify_user(
-                            username, "Circuit Breaker Triggered", body,
-                            {"type": "circuit_breaker"},
-                        )
-                    else:
-                        notif.notify_circuit_breaker(state["consecutive_losses"])
+                    try:
+                        if username:
+                            await asyncio.to_thread(
+                                notif.notify_user,
+                                username, "Circuit Breaker Triggered", body,
+                                {"type": "circuit_breaker"},
+                            )
+                        else:
+                            await asyncio.to_thread(notif.notify_circuit_breaker, state["consecutive_losses"])
+                    except Exception as e:
+                        logger.warning(f"Circuit-breaker notification failed for {username}: {e}")
                 return  # settled — done
 
             logger.warning(f"👁  Contract {contract_id} did not settle within 20 min")
@@ -463,12 +478,16 @@ class XAUMasterStrategy:
             contract_id = result.get("buy", {}).get("contract_id", "unknown")
             logger.info(f"✅ [{username}] {direction} ${stake:.2f} | contract={contract_id}")
 
-            notif.notify_user(
-                username,
-                f"Trade Placed {'CALL ↑' if direction == 'CALL' else 'PUT ↓'}",
-                f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/7",
-                {"type": "trade_executed", "direction": direction},
-            )
+            try:
+                await asyncio.to_thread(
+                    notif.notify_user,
+                    username,
+                    f"Trade Placed {'CALL ↑' if direction == 'CALL' else 'PUT ↓'}",
+                    f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/7",
+                    {"type": "trade_executed", "direction": direction},
+                )
+            except Exception as e:
+                logger.warning(f"Trade-placed notification failed for {username}: {e}")
 
             # Pass the token — monitor opens its own fresh connections per poll
             asyncio.create_task(
@@ -542,7 +561,7 @@ class XAUMasterStrategy:
             except Exception as e:
                 logger.warning(f"Balance fetch: {e}")
 
-            self._maybe_notify_session_start()
+            await self._maybe_notify_session_start()
 
             logger.info(
                 f"🔍 session={'✅' if self._in_trading_session() else '❌'} "

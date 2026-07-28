@@ -512,7 +512,10 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
         raise HTTPException(status_code=400, detail="Image must be under 3MB.")
 
     try:
-        avatar_url = storage.upload_avatar(user.username, image_bytes, req.content_type)
+        # storage.upload_avatar is a blocking `requests` call — offload it so
+        # it doesn't stall the single-worker event loop (and every other
+        # concurrent request) for the full upload duration.
+        avatar_url = await asyncio.to_thread(storage.upload_avatar, user.username, image_bytes, req.content_type)
     except Exception as e:
         logger.warning(f"Avatar upload failed for {user.username}: {e}")
         raise HTTPException(status_code=502, detail="Avatar upload failed. Please try again.")
@@ -578,7 +581,9 @@ async def get_open_contracts(user=Depends(get_current_user)):
 @app.get("/news", response_model=NewsResponse)
 async def get_news():
     try:
-        articles, sentiment = get_news_and_sentiment()
+        # Blocking `requests` call under the hood — offload it, same
+        # reasoning as the other fixes in this audit.
+        articles, sentiment = await asyncio.to_thread(get_news_and_sentiment)
         return NewsResponse(articles=articles, sentiment=sentiment)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"News error: {e}")
@@ -904,18 +909,27 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
         if len(image_bytes) > 5 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="Image must be under 5MB.")
         try:
-            image_url = storage.upload_payment_proof(req.payment_id, image_bytes, req.content_type)
+            # Blocking `requests` call — offload it, same reasoning as the
+            # avatar upload above.
+            image_url = await asyncio.to_thread(storage.upload_payment_proof, req.payment_id, image_bytes, req.content_type)
         except Exception as e:
             logger.warning(f"Proof upload failed for {req.payment_id}: {e}")
             raise HTTPException(status_code=502, detail="Screenshot upload failed. Please try again.")
 
     db.submit_payment_proof(req.payment_id, req.reference.strip(), image_url)
 
-    notif.notify_admins(
-        "New Payment Submitted for Review",
-        f"{user.username} | {sub['plan'].capitalize()} Plan | ${sub['price_usd']:.2f}",
-        {"type": "payment_review", "payment_id": req.payment_id},
-    )
+    # notify_admins sends a blocking FCM push per admin device — offload it
+    # too, and don't let a slow/failed push turn a successful proof
+    # submission into a 500 for the user.
+    try:
+        await asyncio.to_thread(
+            notif.notify_admins,
+            "New Payment Submitted for Review",
+            f"{user.username} | {sub['plan'].capitalize()} Plan | ${sub['price_usd']:.2f}",
+            {"type": "payment_review", "payment_id": req.payment_id},
+        )
+    except Exception as e:
+        logger.warning(f"notify_admins failed for payment {req.payment_id}: {e}")
 
     return {"status": "pending_review"}
 
@@ -932,7 +946,7 @@ async def get_payment_proof_image(payment_id: str, user=Depends(get_current_user
         raise HTTPException(status_code=404, detail="No screenshot was submitted for this payment.")
 
     try:
-        image_bytes, content_type = storage.get_payment_proof_bytes(sub["proof_image_url"])
+        image_bytes, content_type = await asyncio.to_thread(storage.get_payment_proof_bytes, sub["proof_image_url"])
     except Exception as e:
         logger.warning(f"Proof retrieval failed for {payment_id}: {e}")
         raise HTTPException(status_code=502, detail="Could not retrieve screenshot.")
@@ -1042,7 +1056,10 @@ async def admin_list_payment_methods(user=Depends(_require_admin)):
 @app.post("/admin/payment_methods/create")
 async def admin_create_payment_method(req: AdminPaymentMethodRequest, user=Depends(_require_admin)):
     _validate_payment_method_fields(req)
-    logo_url = coingecko.fetch_logo_url(req.crypto_currency) if req.type == "crypto" else None
+    # Blocking `requests` call to CoinGecko — offload it so it doesn't stall
+    # the single-worker event loop (this was the direct cause of the admin
+    # panel timing out right after saving a payment method).
+    logo_url = await asyncio.to_thread(coingecko.fetch_logo_url, req.crypto_currency) if req.type == "crypto" else None
     method_id = db.create_payment_method(
         type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
@@ -1059,7 +1076,7 @@ async def admin_update_payment_method(req: AdminPaymentMethodUpdateRequest, user
     if not db.get_payment_method(req.id):
         raise HTTPException(status_code=404, detail="Payment method not found.")
     _validate_payment_method_fields(req)
-    logo_url = coingecko.fetch_logo_url(req.crypto_currency) if req.type == "crypto" else None
+    logo_url = await asyncio.to_thread(coingecko.fetch_logo_url, req.crypto_currency) if req.type == "crypto" else None
     db.update_payment_method(
         req.id, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
@@ -1086,11 +1103,15 @@ async def admin_approve_subscription(req: AdminSubActionRequest, user=Depends(_r
         raise HTTPException(status_code=400, detail=f"Cannot approve a {sub['status']} payment.")
     db.admin_approve_subscription(req.sub_id, sub["plan"], user.username)
     logger.info(f"Admin {user.username} approved subscription {req.sub_id} ({sub['username']}, {sub['plan']})")
-    notif.notify_user(
-        sub["username"], "Subscription Activated",
-        f"Your {sub['plan']} subscription is now active. Welcome to Velau.",
-        {"type": "subscription_approved"},
-    )
+    try:
+        await asyncio.to_thread(
+            notif.notify_user,
+            sub["username"], "Subscription Activated",
+            f"Your {sub['plan']} subscription is now active. Welcome to Velau.",
+            {"type": "subscription_approved"},
+        )
+    except Exception as e:
+        logger.warning(f"notify_user failed for approval of subscription {req.sub_id}: {e}")
     return {"ok": True}
 
 
@@ -1105,11 +1126,15 @@ async def admin_reject_subscription(req: AdminSubRejectRequest, user=Depends(_re
         raise HTTPException(status_code=400, detail="A rejection reason is required.")
     db.admin_reject_subscription(req.sub_id, user.username, req.reason.strip())
     logger.info(f"Admin {user.username} rejected subscription {req.sub_id} ({sub['username']}): {req.reason}")
-    notif.notify_user(
-        sub["username"], "Payment Rejected",
-        req.reason.strip(),
-        {"type": "subscription_rejected"},
-    )
+    try:
+        await asyncio.to_thread(
+            notif.notify_user,
+            sub["username"], "Payment Rejected",
+            req.reason.strip(),
+            {"type": "subscription_rejected"},
+        )
+    except Exception as e:
+        logger.warning(f"notify_user failed for rejection of subscription {req.sub_id}: {e}")
     return {"ok": True}
 
 
