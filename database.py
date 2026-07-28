@@ -20,7 +20,22 @@ _USE_POSTGRES = bool(DATABASE_URL)
 if _USE_POSTGRES:
     import psycopg2
     import psycopg2.extras
+    from psycopg2.pool import ThreadedConnectionPool
     logger.info("✅ Using PostgreSQL (persistent)")
+    # Reused across requests. Opening a fresh TCP+TLS+auth connection to
+    # Supabase on every single query (the previous behavior) blocks the
+    # single-worker event loop for the full handshake each time — under any
+    # burst of concurrent requests (e.g. the admin panel firing 5 endpoints
+    # at once on refresh) those blocking connects serialize one after
+    # another and can pile up past a client's request timeout.
+    #
+    # minconn=0 — Supabase has paused/slept on this project before (see the
+    # keepalive cron). A nonzero minconn opens connections immediately at
+    # import time, which would crash the entire app on startup if Supabase
+    # happened to be unreachable at that exact moment. With 0, the pool only
+    # connects lazily on first use, same failure mode as before (one request
+    # fails, not the whole process) but with pooling for every call after.
+    _pool = ThreadedConnectionPool(0, 10, DATABASE_URL)
 else:
     import sqlite3
     logger.warning("⚠️  DATABASE_URL not set — falling back to SQLite")
@@ -29,7 +44,7 @@ else:
 @contextmanager
 def get_conn():
     if _USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _pool.getconn()
         conn.autocommit = False
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     else:
@@ -43,7 +58,10 @@ def get_conn():
         raise
     finally:
         cur.close()
-        conn.close()
+        if _USE_POSTGRES:
+            _pool.putconn(conn)
+        else:
+            conn.close()
 
 
 def _sqlite_conn():
