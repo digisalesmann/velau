@@ -36,3 +36,6 @@ register_limiter       = RateLimiter(max_attempts=10, window_seconds=3600)   # 1
 twofa_limiter          = RateLimiter(max_attempts=8,  window_seconds=300)    # 8 tries / 5 min per username
 forgot_password_limiter = RateLimiter(max_attempts=5, window_seconds=3600)   # 5 requests / hour per email
 reset_password_limiter  = RateLimiter(max_attempts=5, window_seconds=900)    # 5 code guesses / 15 min per email
+change_password_limiter = RateLimiter(max_attempts=8, window_seconds=300)    # 8 tries / 5 min per username — a
+                                                                              # stolen/leaked JWT shouldn't be enough
+                                                                              # to brute-force the real password

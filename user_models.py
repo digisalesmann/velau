@@ -15,7 +15,10 @@ from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
 from database import get_user, user_exists, create_user, is_admin as db_is_admin
 import database as db
-from rate_limit import login_limiter, register_limiter, forgot_password_limiter, reset_password_limiter
+from rate_limit import (
+    login_limiter, register_limiter, forgot_password_limiter,
+    reset_password_limiter, change_password_limiter,
+)
 
 logger = logging.getLogger("Auth")
 pwd_context = PasswordHash([BcryptHasher()])
@@ -54,6 +57,10 @@ class ResetPasswordRequest(BaseModel):
     username:     str
     code:         str
     new_password: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password:      str
 
 
 # ── Password ───────────────────────────────────────────────────────────────────
@@ -198,6 +205,25 @@ async def reset_password(req: ResetPasswordRequest):
     db.set_password(req.username, get_password_hash(req.new_password))
     db.mark_password_reset_used(row["id"])
     reset_password_limiter.reset(req.username.lower())
+    return {"ok": True}
+
+
+@router.post("/auth/change-password")
+async def change_password(req: ChangePasswordRequest, user: User = Depends(get_current_user)):
+    """
+    For a logged-in user who knows their current password — distinct from
+    /auth/reset-password, which is for a logged-out user proving identity
+    via an emailed code instead.
+    """
+    change_password_limiter.check(user.username.lower())
+
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    if not verify_password(req.current_password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    db.set_password(user.username, get_password_hash(req.new_password))
+    change_password_limiter.reset(user.username.lower())
     return {"ok": True}
 
 
