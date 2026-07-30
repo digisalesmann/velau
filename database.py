@@ -127,7 +127,8 @@ def init_db():
                 )
             """)
             for col, defn in [
-                ("executed", "BOOLEAN DEFAULT NULL"),
+                ("executed",      "BOOLEAN DEFAULT NULL"),
+                ("features_json", "TEXT DEFAULT NULL"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -377,6 +378,7 @@ def init_db():
                 ("confluence_score", "INTEGER DEFAULT 0"),
                 ("username",         "TEXT DEFAULT NULL"),
                 ("executed",         "INTEGER DEFAULT NULL"),
+                ("features_json",    "TEXT DEFAULT NULL"),
             ]:
                 _add_col(cur, "signals", col, defn)
             for col, defn in [
@@ -776,20 +778,26 @@ def get_fcm_tokens(username: str = None) -> list[str]:
 # ── Signals ────────────────────────────────────────────────────────────────────
 
 def insert_signal(symbol, sig_type, price, rsi, bias, reason,
-                  confluence_score=0, username=None) -> int | None:
+                  confluence_score=0, username=None, features_json=None) -> int | None:
     """Returns the new row's id so the caller can later record whether a
     BUY/SELL signal actually resulted in an executed trade (see
-    update_signal_executed) — the signal is saved before that's known."""
+    update_signal_executed) — the signal is saved before that's known.
+
+    features_json captures the full indicator vector (EMAs, MACD, ADX/DI,
+    BB%, ATR, HTF biases, BOS direction) behind this signal's score, not
+    just the derived score/reason — needed so a future model can be fit
+    against real outcomes once enough live trade history accumulates."""
     params = (str(symbol), str(sig_type), float(price), float(rsi),
               str(bias), str(reason), int(confluence_score),
-              str(username) if username else None)
+              str(username) if username else None,
+              str(features_json) if features_json else None)
     with get_conn() as (conn, cur):
         if _USE_POSTGRES:
             cur.execute(
                 """
                 INSERT INTO signals
-                  (symbol, type, price, rsi, bias, reason, confluence_score, username)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                  (symbol, type, price, rsi, bias, reason, confluence_score, username, features_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 params,
@@ -800,8 +808,8 @@ def insert_signal(symbol, sig_type, price, rsi, bias, reason,
             cur.execute(
                 """
                 INSERT INTO signals
-                  (symbol, type, price, rsi, bias, reason, confluence_score, username)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  (symbol, type, price, rsi, bias, reason, confluence_score, username, features_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 params,
             )

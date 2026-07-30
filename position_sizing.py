@@ -83,6 +83,8 @@ def calculate_stake(
     win_rate: float = 0.0,
     in_recovery: bool = False,
     consecutive_wins: int = 0,
+    atr: float = None,
+    atr_ceiling: float = None,
 ) -> tuple[float, str]:
     """
     Calculate optimal stake for next binary options trade.
@@ -93,6 +95,14 @@ def calculate_stake(
                           Used to scale down if win rate is concerning
         in_recovery:      True after a loss, until consecutive_wins threshold
         consecutive_wins: Wins in a row (used to exit recovery)
+        atr:              Current ATR reading, if available
+        atr_ceiling:      The strategy's hard volatility veto threshold (trades
+                          above this are already blocked before staking is ever
+                          computed — see MAX_SAFE_ATR in core/strategy_engine.py).
+                          When both are given, stake is scaled down as ATR
+                          approaches that ceiling, so the choppy/news-adjacent
+                          zone just below the hard cutoff still gets sized more
+                          cautiously instead of treated the same as calm markets.
 
     Returns:
         (stake_amount, tier_label) tuple
@@ -123,6 +133,19 @@ def calculate_stake(
     # ── Calculate raw stake ────────────────────────────────────────────────────
     raw_stake = balance * risk_pct
 
+    # ── Volatility scaling ─────────────────────────────────────────────────────
+    # Linearly cut stake from 100% down to a 50% floor as ATR climbs through the
+    # top half of the range below the hard veto ceiling. Below that ceiling every
+    # trade currently gets sized identically regardless of how close to it the
+    # market actually is — this makes the riskier half of the "still tradeable"
+    # range cost less without ever fully zeroing the stake (the hard gate already
+    # owns the "too dangerous to trade at all" decision).
+    vol_mult = 1.0
+    if atr is not None and atr_ceiling:
+        atr_ratio = atr / atr_ceiling
+        vol_mult  = 1.0 if atr_ratio <= 0.5 else max(0.5, 1.0 - (atr_ratio - 0.5))
+        raw_stake *= vol_mult
+
     # Apply absolute bounds
     stake = max(MIN_STAKE, min(MAX_STAKE, raw_stake))
     stake = _round_stake(stake)
@@ -130,6 +153,7 @@ def calculate_stake(
     logger.info(
         f"💰 Stake ${stake:.2f} | tier={tier_label} ({risk_pct:.0%}) | "
         f"balance=${balance:.2f} | wr={win_rate:.1%} | "
+        f"vol_mult={vol_mult:.2f} | "
         f"recovery={'YES (' + str(consecutive_wins) + '/' + str(WINS_TO_EXIT_RECOVERY) + ')' if in_recovery else 'NO'}"
     )
 

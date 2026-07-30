@@ -94,3 +94,6 @@ render-build/
 # Flutter & Firebase sensitive files
 android/app/google-services.json
 ios/Runner/GoogleService-Info.plist
+
+# Regenerable historical-candle cache (see backtest/fetch_history.py)
+backtest/data/

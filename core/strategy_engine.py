@@ -6,14 +6,47 @@ Timeframe stack:
   1H  candles → session trend direction
   15M candles → primary entry/exit signals
 
-Confluence scoring (5/7 required):
+Confluence scoring (4/4 required — unanimous):
   1. 4H EMA trend  — price vs EMA50 on 4H  [REQUIRED — must match direction]
   2. 1H EMA trend  — EMA50 vs EMA100 on 1H [REQUIRED — must match or be neutral]
   3. RSI momentum  — RSI14 > 55 (bull) / < 45 (bear) on 15M (conviction zone)
   4. MACD momentum — both histogram AND line above/below zero on 15M
-  5. Bollinger Band — price pulls back below/above mid-band in trend direction
-  6. ADX trend     — ADX > 25 + DI alignment confirms trending market
-  7. BOS structure — fresh break of 20-candle swing high/low on 15M
+
+Bollinger-pullback, ADX/DI, BOS structure, and pivot-point factors were
+removed after backtesting a full year of real Deriv frxXAUUSD data
+(backtest/engine.py) showed each one was either noise (flat win rate
+whether it agreed with the trade or not) or actively counterproductive
+(win rate *lower* when it agreed) — see backtest/data/ and the ablation
+results for the full breakdown. Only RSI and MACD showed a real positive
+correlation between agreement and winning, hence unanimous 4/4 rather than
+a partial-majority score.
+
+CALL-only: backtesting also showed a large, consistent asymmetry — CALL
+signals won 51.1% vs PUT at 43.5% over the same year — so PUT signals are
+not taken at all for now (see the CALL-only gate in execute_trade_cycle).
+
+Two further refinements, layered on top of the above:
+  - Session hours narrowed to 11:00-12:00 and 14:00-17:00 UTC only, after
+    an hour-by-hour breakdown showed 09:00-10:00 and 12:00-13:00 UTC
+    backtesting well below break-even (45-46%) while these hours ran
+    57-60%.
+  - RSI and MACD (the two factors with real signal) must ALSO agree on the
+    1H timeframe, not just 15M — a stricter, higher-conviction version of
+    exactly the two things already confirmed to work, rather than adding
+    a new indicator type.
+
+Combined, these backtested at 62.3% win rate (231 trades over the year),
+profitable in BOTH halves of the year independently (64.3% / 60.3%) — the
+first configuration tested that crossed the 57.1% break-even line, and did
+so consistently rather than in one lucky stretch. Caveat, stated plainly:
+this was the best-performing configuration found after testing several
+hypotheses (contract duration, multi-timeframe confirmation, session
+narrowing, and their combination) — that "best of several tested" framing
+means this looks somewhat better than its true underlying edge by
+construction, and 231 trades is a smaller sample than the ~1300 the
+un-narrowed version traded. Treat this as the best evidence available, not
+as proven — trade frequency is also much lower now (roughly 1 trade every
+1.5 days) as a direct consequence.
 
 Trade contract: frxXAUUSD CALL/PUT, 15-minute expiry (matches analysis candle).
 
@@ -31,13 +64,14 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import asyncio
+import json
 import logging
 import pandas as pd
 from datetime import datetime, timezone
 
-from ta.trend      import EMAIndicator, MACD, ADXIndicator
+from ta.trend      import EMAIndicator, MACD
 from ta.momentum   import RSIIndicator
-from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volatility import AverageTrueRange
 
 from brokers.deriv_trading_service import DerivTradingService
 from position_sizing               import (
@@ -49,14 +83,16 @@ from core import notifications as notif
 logger = logging.getLogger("XAUStrategy")
 
 ANALYSIS_SYMBOL        = "frxXAUUSD"
-MIN_CONFLUENCE         = 5          # 5/7 — high-quality signals only
+MIN_CONFLUENCE         = 4          # 4/4 — unanimous among the 4 factors backtesting
+                                    # confirmed actually carry signal (see module docstring)
+CALL_ONLY              = True       # backtesting found PUT signals unprofitable; see docstring
 LOOP_INTERVAL          = 300        # 5-minute cycles
 MAX_CONSECUTIVE_LOSSES = 3
 MAX_DAILY_DRAWDOWN_PCT = 10.0
-SESSIONS               = [(8, 17)]  # Skip volatile London open hour; NY close at 17
-SWING_LOOKBACK         = 20         # 5-hour structure look-back on 15M candles
+SESSIONS               = [(11, 12), (14, 17)]  # backtested hours only — see docstring;
+                                    # 09-10 and 12-13 UTC backtested well below break-even
 MAX_SAFE_ATR           = 20.0       # filter extreme volatility spikes
-ADX_TREND_THRESHOLD    = 25         # industry standard: trending market threshold
+REQUIRE_1H_CONFIRMATION = True      # RSI/MACD must also agree on 1H, not just 15M — see docstring
 
 
 class XAUMasterStrategy:
@@ -122,12 +158,13 @@ class XAUMasterStrategy:
         return stake, tier
 
     # ── DB helpers ─────────────────────────────────────────────────────────────
-    def save_signal(self, sig_type, price, rsi, bias, reason, score=0) -> int | None:
+    def save_signal(self, sig_type, price, rsi, bias, reason, score=0, features: dict = None) -> int | None:
         try:
             return db.insert_signal(
                 ANALYSIS_SYMBOL, sig_type,
                 float(price), float(rsi), str(bias),
-                f"[{int(score)}/7] {reason}", int(score),
+                f"[{int(score)}/4] {reason}", int(score),
+                features_json=json.dumps(features) if features else None,
             )
         except Exception as e:
             logger.error(f"Signal DB error: {e}")
@@ -188,19 +225,9 @@ class XAUMasterStrategy:
         df["MACD_H"]  = macd.macd_diff()
         df["MACD_L"]  = macd.macd()      # MACD line (for zero-cross)
 
-        # Volatility / range
+        # Volatility / range — still used for the volatility gate and
+        # vol-scaled stake sizing, even though it's no longer a scoring factor
         df["ATR_14"]  = AverageTrueRange(high=h, low=l, close=c, window=14).average_true_range()
-        bb = BollingerBands(close=c, window=20, window_dev=2)
-        df["BB_MID"]  = bb.bollinger_mavg()
-        df["BB_UP"]   = bb.bollinger_hband()
-        df["BB_LO"]   = bb.bollinger_lband()
-        df["BB_PCT"]  = bb.bollinger_pband()   # 0=lower band, 1=upper band
-
-        # Trend strength
-        adx = ADXIndicator(high=h, low=l, close=c, window=14)
-        df["ADX"]     = adx.adx()
-        df["DI_PLUS"] = adx.adx_pos()
-        df["DI_MINUS"]= adx.adx_neg()
 
         df.dropna(inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -242,22 +269,27 @@ class XAUMasterStrategy:
             logger.warning(f"1H bias error: {e}")
             return "neutral"
 
-    # ── Structure detection ────────────────────────────────────────────────────
-    def _detect_bos(self, df):
-        """Fresh break of structure on current 15M candle only."""
-        if len(df) < SWING_LOOKBACK + 5:
-            return "", "No BOS"
-        recent     = df.tail(SWING_LOOKBACK + 5).reset_index(drop=True)
-        cur        = float(recent["close"].iloc[-1])
-        prev       = float(recent["close"].iloc[-2])
-        lookback   = recent.iloc[:-2]
-        swing_high = float(lookback["high"].max())
-        swing_low  = float(lookback["low"].min())
-        if cur > swing_high and prev <= swing_high:
-            return "bull", f"BOS broke {swing_high:.2f}"
-        if cur < swing_low and prev >= swing_low:
-            return "bear", f"BOS broke {swing_low:.2f}"
-        return "", "No fresh BOS"
+    async def _get_1h_momentum(self, service) -> tuple[float | None, float | None, float | None]:
+        """RSI14/MACD on 1H candles — only called to confirm an
+        already-qualifying 15M signal also has momentum agreement one
+        timeframe up (see module docstring); returns (None, None, None)
+        on any failure so the caller can treat that as unconfirmed."""
+        try:
+            df = await self._get_candles(service, gran=3600, count=220)
+            if df.empty or len(df) < 35:
+                return None, None, None
+            df["RSI_14"] = RSIIndicator(close=df["close"], window=14).rsi()
+            macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+            df["MACD_H"] = macd.macd_diff()
+            df["MACD_L"] = macd.macd()
+            df.dropna(inplace=True)
+            if df.empty:
+                return None, None, None
+            row = df.iloc[-1]
+            return float(row["RSI_14"]), float(row["MACD_H"]), float(row["MACD_L"])
+        except Exception as e:
+            logger.warning(f"1H momentum error: {e}")
+            return None, None, None
 
     # ── Confluence scorer ──────────────────────────────────────────────────────
     def _score(self, df: pd.DataFrame, h1_bias: str, h4_bias: str) -> tuple:
@@ -269,16 +301,10 @@ class XAUMasterStrategy:
         rsi     = float(row["RSI_14"])
         macd_h  = float(row["MACD_H"])
         macd_l  = float(row["MACD_L"])
-        adx     = float(row["ADX"])
-        di_plus = float(row["DI_PLUS"])
-        di_minus= float(row["DI_MINUS"])
-        bb_pct  = float(row["BB_PCT"])
-        bb_mid  = float(row["BB_MID"])
 
         logger.info(
-            f"📊 Price={price:.2f} RSI={rsi:.1f} ADX={adx:.1f} "
-            f"EMA50={ema50:.2f} EMA100={ema100:.2f} "
-            f"MACD_H={macd_h:.4f} BB%={bb_pct:.2f}"
+            f"📊 Price={price:.2f} RSI={rsi:.1f} "
+            f"EMA50={ema50:.2f} EMA100={ema100:.2f} MACD_H={macd_h:.4f}"
         )
 
         # 1. 4H macro bias (strong trend filter)
@@ -306,31 +332,13 @@ class XAUMasterStrategy:
         elif macd_h < 0 and macd_l < 0:
             bear_r.append(f"MACD below zero, histogram negative")
 
-        # 5. Bollinger Band pullback-to-midband in trend direction only
-        # BB extremes (oversold/overbought) removed — catch falling knives in binary options
-        if bb_pct < 0.45 and h1_bias == "bullish":
-            bull_r.append(f"Price below BB mid in uptrend (pullback entry)")
-        elif bb_pct > 0.55 and h1_bias == "bearish":
-            bear_r.append(f"Price above BB mid in downtrend (pullback entry)")
+        features = {
+            "price": price, "ema50": ema50, "ema100": ema100, "rsi": rsi,
+            "macd_h": macd_h, "macd_l": macd_l,
+            "h1_bias": h1_bias, "h4_bias": h4_bias,
+        }
 
-        # 6. ADX + DI direction — trend strength
-        if adx > ADX_TREND_THRESHOLD:
-            if di_plus > di_minus:
-                bull_r.append(f"ADX {adx:.1f} trending, +DI > -DI (bullish pressure)")
-            elif di_minus > di_plus:
-                bear_r.append(f"ADX {adx:.1f} trending, -DI > +DI (bearish pressure)")
-        else:
-            logger.info(f"⚠️  ADX {adx:.1f} < {ADX_TREND_THRESHOLD} (choppy market, ADX factor neutral)")
-
-        # 7. Fresh BOS structure break
-        bos_dir, bos_desc = self._detect_bos(df)
-        if bos_dir == "bull":
-            bull_r.append(bos_desc)
-        elif bos_dir == "bear":
-            bear_r.append(bos_desc)
-        logger.info(f"🏗  BOS: {bos_desc}")
-
-        return len(bull_r), len(bear_r), bull_r, bear_r
+        return len(bull_r), len(bear_r), bull_r, bear_r, features
 
     # ── Contract monitor ───────────────────────────────────────────────────────
     async def _monitor_contract(self, token: str, account_type: str, contract_id, stake, username: str = ""):
@@ -460,7 +468,7 @@ class XAUMasterStrategy:
         return []
 
     async def _place_for_user(self, username: str, token: str, account_type: str,
-                               direction: str, score: int) -> bool:
+                               direction: str, score: int, atr: float = None) -> bool:
         """Place a trade. Returns True if a monitor task was started, False on failure."""
         svc = DerivTradingService(token=token, account_type=account_type)
         try:
@@ -473,6 +481,8 @@ class XAUMasterStrategy:
                 win_rate         = self._win_rate,
                 in_recovery      = self._in_recovery,
                 consecutive_wins = self._consecutive_wins,
+                atr              = atr,
+                atr_ceiling      = MAX_SAFE_ATR,
             )
             result      = await svc.place_order(direction, stake)
             contract_id = result.get("buy", {}).get("contract_id", "unknown")
@@ -483,7 +493,7 @@ class XAUMasterStrategy:
                     notif.notify_user,
                     username,
                     f"Trade Placed {'CALL ↑' if direction == 'CALL' else 'PUT ↓'}",
-                    f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/7",
+                    f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/4",
                     {"type": "trade_executed", "direction": direction},
                 )
             except Exception as e:
@@ -602,7 +612,6 @@ class XAUMasterStrategy:
             price = float(row["close"])
             rsi   = float(row["RSI_14"])
             atr   = float(row["ATR_14"])
-            adx   = float(row["ADX"])
 
             # ── Volatility gate ────────────────────────────────────────────────
             if atr > MAX_SAFE_ATR:
@@ -612,8 +621,9 @@ class XAUMasterStrategy:
                 return
 
             # ── Score confluence ───────────────────────────────────────────────
-            bull_score, bear_score, bull_r, bear_r = self._score(df, h1_bias, h4_bias)
-            logger.info(f"🔢 BULL={bull_score}/7 BEAR={bear_score}/7 need {MIN_CONFLUENCE}")
+            bull_score, bear_score, bull_r, bear_r, features = self._score(df, h1_bias, h4_bias)
+            features["atr"] = atr
+            logger.info(f"🔢 BULL={bull_score}/4 BEAR={bear_score}/4 need {MIN_CONFLUENCE}")
 
             # ── Hard bias filter — 4H macro trend must be directional ──────────
             # 4H must be strictly bullish/bearish (no neutral allowed — that's sideways).
@@ -626,42 +636,60 @@ class XAUMasterStrategy:
             if bull_score >= MIN_CONFLUENCE and bull_score > bear_score:
                 if biases_agree_bull:
                     direction, reasons, score = "CALL", bull_r, bull_score
-                    logger.info(f"🟢 CALL [{score}/7] | 4H={h4_bias} 1H={h1_bias}")
+                    logger.info(f"🟢 CALL [{score}/4] | 4H={h4_bias} 1H={h1_bias}")
                 else:
                     self.save_signal("NEUTRAL", price, rsi, h1_bias,
-                        f"15M bull ({bull_score}/7) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
-                        bull_score)
+                        f"15M bull ({bull_score}/4) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
+                        bull_score, features)
                     return
 
             elif bear_score >= MIN_CONFLUENCE and bear_score > bull_score:
                 if biases_agree_bear:
                     direction, reasons, score = "PUT", bear_r, bear_score
-                    logger.info(f"🔴 PUT [{score}/7] | 4H={h4_bias} 1H={h1_bias}")
+                    logger.info(f"🔴 PUT [{score}/4] | 4H={h4_bias} 1H={h1_bias}")
                 else:
                     self.save_signal("NEUTRAL", price, rsi, h1_bias,
-                        f"15M bear ({bear_score}/7) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
-                        bear_score)
+                        f"15M bear ({bear_score}/4) blocked by HTF bias (4H={h4_bias} 1H={h1_bias})",
+                        bear_score, features)
+                    return
+
+            if direction == "PUT" and CALL_ONLY:
+                logger.info(f"⛔ PUT [{score}/4] skipped — CALL-only mode")
+                self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                    f"PUT ({score}/4) skipped — CALL-only mode (backtested PUT win rate below break-even)",
+                    score, features)
+                return
+
+            if direction and REQUIRE_1H_CONFIRMATION:
+                h1_rsi, h1_macd_h, h1_macd_l = await self._get_1h_momentum(service)
+                confirmed = h1_rsi is not None and (
+                    (direction == "CALL" and h1_rsi > 55 and h1_macd_h > 0 and h1_macd_l > 0) or
+                    (direction == "PUT" and h1_rsi < 45 and h1_macd_h < 0 and h1_macd_l < 0)
+                )
+                if not confirmed:
+                    logger.info(f"⛔ {direction} [{score}/4] lacks 1H RSI/MACD confirmation — skipping")
+                    self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                        f"{direction} ({score}/4) lacks 1H RSI/MACD confirmation", score, features)
                     return
 
             if direction:
                 # ── News sentiment filter (before lock or signal save) ──────────────
-                sentiment     = self._get_cached_sentiment()
-                news_overall  = sentiment.get("overall", "Neutral")
-                sentiment_min = MIN_CONFLUENCE + 1   # raise bar when news disagrees
+                # Confluence is already unanimous (score is always MIN_CONFLUENCE, the
+                # max possible with 4 factors) — there's no higher bar left to clear,
+                # so outright news disagreement blocks the trade rather than the old
+                # "raise the bar" escalation, which no longer has room to raise into.
+                sentiment    = self._get_cached_sentiment()
+                news_overall = sentiment.get("overall", "Neutral")
                 if direction == "CALL" and news_overall == "Bearish":
-                    if score < sentiment_min:
-                        logger.warning(f"⚠️  Bearish news opposes CALL ({score}/7 < {sentiment_min}) — skipping")
-                        self.save_signal("NEUTRAL", price, rsi, h1_bias,
-                            f"News sentiment Bearish — CALL needs {sentiment_min}/7, got {score}/7", score)
-                        return
-                    logger.info(f"📰 News Bearish but CALL has high confluence ({score}/7) — proceeding")
+                    logger.warning(f"⚠️  Bearish news opposes CALL [{score}/4] — skipping")
+                    self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                        f"News sentiment Bearish opposes CALL ({score}/4)", score, features)
+                    return
                 elif direction == "PUT" and news_overall == "Bullish":
-                    if score < sentiment_min:
-                        logger.warning(f"⚠️  Bullish news opposes PUT ({score}/7 < {sentiment_min}) — skipping")
-                        self.save_signal("NEUTRAL", price, rsi, h1_bias,
-                            f"News sentiment Bullish — PUT needs {sentiment_min}/7, got {score}/7", score)
-                        return
-                    logger.info(f"📰 News Bullish but PUT has high confluence ({score}/7) — proceeding")
+                    logger.warning(f"⚠️  Bullish news opposes PUT [{score}/4] — skipping")
+                    self.save_signal("NEUTRAL", price, rsi, h1_bias,
+                        f"News sentiment Bullish opposes PUT ({score}/4)", score, features)
+                    return
                 elif news_overall != "Neutral":
                     logger.info(f"📰 Sentiment {news_overall} aligns with {direction}")
 
@@ -671,7 +699,7 @@ class XAUMasterStrategy:
                 # an executed trade — "qualified" and "executed" are not the same
                 # thing, and the mobile app's badge must reflect the latter.
                 signal_id = self.save_signal(signal_type, price, rsi, h1_bias,
-                    " | ".join(reasons), score)
+                    " | ".join(reasons), score, features)
 
                 eligible = [
                     u for u in all_users
@@ -688,7 +716,7 @@ class XAUMasterStrategy:
                     return
 
                 logger.info(
-                    f"🚀 {direction} | confluence={score}/7 | ADX={adx:.1f} | "
+                    f"🚀 {direction} | confluence={score}/4 | "
                     f"accounts={len(eligible)}/{len(all_users)}"
                 )
                 self._trade_in_progress = True
@@ -696,7 +724,7 @@ class XAUMasterStrategy:
                 results = await asyncio.gather(
                     *[self._place_for_user(
                         u["username"], u["deriv_token"],
-                        u.get("trade_account_type", "real"), direction, score,
+                        u.get("trade_account_type", "real"), direction, score, atr,
                       ) for u in eligible],
                     return_exceptions=True,
                 )
@@ -716,10 +744,10 @@ class XAUMasterStrategy:
                 top_r   = bull_r if bull_score >= bear_score else bear_r
                 self.save_signal(
                     "NEUTRAL", price, rsi, h1_bias,
-                    f"Leaning {leaning} ({top}/7, need {MIN_CONFLUENCE}). "
-                    + " | ".join(top_r[:3]), top
+                    f"Leaning {leaning} ({top}/4, need {MIN_CONFLUENCE}). "
+                    + " | ".join(top_r[:3]), top, features
                 )
-                logger.info(f"⏳ Waiting — {leaning} {top}/7 (need {MIN_CONFLUENCE})")
+                logger.info(f"⏳ Waiting — {leaning} {top}/4 (need {MIN_CONFLUENCE})")
 
         except Exception as e:
             logger.error(f"❌ Cycle error: {e}")
