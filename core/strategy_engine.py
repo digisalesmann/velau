@@ -95,23 +95,6 @@ MAX_SAFE_ATR           = 20.0       # filter extreme volatility spikes
 REQUIRE_1H_CONFIRMATION = True      # RSI/MACD must also agree on 1H, not just 15M — see docstring
 
 
-class XAUMasterStrategy:
-    def __init__(self):
-        self.is_running          = False
-        self._trade_in_progress  = False
-        self._consecutive_wins   = 0
-        self._in_recovery        = False
-        self._last_session_notif = None
-        self._current_balance    = 0.0
-        self._win_rate           = 0.0
-        self._sentiment_cache: dict = {}
-        self._sentiment_cache_time: datetime | None = None
-
-    def _in_trading_session(self) -> bool:
-        hour = datetime.now(timezone.utc).hour
-        return any(s <= hour < e for s, e in SESSIONS)
-
-
 def get_session_status() -> dict:
     """Single source of truth for session-status display — used by both
     /dashboard and /signals so the UI never drifts from SESSIONS again the
@@ -135,6 +118,23 @@ def get_session_status() -> dict:
         "session_hours": session_hours,
         "mins_to_session": mins_to_session,
     }
+
+
+class XAUMasterStrategy:
+    def __init__(self):
+        self.is_running          = False
+        self._trade_in_progress  = False
+        self._consecutive_wins   = 0
+        self._in_recovery        = False
+        self._last_session_notif = None
+        self._current_balance    = 0.0
+        self._win_rate           = 0.0
+        self._sentiment_cache: dict = {}
+        self._sentiment_cache_time: datetime | None = None
+
+    def _in_trading_session(self) -> bool:
+        hour = datetime.now(timezone.utc).hour
+        return any(s <= hour < e for s, e in SESSIONS)
 
     def _get_cached_sentiment(self) -> dict:
         """Refresh news sentiment at most once every 30 minutes."""
