@@ -977,6 +977,22 @@ def get_pending_subscription_for_user(username: str) -> dict | None:
     )
 
 
+def get_unresolved_subscription_for_user(username: str) -> dict | None:
+    """Like get_pending_subscription_for_user but also includes 'rejected' —
+    the mobile app's own source of truth for its "resume this payment"
+    dashboard banner, so a device that never wrote (or lost) its local
+    pending-payment cache can still discover the order server-side instead
+    of leaving it stranded with no way back to it."""
+    return fetchone(
+        """
+        SELECT * FROM subscriptions
+        WHERE username = ? AND status IN ('pending', 'pending_review', 'rejected')
+        ORDER BY created_at DESC LIMIT 1
+        """,
+        (username,),
+    )
+
+
 def cancel_pending_subscription(payment_id: str, username: str):
     """Mark a pending subscription as cancelled. Only cancels if still pending and owned by user.
     Deliberately does NOT cancel 'pending_review' — once proof is submitted,

@@ -29,6 +29,7 @@ import deriv_cache
 from core import notifications as notif
 import storage
 import coingecko
+import fx_rates
 
 trading_bot = XAUMasterStrategy()
 bot_task: Optional[asyncio.Task] = None
@@ -770,10 +771,60 @@ async def get_session(user=Depends(get_current_user)):
     }
 
 
+@app.get("/subscription/pending")
+async def get_pending_payment(user=Depends(get_current_user)):
+    """Authoritative check for an unresolved order — the mobile dashboard's
+    "resume this payment" banner is seeded from this, not only from its own
+    local cache, so a cleared app / reinstalled device / a crash before that
+    cache was written never leaves a real order with no way back to it."""
+    sub = db.get_unresolved_subscription_for_user(user.username)
+    if not sub:
+        return {"pending": None}
+
+    method = db.get_payment_method(sub["payment_method_id"]) if sub.get("payment_method_id") else None
+    if method:
+        currency_code = method["crypto_currency"] if method["type"] == "crypto" else method["bank_currency"]
+    else:
+        currency_code = None
+
+    return {
+        "pending": {
+            "payment_id":       sub["payment_id"],
+            "plan":             sub["plan"],
+            "status":           sub["status"],
+            "price_usd":        sub["price_usd"],
+            "pay_amount":       sub["pay_amount"],
+            "pay_currency":     sub["pay_currency"],
+            "currency_code":    currency_code,
+            "pay_address":      sub["pay_address"],
+            "method_type":      sub["method_type"],
+            "instructions":     method.get("instructions") if method else None,
+            "bank_name":        method.get("bank_name") if method else None,
+            "crypto_currency":  method.get("crypto_currency") if method else None,
+            "logo_url":         method.get("logo_url") if method else None,
+            "rejection_reason": sub.get("rejection_reason"),
+        }
+    }
+
+
 @app.get("/subscription/methods")
-async def list_payment_methods(user=Depends(get_current_user)):
-    """Enabled payment methods for the checkout picker."""
-    return {"methods": db.get_payment_methods(enabled_only=True)}
+async def list_payment_methods(plan: Optional[str] = None, user=Depends(get_current_user)):
+    """Enabled payment methods for the checkout picker. If `plan` is given,
+    bank_transfer methods get a live-converted preview_amount/preview_currency
+    so the user can compare methods before committing to one — omitted (not
+    an error) when a rate isn't available or no plan was passed."""
+    from payments import PLANS
+
+    methods = db.get_payment_methods(enabled_only=True)
+    price_usd = PLANS.get(plan, {}).get("usd") if plan else None
+    if price_usd is not None:
+        for m in methods:
+            if m["type"] == "bank_transfer" and m.get("bank_currency"):
+                converted = fx_rates.convert_from_usd(price_usd, m["bank_currency"])
+                if converted is not None:
+                    m["preview_amount"] = converted
+                    m["preview_currency"] = m["bank_currency"]
+    return {"methods": methods}
 
 
 @app.post("/subscription/create")
@@ -806,9 +857,18 @@ async def create_subscription(req: SubscriptionCreateRequest,
     payment_id = uuid.uuid4().hex
 
     if method["type"] == "crypto":
-        pay_address  = method["crypto_address"] or ""
-        pay_currency = f'{method["crypto_currency"]} ({method["crypto_network"]})'
+        pay_address    = method["crypto_address"] or ""
+        pay_currency   = f'{method["crypto_currency"]} ({method["crypto_network"]})'
+        pay_amount     = price_usd
+        currency_code  = method["crypto_currency"]
     else:  # bank_transfer
+        currency_code = method["bank_currency"]
+        pay_amount = fx_rates.convert_from_usd(price_usd, currency_code)
+        if pay_amount is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Live exchange rate is temporarily unavailable. Please try again shortly.",
+            )
         lines = [f'Bank: {method["bank_name"]}', f'Account Name: {method["bank_account_name"]}',
                   f'Account Number: {method["bank_account_number"]}']
         if method.get("bank_routing_number"):
@@ -818,7 +878,7 @@ async def create_subscription(req: SubscriptionCreateRequest,
         if method.get("bank_iban"):
             lines.append(f'IBAN: {method["bank_iban"]}')
         pay_address  = "\n".join(lines)
-        pay_currency = f'Bank Transfer ({method["bank_currency"]})'
+        pay_currency = f'Bank Transfer ({currency_code})'
 
     db.create_pending_subscription(
         username=user.username,
@@ -827,7 +887,7 @@ async def create_subscription(req: SubscriptionCreateRequest,
         payment_method_id=method["id"],
         method_type=method["type"],
         pay_address=pay_address,
-        pay_amount=price_usd,
+        pay_amount=pay_amount,
         pay_currency=pay_currency,
         price_usd=price_usd,
     )
@@ -836,8 +896,9 @@ async def create_subscription(req: SubscriptionCreateRequest,
         "payment_id":   payment_id,
         "plan":         req.plan,
         "price_usd":    price_usd,
-        "pay_amount":   price_usd,
+        "pay_amount":   pay_amount,
         "pay_currency": pay_currency,
+        "currency_code": currency_code,
         "pay_address":  pay_address,
         "method_type":  method["type"],
         "instructions": method.get("instructions"),
