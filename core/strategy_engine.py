@@ -111,6 +111,31 @@ class XAUMasterStrategy:
         hour = datetime.now(timezone.utc).hour
         return any(s <= hour < e for s, e in SESSIONS)
 
+
+def get_session_status() -> dict:
+    """Single source of truth for session-status display — used by both
+    /dashboard and /signals so the UI never drifts from SESSIONS again the
+    way the old hardcoded "London open (07:00 UTC)" copy did."""
+    now_utc = datetime.now(timezone.utc)
+    in_session = any(s <= now_utc.hour < e for s, e in SESSIONS)
+    session_hours = ", ".join(f"{s:02d}:00-{e:02d}:00" for s, e in SESSIONS) + " UTC"
+
+    if in_session:
+        mins_to_session = 0
+    else:
+        now_minutes = now_utc.hour * 60 + now_utc.minute
+        starts_today = [s * 60 for s, _ in SESSIONS if s * 60 > now_minutes]
+        if starts_today:
+            mins_to_session = min(starts_today) - now_minutes
+        else:
+            mins_to_session = (24 * 60 - now_minutes) + min(s for s, _ in SESSIONS) * 60
+
+    return {
+        "in_session": in_session,
+        "session_hours": session_hours,
+        "mins_to_session": mins_to_session,
+    }
+
     def _get_cached_sentiment(self) -> dict:
         """Refresh news sentiment at most once every 30 minutes."""
         now = datetime.now(timezone.utc)

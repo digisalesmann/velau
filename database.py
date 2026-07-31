@@ -104,6 +104,10 @@ def init_db():
                 ("avatar_url",    "TEXT DEFAULT NULL"),
                 ("bot_enabled",   "BOOLEAN DEFAULT TRUE"),
                 ("trade_account_type", "TEXT DEFAULT 'real'"),
+                ("trading_experience",  "TEXT DEFAULT NULL"),
+                ("risk_tolerance",      "TEXT DEFAULT NULL"),
+                ("capital_range",       "TEXT DEFAULT NULL"),
+                ("survey_completed_at", "TIMESTAMP DEFAULT NULL"),
             ]:
                 try:
                     cur.execute("SAVEPOINT add_col")
@@ -372,6 +376,10 @@ def init_db():
                 ("avatar_url",   "TEXT DEFAULT NULL"),
                 ("bot_enabled",  "INTEGER DEFAULT 1"),
                 ("trade_account_type", "TEXT DEFAULT 'real'"),
+                ("trading_experience",  "TEXT DEFAULT NULL"),
+                ("risk_tolerance",      "TEXT DEFAULT NULL"),
+                ("capital_range",       "TEXT DEFAULT NULL"),
+                ("survey_completed_at", "DATETIME DEFAULT NULL"),
             ]:
                 _add_col(cur, "users", col, defn)
             for col, defn in [
@@ -494,6 +502,23 @@ def update_avatar_url(username: str, avatar_url: str):
         "UPDATE users SET avatar_url = ? WHERE username = ?",
         (avatar_url, username),
     )
+
+
+def save_user_survey(username: str, trading_experience: str, risk_tolerance: str, capital_range: str):
+    execute(
+        """
+        UPDATE users
+        SET trading_experience = ?, risk_tolerance = ?, capital_range = ?,
+            survey_completed_at = CURRENT_TIMESTAMP
+        WHERE username = ?
+        """,
+        (trading_experience, risk_tolerance, capital_range, username),
+    )
+
+
+def get_survey_completed(username: str) -> bool:
+    row = fetchone("SELECT survey_completed_at FROM users WHERE username = ?", (username,))
+    return bool(row and row.get("survey_completed_at"))
 
 
 # ── Password reset ─────────────────────────────────────────────────────────────

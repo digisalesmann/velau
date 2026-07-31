@@ -23,7 +23,7 @@ logger = logging.getLogger("Main")
 from user_models import User, router as users_router, get_current_user
 from rate_limit import twofa_limiter
 from news.news_pipeline import get_news_and_sentiment
-from core.strategy_engine import XAUMasterStrategy
+from core.strategy_engine import XAUMasterStrategy, get_session_status
 import database as db
 import deriv_cache
 from core import notifications as notif
@@ -135,6 +135,7 @@ class DashboardResponse(BaseModel):
     consecutive_losses:  int = 0
     trade_in_progress:   bool = False
     in_session:          bool = True
+    session_hours:       str = ""
     deriv_connected:     bool = False
     display_name:        Optional[str] = None
     avatar_url:           Optional[str] = None
@@ -151,6 +152,11 @@ class AvatarUploadRequest(BaseModel):
 
 class TradeModeRequest(BaseModel):
     mode: str  # "demo" or "real"
+
+class SurveyRequest(BaseModel):
+    trading_experience: str
+    risk_tolerance: str
+    capital_range: str
 
 class TickRequest(BaseModel):
     symbol: str = "frxXAUUSD"
@@ -481,6 +487,7 @@ async def get_dashboard(user=Depends(get_current_user)):
         consecutive_losses=int(risk["consecutive_losses"]),
         trade_in_progress=trading_bot._trade_in_progress,
         in_session=trading_bot._in_trading_session(),
+        session_hours=get_session_status()["session_hours"],
         deriv_connected=bool(deriv_token),
         display_name=profile.get("display_name"),
         avatar_url=profile.get("avatar_url"),
@@ -523,6 +530,28 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
 
     db.update_avatar_url(user.username, avatar_url)
     return {"avatar_url": avatar_url}
+
+
+_TRADING_EXPERIENCE = {"new", "some_experience", "experienced"}
+_RISK_TOLERANCE = {"conservative", "balanced", "aggressive"}
+_CAPITAL_RANGE = {"under_100", "100_1000", "1000_10000", "10000_plus"}
+
+@app.post("/account/survey")
+async def submit_survey(req: SurveyRequest, user=Depends(get_current_user)):
+    """Post-signup risk/suitability questionnaire — informational only, does
+    not affect the trading strategy (that's global, not user-configurable)."""
+    if req.trading_experience not in _TRADING_EXPERIENCE:
+        raise HTTPException(status_code=400, detail="Invalid trading_experience value.")
+    if req.risk_tolerance not in _RISK_TOLERANCE:
+        raise HTTPException(status_code=400, detail="Invalid risk_tolerance value.")
+    if req.capital_range not in _CAPITAL_RANGE:
+        raise HTTPException(status_code=400, detail="Invalid capital_range value.")
+    db.save_user_survey(user.username, req.trading_experience, req.risk_tolerance, req.capital_range)
+    return {
+        "trading_experience": req.trading_experience,
+        "risk_tolerance": req.risk_tolerance,
+        "capital_range": req.capital_range,
+    }
 
 
 @app.get("/open_contracts")
@@ -592,28 +621,12 @@ async def get_news():
 @app.get("/signals")
 async def get_signals(user=Depends(get_current_user)):
     try:
-        from datetime import timezone as tz
-        from core.strategy_engine import SESSIONS
-        now_utc  = datetime.now(tz.utc)
-        hour_utc = now_utc.hour
-        in_session = trading_bot._in_trading_session()
-
-        # Single source of truth for the trading window — must match SESSIONS
-        # in core/strategy_engine.py, which is what actually gates the bot.
-        session_start_utc, session_end_utc = SESSIONS[0]
-        if hour_utc < session_start_utc:
-            mins_to_session = (session_start_utc - hour_utc) * 60 - now_utc.minute
-        elif hour_utc >= session_end_utc:
-            # After NY session — next is tomorrow London
-            mins_to_session = (24 - hour_utc + session_start_utc) * 60 - now_utc.minute
-        else:
-            mins_to_session = 0  # in session
-
+        status = get_session_status()
         return {
             "signals":         db.get_signals(limit=30, username=user.username),
-            "in_session":      in_session,
-            "session_hours":   f"{session_start_utc:02d}:00-{session_end_utc:02d}:00 UTC (London + NY)",
-            "mins_to_session": mins_to_session if not in_session else 0,
+            "in_session":      status["in_session"],
+            "session_hours":   status["session_hours"],
+            "mins_to_session": status["mins_to_session"],
             "bot_running":     trading_bot.is_running,
         }
     except Exception as e:
@@ -763,11 +776,14 @@ async def get_session(user=Depends(get_current_user)):
         sub = db.get_active_subscription(user.username)
         subscription_active, plan = bool(sub), (sub["plan"] if sub else None)
 
+    survey_completed = db.get_survey_completed(user.username)
+
     return {
         "tfa_enabled":         tfa_enabled,
         "subscription_active": subscription_active,
         "plan":                plan,
         "is_admin":            admin,
+        "survey_completed":    survey_completed,
     }
 
 
