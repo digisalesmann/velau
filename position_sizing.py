@@ -85,6 +85,7 @@ def calculate_stake(
     consecutive_wins: int = 0,
     atr: float = None,
     atr_ceiling: float = None,
+    trade_count: int = 0,
 ) -> tuple[float, str]:
     """
     Calculate optimal stake for next binary options trade.
@@ -103,6 +104,10 @@ def calculate_stake(
                           approaches that ceiling, so the choppy/news-adjacent
                           zone just below the hard cutoff still gets sized more
                           cautiously instead of treated the same as calm markets.
+        trade_count:      Total settled trades so far. The win-rate safety
+                          check below only engages once this is meaningful
+                          (20+) — on a small sample, a dip below 50% is just
+                          noise, not evidence the strategy is broken.
 
     Returns:
         (stake_amount, tier_label) tuple
@@ -113,14 +118,20 @@ def calculate_stake(
     # ── Win rate safety check ──────────────────────────────────────────────────
     # If we have enough trade history and win rate is below break-even (57.1%),
     # force minimum sizing until the strategy proves itself again.
-    # Only apply this check if we have meaningful sample size (20+ trades).
-    if win_rate > 0 and win_rate < 0.50:
+    # Bug fixed 2026-08-17: this branch computed balance*1% with no upper
+    # bound, so on any balance above ~$2,500 it staked *more* than the
+    # normal $50-capped tier — the opposite of what "caution" is supposed to
+    # do. On an ~$8,300 balance this staked ~$83/trade, which is exactly what
+    # a live trade-log audit caught. Now goes through the same MAX_STAKE cap
+    # as every other branch, and only engages past the 20-trade sample size
+    # the comment above always said it should (never actually implemented).
+    if win_rate > 0 and win_rate < 0.50 and trade_count >= 20:
         # Below 50% win rate — drop to minimum sizing, strategy may be broken
-        stake = max(MIN_STAKE, balance * 0.01)
+        stake = max(MIN_STAKE, min(MAX_STAKE, balance * 0.01))
         stake = _round_stake(stake)
         logger.warning(
-            f"⚠️  Win rate {win_rate:.1%} below 50%, applying "
-            f"minimum sizing ${stake:.2f} until strategy recovers"
+            f"⚠️  Win rate {win_rate:.1%} below 50% over {trade_count} trades, "
+            f"applying minimum sizing ${stake:.2f} until strategy recovers"
         )
         return stake, "WIN_RATE_CAUTION"
 

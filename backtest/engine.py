@@ -246,6 +246,7 @@ def run_backtest(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame,
         stake, tier = calculate_stake(
             balance=balance, win_rate=win_rate, in_recovery=in_recovery,
             consecutive_wins=consecutive_wins, atr=atr, atr_ceiling=MAX_SAFE_ATR,
+            trade_count=len(trades),
         )
 
         pnl = stake * PAYOUT_PCT if won else -stake

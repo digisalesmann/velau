@@ -129,6 +129,7 @@ class XAUMasterStrategy:
         self._last_session_notif = None
         self._current_balance    = 0.0
         self._win_rate           = 0.0
+        self._trade_count        = 0
         self._sentiment_cache: dict = {}
         self._sentiment_cache_time: datetime | None = None
 
@@ -170,8 +171,10 @@ class XAUMasterStrategy:
         try:
             stats = db.get_trade_stats()
             self._win_rate = stats["win_rate"] / 100.0
+            self._trade_count = int(stats.get("total_trades", 0))
         except Exception:
             self._win_rate = 0.0
+            self._trade_count = 0
 
     def _get_stake(self) -> tuple[float, str]:
         stake, tier = calculate_stake(
@@ -179,6 +182,7 @@ class XAUMasterStrategy:
             win_rate         = self._win_rate,
             in_recovery      = self._in_recovery,
             consecutive_wins = self._consecutive_wins,
+            trade_count      = self._trade_count,
         )
         return stake, tier
 
@@ -508,6 +512,7 @@ class XAUMasterStrategy:
                 consecutive_wins = self._consecutive_wins,
                 atr              = atr,
                 atr_ceiling      = MAX_SAFE_ATR,
+                trade_count      = self._trade_count,
             )
             result      = await svc.place_order(direction, stake)
             contract_id = result.get("buy", {}).get("contract_id", "unknown")
