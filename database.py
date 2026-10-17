@@ -244,6 +244,27 @@ def init_db():
                     updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trend_positions (
+                    contract_id     TEXT NOT NULL,
+                    username        TEXT NOT NULL,
+                    sleeve          TEXT NOT NULL,
+                    entry_bar_epoch BIGINT NOT NULL,
+                    entry_price     REAL NOT NULL,
+                    stop_mult       REAL NOT NULL,
+                    initial_stop    REAL NOT NULL,
+                    trail_stop      REAL DEFAULT NULL,
+                    risk            REAL NOT NULL,
+                    stake           REAL NOT NULL,
+                    multiplier      INTEGER NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'open',
+                    opened_at       BIGINT NOT NULL,
+                    closed_at       BIGINT DEFAULT NULL,
+                    pnl             REAL DEFAULT NULL,
+                    exit_reason     TEXT DEFAULT NULL,
+                    PRIMARY KEY (contract_id, username)
+                )
+            """)
             for col, defn in [
                 ("logo_url", "TEXT DEFAULT NULL"),
             ]:
@@ -404,6 +425,27 @@ def init_db():
                 ("rejection_reason",  "TEXT DEFAULT NULL"),
             ]:
                 _add_col(cur, "subscriptions", col, defn)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trend_positions (
+                    contract_id     TEXT NOT NULL,
+                    username        TEXT NOT NULL,
+                    sleeve          TEXT NOT NULL,
+                    entry_bar_epoch INTEGER NOT NULL,
+                    entry_price     REAL NOT NULL,
+                    stop_mult       REAL NOT NULL,
+                    initial_stop    REAL NOT NULL,
+                    trail_stop      REAL DEFAULT NULL,
+                    risk            REAL NOT NULL,
+                    stake           REAL NOT NULL,
+                    multiplier      INTEGER NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'open',
+                    opened_at       INTEGER NOT NULL,
+                    closed_at       INTEGER DEFAULT NULL,
+                    pnl             REAL DEFAULT NULL,
+                    exit_reason     TEXT DEFAULT NULL,
+                    PRIMARY KEY (contract_id, username)
+                )
+            """)
             for col, defn in [
                 ("logo_url", "TEXT DEFAULT NULL"),
             ]:
@@ -586,6 +628,51 @@ def set_trade_account_type(username: str, account_type: str):
         "UPDATE users SET trade_account_type = ? WHERE username = ?",
         (account_type, username),
     )
+
+
+# ── Trend positions ────────────────────────────────────────────────────────────
+# Open 4H-trend multiplier positions (core/trend_strategy.py). Persisted, not
+# held in memory, because positions run for days/weeks and must survive
+# Render restarts: the trailing stop is rebuilt from candles + these rows.
+
+def insert_trend_position(contract_id: str, username: str, sleeve: str, entry_bar_epoch: int,
+                          entry_price: float, stop_mult: float, initial_stop: float,
+                          risk: float, stake: float, multiplier: int, opened_at: int):
+    execute(
+        """INSERT INTO trend_positions
+           (contract_id, username, sleeve, entry_bar_epoch, entry_price, stop_mult,
+            initial_stop, risk, stake, multiplier, status, opened_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)""",
+        (str(contract_id), username, sleeve, int(entry_bar_epoch), float(entry_price),
+         float(stop_mult), float(initial_stop), float(risk), float(stake), int(multiplier),
+         int(opened_at)),
+    )
+
+def get_open_trend_positions(username: str = None) -> list[dict]:
+    if username:
+        return fetchall("SELECT * FROM trend_positions WHERE status = 'open' AND username = ?",
+                        (username,))
+    return fetchall("SELECT * FROM trend_positions WHERE status = 'open'")
+
+def close_trend_position(contract_id: str, username: str, closed_at: int, pnl: float, exit_reason: str):
+    execute(
+        """UPDATE trend_positions SET status = 'closed', closed_at = ?, pnl = ?, exit_reason = ?
+           WHERE contract_id = ? AND username = ?""",
+        (int(closed_at), float(pnl), exit_reason, str(contract_id), username),
+    )
+
+def set_trend_trail(contract_id: str, username: str, trail_stop: float):
+    execute("UPDATE trend_positions SET trail_stop = ? WHERE contract_id = ? AND username = ?",
+            (float(trail_stop), str(contract_id), username))
+
+def get_last_trend_exit(username: str, sleeve: str) -> int | None:
+    """Epoch of this user's most recent closed position in this sleeve."""
+    row = fetchone(
+        """SELECT MAX(closed_at) AS last_exit FROM trend_positions
+           WHERE username = ? AND sleeve = ? AND status = 'closed'""",
+        (username, sleeve),
+    )
+    return int(row["last_exit"]) if row and row.get("last_exit") is not None else None
 
 
 # ── Bot control ─────────────────────────────────────────────────────────────────

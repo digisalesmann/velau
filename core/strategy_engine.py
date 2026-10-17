@@ -48,7 +48,13 @@ un-narrowed version traded. Treat this as the best evidence available, not
 as proven — trade frequency is also much lower now (roughly 1 trade every
 1.5 days) as a direct consequence.
 
-Trade contract: frxXAUUSD CALL/PUT, 15-minute expiry (matches analysis candle).
+Trade contract (USE_MULTIPLIERS): frxXAUUSD Multiplier (MULTUP for CALL
+signals) with stop_loss = risk and take_profit = 1.5 x risk, a fixed 1:1.5
+risk-to-reward ratio. The stop sits ~1x ATR(15M) from entry. Sold at market
+after MULT_MAX_HOLD_MINUTES or at MULT_DAILY_CLOSE_UTC_MIN if neither level is
+hit first. Replaced the 15-minute Rise/Fall contract, whose payout Deriv sets
+(a live quote on 2026-10-16 paid 64.6%, so 1:0.65, not the 75% assumed).
+Validated in backtest/multiplier_test.py.
 
 Position sizing tiers:
   $0-50    → 10%   (survival)
@@ -56,8 +62,7 @@ Position sizing tiers:
   $200-1000→  3%   (compound)
   $1000+   →  2%, $50 cap (preservation)
 
-Break-even win rate at 75% payout: 57.1%
-Target: 60%+
+Break-even win rate at 1:1.5: 40.0%
 """
 import sys
 import os
@@ -66,19 +71,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asyncio
 import json
 import logging
+import time
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from ta.trend      import EMAIndicator, MACD
 from ta.momentum   import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-from brokers.deriv_trading_service import DerivTradingService
+from brokers.deriv_trading_service import DerivTradingService, EXECUTION_SYMBOL
+from env_config                    import DERIV_APP_ID
 from position_sizing               import (
-    calculate_stake, WINS_TO_EXIT_RECOVERY
+    calculate_stake, WINS_TO_EXIT_RECOVERY, plan_multiplier_trade,
 )
 import database as db
 from core import notifications as notif
+from core.trend_strategy import TrendTrader
 
 logger = logging.getLogger("XAUStrategy")
 
@@ -93,6 +101,40 @@ SESSIONS               = [(11, 12), (14, 17)]  # backtested hours only — see d
                                     # 09-10 and 12-13 UTC backtested well below break-even
 MAX_SAFE_ATR           = 20.0       # filter extreme volatility spikes
 REQUIRE_1H_CONFIRMATION = True      # RSI/MACD must also agree on 1H, not just 15M — see docstring
+
+# Which strategy the bot runs:
+#   "trend_4h"       core/trend_strategy.py: 4H trend-following on Multipliers,
+#                    the only strategy that held up out of sample (see there)
+#   "confluence_15m" the original 15-minute Rise/Fall strategy in this file,
+#                    kept for reference: lost money in 10 of 11 years 2016-2026
+TRADING_STRATEGY = "trend_4h"
+
+# Trade contract: Multiplier with stop_loss = risk, take_profit = 1.5 x risk
+# (fixed 1:1.5 risk-to-reward; see position_sizing.plan_multiplier_trade).
+# False falls back to the old 15-minute Rise/Fall contract.
+USE_MULTIPLIERS          = False    # the 1:1.5 version backtested ~break-even after
+                                    # commission (negative in the recent half), so off
+MULT_MAX_HOLD_MINUTES    = 240      # sell at market if neither stop nor target hit by then
+MULT_DAILY_CLOSE_UTC_MIN = 20 * 60 + 45  # also sell by 20:45 UTC, before gold's
+                                    # daily break / weekend close, so no position
+                                    # is ever held through a price gap
+MULT_POLL_INTERVAL       = 180      # seconds between monitor polls on a multiplier
+                                    # (Deriv enforces SL/TP itself; polling only
+                                    # records the result and enforces the timeout)
+RECONCILE_EVERY_CYCLES   = 6        # re-check every account's open multiplier
+                                    # positions every ~30 min (and on startup) so a
+                                    # restart never orphans an open position
+
+
+def multiplier_close_by(purchase_epoch: int) -> int:
+    """Epoch by which a multiplier bought at purchase_epoch must be sold:
+    the earlier of the max-hold timeout and the next daily close time."""
+    bought   = datetime.fromtimestamp(purchase_epoch, timezone.utc)
+    daily    = bought.replace(hour=MULT_DAILY_CLOSE_UTC_MIN // 60,
+                              minute=MULT_DAILY_CLOSE_UTC_MIN % 60, second=0, microsecond=0)
+    if daily <= bought:
+        daily += timedelta(days=1)
+    return min(purchase_epoch + MULT_MAX_HOLD_MINUTES * 60, int(daily.timestamp()))
 
 
 def get_session_status() -> dict:
@@ -123,7 +165,10 @@ def get_session_status() -> dict:
 class XAUMasterStrategy:
     def __init__(self):
         self.is_running          = False
-        self._trade_in_progress  = False
+        self._placing            = False  # a signal's orders are being placed right now
+        self._open_contracts: dict = {}   # bot contract_id -> username, until settled
+        self._cycle_count        = 0
+        self._trend              = TrendTrader(self)
         self._consecutive_wins   = 0
         self._in_recovery        = False
         self._last_session_notif = None
@@ -132,6 +177,19 @@ class XAUMasterStrategy:
         self._trade_count        = 0
         self._sentiment_cache: dict = {}
         self._sentiment_cache_time: datetime | None = None
+
+    @property
+    def _trade_in_progress(self) -> bool:
+        """Position lock: held while orders are being placed and until EVERY
+        bot position from the last signal has settled. Multiplier positions
+        can stay open for hours, so this can't be released by whichever
+        user's monitor happens to finish first (the old behaviour), or a new
+        signal would stack a second position on top of still-open ones."""
+        return self._placing or bool(self._open_contracts)
+
+    @_trade_in_progress.setter
+    def _trade_in_progress(self, value: bool):
+        self._placing = bool(value)
 
     def _in_trading_session(self) -> bool:
         hour = datetime.now(timezone.utc).hour
@@ -370,36 +428,55 @@ class XAUMasterStrategy:
         return len(bull_r), len(bear_r), bull_r, bear_r, features
 
     # ── Contract monitor ───────────────────────────────────────────────────────
-    async def _monitor_contract(self, token: str, account_type: str, contract_id, stake, username: str = ""):
+    async def _monitor_contract(self, token: str, account_type: str, contract_id, stake,
+                                username: str = "", close_by: int | None = None):
         """
-        Poll Deriv every 90 s with a fresh connection until the contract settles.
+        Poll Deriv with a fresh connection until the contract settles.
         Polling is used instead of a long-lived subscription because Render's
         network drops WebSocket connections within seconds, making subscriptions
         unreliable and causing the position lock to be released prematurely.
+
+        close_by (multipliers only): epoch at which the position is sold at
+        market if Deriv hasn't already closed it at its stop-loss/take-profit.
+        Without it the contract is a fixed-expiry Rise/Fall, watched for 20 min.
         """
-        logger.info(f"👁  Monitoring {contract_id} | stake=${stake:.2f}")
-        deadline = asyncio.get_running_loop().time() + 1200  # 20-min cap
-        poll_interval = 90  # seconds between polls — contract lasts 15 min
+        loop = asyncio.get_running_loop()
+        if close_by:
+            deadline      = loop.time() + max(0, close_by - time.time()) + 900  # 15-min grace to settle the sale
+            poll_interval = MULT_POLL_INTERVAL
+        else:
+            deadline      = loop.time() + 1200  # 20-min cap
+            poll_interval = 90  # seconds between polls — contract lasts 15 min
+        logger.info(
+            f"👁  Monitoring {contract_id} | stake=${float(stake):.2f}"
+            + (f" | close by {datetime.fromtimestamp(close_by, timezone.utc):%H:%M} UTC" if close_by else "")
+        )
+        sell_attempted = False
 
         try:
-            while asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(poll_interval)
+            while loop.time() < deadline:
+                wait = poll_interval
+                if close_by and not sell_attempted:
+                    wait = max(5, min(poll_interval, close_by - time.time()))
+                await asyncio.sleep(wait)
 
                 svc = DerivTradingService(token=token, account_type=account_type)
                 try:
                     await svc.authenticate()
-                    await svc.ws.send({
-                        "proposal_open_contract": 1,
-                        "contract_id": contract_id,
-                    })
-                    msg = await svc.ws.receive(timeout=20.0)
+                    poc = await svc.get_contract(contract_id)
+                    is_settled = poc.get("is_sold") in (1, True, "1") or \
+                        poc.get("status", "") in ("won", "lost", "sold")
+                    if not is_settled and close_by and time.time() >= close_by:
+                        sell_attempted = True
+                        logger.info(f"⏰ {contract_id} reached its max hold / daily close, selling at market")
+                        await svc.sell_contract(contract_id)
+                        poc = await svc.get_contract(contract_id)
                 except Exception as poll_err:
                     logger.warning(f"👁  Poll error (will retry): {poll_err}")
                     continue
                 finally:
                     await svc.close()
 
-                poc = msg.get("proposal_open_contract") or msg.get("poc")
                 if not poc:
                     logger.debug(f"👁  No poc in response, retrying…")
                     continue
@@ -407,80 +484,148 @@ class XAUMasterStrategy:
                 status = poc.get("status", "")
                 logger.info(f"👁  Contract {contract_id} status={status!r}")
 
-                if status not in ("won", "lost", "sold"):
+                if not (poc.get("is_sold") in (1, True, "1") or status in ("won", "lost", "sold")):
                     continue  # still open — poll again
 
-                profit = float(poc.get("profit", 0))
-                won    = status == "won"
-                self.save_trade_result(contract_id, won, profit, username=username)
-
-                state = db.record_trade_settlement(
-                    username, won, profit, MAX_CONSECUTIVE_LOSSES, MAX_DAILY_DRAWDOWN_PCT
-                )
-
-                try:
-                    if username:
-                        await asyncio.to_thread(
-                            notif.notify_user,
-                            username,
-                            f"Trade {'Won' if won else 'Lost'}  {'+' if won else '-'}${abs(profit):.2f}",
-                            f"Contract {contract_id} settled.",
-                            {"type": "trade_settled", "won": str(won), "pnl": str(profit)},
-                        )
-                    else:
-                        await asyncio.to_thread(notif.notify_trade_settled, contract_id, won, profit)
-                except Exception as e:
-                    logger.warning(f"Trade-settled notification failed for contract {contract_id}: {e}")
-
-                # Global stake-sizing counters — explicitly out of scope for
-                # per-user isolation, unchanged logic.
-                if won:
-                    self._consecutive_wins += 1
-                    if self._in_recovery and \
-                            self._consecutive_wins >= WINS_TO_EXIT_RECOVERY:
-                        self._in_recovery = False
-                        logger.info(f"✅ Exiting recovery after {self._consecutive_wins} wins")
-                    logger.info(
-                        f"✅ [{username}] WON +${profit:.2f} | streak=+{self._consecutive_wins} | "
-                        f"user_daily={state['daily_pnl']:+.2f}"
-                    )
-                else:
-                    self._consecutive_wins = 0
-                    self._in_recovery       = True
-                    logger.warning(
-                        f"❌ [{username}] LOST -${stake:.2f} | user_streak=-{state['consecutive_losses']} | "
-                        f"→ recovery (need {WINS_TO_EXIT_RECOVERY} wins)"
-                    )
-
-                if state["newly_tripped"]:
-                    logger.error(
-                        f"🚨 [{username}] CIRCUIT BREAKER tripped | "
-                        f"losses={state['consecutive_losses']} | daily={state['daily_pnl']:+.2f}"
-                    )
-                    body = (
-                        f"{state['consecutive_losses']} consecutive losses or daily drawdown "
-                        f"limit hit. Your bot has paused for today, resumes at midnight UTC."
-                    )
-                    try:
-                        if username:
-                            await asyncio.to_thread(
-                                notif.notify_user,
-                                username, "Circuit Breaker Triggered", body,
-                                {"type": "circuit_breaker"},
-                            )
-                        else:
-                            await asyncio.to_thread(notif.notify_circuit_breaker, state["consecutive_losses"])
-                    except Exception as e:
-                        logger.warning(f"Circuit-breaker notification failed for {username}: {e}")
+                # Multipliers closed at their stop-loss/take-profit (or sold on
+                # timeout) report status "sold", never "won", so win/loss has
+                # to come from the realised profit, not the status string.
+                await self._settle_contract(contract_id, float(poc.get("profit", 0)), username,
+                                            MAX_CONSECUTIVE_LOSSES)
                 return  # settled — done
 
-            logger.warning(f"👁  Contract {contract_id} did not settle within 20 min")
+            # A multiplier that couldn't be confirmed sold is still picked up
+            # again by _reconcile_open_positions on the next reconcile pass.
+            logger.warning(f"👁  Contract {contract_id} did not settle before the monitor deadline")
 
         except Exception as e:
             logger.error(f"Monitor fatal error: {e}")
         finally:
-            self._trade_in_progress = False
-            logger.info("🔓 Position lock released")
+            # Only bot positions are in _open_contracts; a manual /trade
+            # contract monitored here never touches the bot's position lock.
+            self._open_contracts.pop(str(contract_id), None)
+            if not self._open_contracts:
+                logger.info("🔓 Position lock released")
+
+    async def _settle_contract(self, contract_id, profit: float, username: str,
+                               max_consecutive_losses: int):
+        """Record a closed contract: trade_results row, per-user risk state
+        (circuit breaker), win/loss notification, and the global stake-sizing
+        streak counters. Shared by the contract monitor and the trend strategy."""
+        won = profit > 0
+        self.save_trade_result(contract_id, won, profit, username=username)
+
+        state = db.record_trade_settlement(
+            username, won, profit, max_consecutive_losses, MAX_DAILY_DRAWDOWN_PCT
+        )
+
+        try:
+            if username:
+                await asyncio.to_thread(
+                    notif.notify_user,
+                    username,
+                    f"Trade {'Won' if won else 'Lost'}  {'+' if won else '-'}${abs(profit):.2f}",
+                    f"Contract {contract_id} settled.",
+                    {"type": "trade_settled", "won": str(won), "pnl": str(profit)},
+                )
+            else:
+                await asyncio.to_thread(notif.notify_trade_settled, contract_id, won, profit)
+        except Exception as e:
+            logger.warning(f"Trade-settled notification failed for contract {contract_id}: {e}")
+
+        # Global stake-sizing counters — explicitly out of scope for
+        # per-user isolation, unchanged logic.
+        if won:
+            self._consecutive_wins += 1
+            if self._in_recovery and \
+                    self._consecutive_wins >= WINS_TO_EXIT_RECOVERY:
+                self._in_recovery = False
+                logger.info(f"✅ Exiting recovery after {self._consecutive_wins} wins")
+            logger.info(
+                f"✅ [{username}] WON +${profit:.2f} | streak=+{self._consecutive_wins} | "
+                f"user_daily={state['daily_pnl']:+.2f}"
+            )
+        else:
+            self._consecutive_wins = 0
+            self._in_recovery       = True
+            logger.warning(
+                f"❌ [{username}] LOST -${abs(profit):.2f} | user_streak=-{state['consecutive_losses']} | "
+                f"→ recovery (need {WINS_TO_EXIT_RECOVERY} wins)"
+            )
+
+        if state["newly_tripped"]:
+            logger.error(
+                f"🚨 [{username}] CIRCUIT BREAKER tripped | "
+                f"losses={state['consecutive_losses']} | daily={state['daily_pnl']:+.2f}"
+            )
+            body = (
+                f"{state['consecutive_losses']} consecutive losses or daily drawdown "
+                f"limit hit. Your bot has paused for today, resumes at midnight UTC."
+            )
+            try:
+                if username:
+                    await asyncio.to_thread(
+                        notif.notify_user,
+                        username, "Circuit Breaker Triggered", body,
+                        {"type": "circuit_breaker"},
+                    )
+                else:
+                    await asyncio.to_thread(notif.notify_circuit_breaker, state["consecutive_losses"])
+            except Exception as e:
+                logger.warning(f"Circuit-breaker notification failed for {username}: {e}")
+
+    async def _reconcile_open_positions(self, all_users: list[dict]):
+        """
+        Restart safety for multipliers. Unlike a 15-minute Rise/Fall, a
+        multiplier never expires on its own, and monitors only live in this
+        process's memory. After a Render restart/redeploy, any position the
+        bot opened would otherwise go unwatched: no max-hold/daily-close
+        sale, no recorded result, and no lock, so a new signal would open a
+        second position on top of it. This finds the bot's own open
+        multipliers on every account and resumes monitoring them.
+        """
+        try:
+            app_id = int(DERIV_APP_ID)
+        except (TypeError, ValueError):
+            app_id = None
+
+        for u in all_users:
+            svc = DerivTradingService(
+                token=u["deriv_token"], account_type=u.get("trade_account_type", "real"),
+                max_retries=2,
+            )
+            try:
+                await svc.authenticate()
+                contracts = await svc.get_open_contracts()
+            except Exception as e:
+                logger.warning(f"🔁 Reconcile [{u['username']}] failed: {e}")
+                continue
+            finally:
+                await svc.close()
+
+            for c in contracts:
+                cid = str(c.get("contract_id", ""))
+                if not cid or cid in self._open_contracts:
+                    continue
+                if c.get("contract_type") not in ("MULTUP", "MULTDOWN"):
+                    continue
+                if c.get("underlying_symbol", c.get("symbol")) != EXECUTION_SYMBOL:
+                    continue
+                # Only contracts this app opened, never a user's own manual
+                # multiplier trades placed through Deriv directly.
+                if app_id is not None and c.get("app_id") not in (None, app_id):
+                    continue
+                purchase = int(c.get("purchase_time") or c.get("date_start") or time.time())
+                close_by = multiplier_close_by(purchase)
+                logger.warning(
+                    f"🔁 [{u['username']}] adopting unmonitored open multiplier {cid} "
+                    f"(bought {datetime.fromtimestamp(purchase, timezone.utc):%Y-%m-%d %H:%M} UTC)"
+                )
+                self._open_contracts[cid] = u["username"]
+                asyncio.create_task(self._monitor_contract(
+                    u["deriv_token"], u.get("trade_account_type", "real"), cid,
+                    float(c.get("buy_price", 0) or 0), u["username"], close_by=close_by,
+                ))
 
     # ── Main trade cycle ───────────────────────────────────────────────────────
     def _get_all_users(self) -> list[dict]:
@@ -497,7 +642,8 @@ class XAUMasterStrategy:
         return []
 
     async def _place_for_user(self, username: str, token: str, account_type: str,
-                               direction: str, score: int, atr: float = None) -> bool:
+                               direction: str, score: int, atr: float = None,
+                               price: float = None) -> bool:
         """Place a trade. Returns True if a monitor task was started, False on failure."""
         svc = DerivTradingService(token=token, account_type=account_type)
         try:
@@ -505,6 +651,8 @@ class XAUMasterStrategy:
             info    = await svc.get_account_info()
             balance = float(info.get("balance", 0.0))
             db.maybe_set_opening_balance(username, balance)
+            # With multipliers this is the dollar RISK (loss at the stop), not
+            # the Deriv stake — see position_sizing.plan_multiplier_trade.
             stake, tier = calculate_stake(
                 balance          = balance,
                 win_rate         = self._win_rate,
@@ -514,16 +662,39 @@ class XAUMasterStrategy:
                 atr_ceiling      = MAX_SAFE_ATR,
                 trade_count      = self._trade_count,
             )
-            result      = await svc.place_order(direction, stake)
-            contract_id = result.get("buy", {}).get("contract_id", "unknown")
-            logger.info(f"✅ [{username}] {direction} ${stake:.2f} | contract={contract_id}")
+            close_by = None
+            if USE_MULTIPLIERS:
+                if not atr or not price:
+                    raise ValueError("ATR and price are required to size a multiplier trade")
+                plan = plan_multiplier_trade(stake, atr, price)
+                if plan["stake"] > balance:
+                    raise ValueError(
+                        f"balance ${balance:.2f} below the ${plan['stake']:.2f} multiplier stake needed"
+                    )
+                result = await svc.place_order(
+                    "MULTUP" if direction == "CALL" else "MULTDOWN", plan["stake"],
+                    multiplier=plan["multiplier"],
+                    stop_loss=plan["stop_loss"], take_profit=plan["take_profit"],
+                )
+                buy        = result.get("buy", {})
+                purchase   = int(buy.get("purchase_time") or buy.get("start_time") or time.time())
+                close_by   = multiplier_close_by(purchase)
+                deriv_stake = plan["stake"]
+                summary    = f"Risk ${plan['stop_loss']:.2f}  |  Target +${plan['take_profit']:.2f}"
+            else:
+                result      = await svc.place_order(direction, stake)
+                deriv_stake = stake
+                summary     = f"Stake ${stake:.2f}"
+            contract_id = str(result.get("buy", {}).get("contract_id", "unknown"))
+            logger.info(f"✅ [{username}] {direction} {summary} | contract={contract_id}")
+            self._open_contracts[contract_id] = username
 
             try:
                 await asyncio.to_thread(
                     notif.notify_user,
                     username,
                     f"Trade Placed {'CALL ↑' if direction == 'CALL' else 'PUT ↓'}",
-                    f"XAU/USD  |  Stake ${stake:.2f}  |  Confluence {score}/4",
+                    f"XAU/USD  |  {summary}  |  Confluence {score}/4",
                     {"type": "trade_executed", "direction": direction},
                 )
             except Exception as e:
@@ -531,7 +702,8 @@ class XAUMasterStrategy:
 
             # Pass the token — monitor opens its own fresh connections per poll
             asyncio.create_task(
-                self._monitor_contract(token, account_type, contract_id, stake, username)
+                self._monitor_contract(token, account_type, contract_id, deriv_stake,
+                                       username, close_by=close_by)
             )
             return True
         except Exception as e:
@@ -580,6 +752,17 @@ class XAUMasterStrategy:
             [u["username"] for u in all_users], now_utc.date().isoformat()
         )
 
+        # Startup, then every ~30 min: re-attach monitors to any open bot
+        # multiplier positions this process isn't watching (e.g. after a
+        # redeploy) before deciding whether the position lock is free. Only
+        # for the confluence strategy's short multipliers: it would otherwise
+        # adopt the trend strategy's week-long positions and sell them after
+        # MULT_MAX_HOLD_MINUTES. Trend positions are tracked in the DB instead.
+        if TRADING_STRATEGY == "confluence_15m" and USE_MULTIPLIERS and \
+                self._cycle_count % RECONCILE_EVERY_CYCLES == 0:
+            await self._reconcile_open_positions(all_users)
+        self._cycle_count += 1
+
         # Any authenticated account works for market data (candles/bias are
         # symbol-level, not per-user) — scan until one works so a single
         # broken/stale token can't block the whole cycle for every user.
@@ -600,6 +783,10 @@ class XAUMasterStrategy:
                 )
             except Exception as e:
                 logger.warning(f"Balance fetch: {e}")
+
+            if TRADING_STRATEGY == "trend_4h":
+                await self._trend.run_cycle(service, all_users)
+                return
 
             await self._maybe_notify_session_start()
 
@@ -754,7 +941,7 @@ class XAUMasterStrategy:
                 results = await asyncio.gather(
                     *[self._place_for_user(
                         u["username"], u["deriv_token"],
-                        u.get("trade_account_type", "real"), direction, score, atr,
+                        u.get("trade_account_type", "real"), direction, score, atr, price,
                       ) for u in eligible],
                     return_exceptions=True,
                 )
@@ -763,10 +950,10 @@ class XAUMasterStrategy:
                 if signal_id:
                     db.update_signal_executed(signal_id, executed)
 
-                # If every placement failed (no monitor started), release lock now.
-                # Otherwise the monitor's finally block will release it after settlement.
+                # Placement is done. The lock now stays held only by the open
+                # positions in _open_contracts, each released by its monitor.
+                self._trade_in_progress = False
                 if not executed:
-                    self._trade_in_progress = False
                     logger.warning("⚠️  All trade placements failed — lock released")
             else:
                 top     = max(bull_score, bear_score)

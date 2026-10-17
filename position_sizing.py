@@ -24,9 +24,12 @@ Example stakes:
   $1000 balance → $20.00 (2%)
   $5000 balance → $50.00 (2%, capped)
 
-Break-even win rate for 75% payout binary options: 57.1%
-At 60% win rate, expected value per $10 stake = +$0.50
-At 65% win rate, expected value per $10 stake = +$1.25
+With Multiplier contracts (plan_multiplier_trade below), the amount above is
+the dollar RISK per trade (the loss if the stop is hit), and the take-profit
+is 1.5x that: a fixed 1:1.5 risk-to-reward ratio.
+Break-even win rate at 1:1.5: 40.0%
+(Rise/Fall at a 75% payout would need 57.1%; at the 64.6% actually quoted
+on 2026-10-16, 60.8%.)
 """
 import math
 import logging
@@ -37,6 +40,10 @@ logger = logging.getLogger("PositionSizing")
 MIN_STAKE = 1.00    # Deriv minimum
 MAX_STAKE = 50.00   # Never exceed this regardless of balance
 ROUND_TO  = 0.50    # Round to nearest 50 cents
+# Win rate below which sizing drops to minimum. This is the 1:1.5 break-even
+# (1 / (1 + 1.5) = 40%); it was 50% when trades were Rise/Fall at a 57.1%
+# break-even, which would now trip constantly on a profitable ~50-54% strategy.
+WIN_RATE_CAUTION_BELOW = 0.40
 
 # Tier definitions: (max_balance, risk_pct, label)
 TIERS = [
@@ -106,7 +113,7 @@ def calculate_stake(
                           cautiously instead of treated the same as calm markets.
         trade_count:      Total settled trades so far. The win-rate safety
                           check below only engages once this is meaningful
-                          (20+) — on a small sample, a dip below 50% is just
+                          (20+) — on a small sample, a dip below break-even is just
                           noise, not evidence the strategy is broken.
 
     Returns:
@@ -116,8 +123,8 @@ def calculate_stake(
         return MIN_STAKE, "MIN"
 
     # ── Win rate safety check ──────────────────────────────────────────────────
-    # If we have enough trade history and win rate is below break-even (57.1%),
-    # force minimum sizing until the strategy proves itself again.
+    # If we have enough trade history and win rate looks broken, force minimum
+    # sizing until the strategy proves itself again.
     # Bug fixed 2026-08-17: this branch computed balance*1% with no upper
     # bound, so on any balance above ~$2,500 it staked *more* than the
     # normal $50-capped tier — the opposite of what "caution" is supposed to
@@ -125,12 +132,12 @@ def calculate_stake(
     # a live trade-log audit caught. Now goes through the same MAX_STAKE cap
     # as every other branch, and only engages past the 20-trade sample size
     # the comment above always said it should (never actually implemented).
-    if win_rate > 0 and win_rate < 0.50 and trade_count >= 20:
-        # Below 50% win rate — drop to minimum sizing, strategy may be broken
+    if win_rate > 0 and win_rate < WIN_RATE_CAUTION_BELOW and trade_count >= 20:
+        # Below break-even win rate — drop to minimum sizing, strategy may be broken
         stake = max(MIN_STAKE, min(MAX_STAKE, balance * 0.01))
         stake = _round_stake(stake)
         logger.warning(
-            f"⚠️  Win rate {win_rate:.1%} below 50% over {trade_count} trades, "
+            f"⚠️  Win rate {win_rate:.1%} below {WIN_RATE_CAUTION_BELOW:.0%} over {trade_count} trades, "
             f"applying minimum sizing ${stake:.2f} until strategy recovers"
         )
         return stake, "WIN_RATE_CAUTION"
@@ -171,6 +178,83 @@ def calculate_stake(
     return stake, tier_label
 
 
+# ── Multiplier (1:1.5 risk-to-reward) trade planning ───────────────────────────
+# Rise/Fall pays whatever Deriv quotes (a live quote on 2026-10-16 was 64.6%,
+# i.e. 1:0.65), so a fixed 1:1.5 ratio is only possible on Multiplier
+# contracts with a take-profit/stop-loss. Deriv's stop_loss / take_profit are
+# net dollar P&L *including* commission, so stop_loss=R and take_profit=1.5R
+# gives an exact 1:1.5 ratio in money terms.
+#
+# The amount calculate_stake() returns is used as the dollar RISK R (the loss
+# if the stop is hit) — same % of balance a Rise/Fall stake used to risk. The
+# Deriv stake is larger than R: it's only lost in full if price gaps straight
+# through the stop to Deriv's stop-out level, so it's kept at a minimum of
+# MIN_STAKE_TO_RISK x R and that gap exposure is capped at ~2-3.5R.
+RR_RATIO             = 1.5    # take_profit = RR_RATIO x stop_loss
+SL_ATR_MULT          = 1.0    # stop distance in price = 1x ATR(15M), backtested
+MULTIPLIER_CHOICES   = (50, 100, 150, 250, 500)  # what Deriv accepted for frxXAUUSD on 2026-10-16
+MIN_STAKE_TO_RISK    = 2.0    # stake >= 2x risk, so the stop sits well clear of stop-out
+COMMISSION_RATE_EST  = 0.00026  # of notional; measured from live frxXAUUSD quotes
+                                # ($0.25 on $1000 notional, $0.13 on $500)
+
+
+# A stake below this multiple of the risk leaves too little room between the
+# stop-loss and Deriv's stop-out (loss = whole stake) for a price gap.
+MIN_FEASIBLE_STAKE_TO_RISK = 1.25
+
+
+def plan_multiplier_trade(risk: float, atr: float, price: float,
+                          stop_atr_mult: float = SL_ATR_MULT,
+                          rr: float | None = RR_RATIO) -> dict:
+    """
+    Turn a dollar risk amount into Deriv Multiplier contract parameters whose
+    stop sits ~stop_atr_mult x ATR from entry. With rr set, take_profit is
+    exactly rr x the risk; with rr=None there is no take-profit (the 4H trend
+    sleeves exit on a trailing stop instead, see core/trend_strategy.py).
+
+    P&L on a multiplier = notional x (price move / entry) - commission, with
+    notional = stake x multiplier. Solving for the notional that loses exactly
+    `risk` (commission included) over a stop distance of stop_atr_mult x ATR:
+        risk = notional x (stop_dist / price) + notional x commission_rate
+
+    Raises ValueError when the stop is so wide that even the smallest
+    multiplier can't keep the stake MIN_FEASIBLE_STAKE_TO_RISK x the risk.
+    """
+    if risk <= 0 or atr <= 0 or price <= 0:
+        raise ValueError(f"Invalid multiplier plan inputs: risk={risk} atr={atr} price={price}")
+
+    stop_dist = stop_atr_mult * atr
+    notional  = risk / (stop_dist / price + COMMISSION_RATE_EST)
+
+    # Largest multiplier that still leaves stake >= MIN_STAKE_TO_RISK x risk:
+    # a smaller stake means less money exposed to a gap through the stop.
+    multiplier = MULTIPLIER_CHOICES[0]
+    for m in MULTIPLIER_CHOICES:
+        if notional / m >= MIN_STAKE_TO_RISK * risk:
+            multiplier = m
+
+    stake = max(MIN_STAKE, round(notional / multiplier, 2))
+    if stake * multiplier > 1.2 * notional:
+        # Deriv's minimum stake forced a bigger position than planned, which
+        # would put the dollar stop_loss far closer than stop_atr_mult x ATR.
+        raise ValueError(
+            f"Risk ${risk:.2f} too small: the ${MIN_STAKE:.2f} minimum stake at x{multiplier} "
+            f"would pull the stop in from {stop_dist:.2f}"
+        )
+    if stake < MIN_FEASIBLE_STAKE_TO_RISK * risk:
+        raise ValueError(
+            f"Stop {stop_dist:.2f} too wide for a multiplier: stake ${stake:.2f} "
+            f"vs risk ${risk:.2f} even at x{multiplier}"
+        )
+    return {
+        "stake":       stake,
+        "multiplier":  multiplier,
+        "stop_loss":   round(risk, 2),
+        "take_profit": round(risk * rr, 2) if rr else None,
+        "notional":    round(stake * multiplier, 2),
+    }
+
+
 def _round_stake(amount: float) -> float:
     """Floor to nearest ROUND_TO increment."""
     return max(MIN_STAKE, math.floor(amount / ROUND_TO) * ROUND_TO)
@@ -190,5 +274,5 @@ def get_sizing_context(balance: float, win_rate: float) -> dict:
         "normal_stake":   normal_stake,
         "recovery_stake": recovery_stake,
         "win_rate":       f"{win_rate:.1%}",
-        "break_even_wr":  "57.1%",
+        "break_even_wr":  "40.0%",
     }

@@ -1,0 +1,308 @@
+"""
+core/trend_strategy.py — 4H trend-following on XAU/USD via Deriv Multipliers.
+
+Replaces the 15-minute Rise/Fall confluence strategy, which lost money in 10
+of the 11 years 2016-2026 when backtested on 10+ years of 1-minute history,
+and lost 25.7% of everything it staked across 103 demo trades in Jul-Aug 2026.
+
+The rules here are exactly the ones validated in backtest/trend_candidate.py
+(run with --regime), and tests/test_trend_parity.py replays these functions
+over the same history to confirm they take the same trades:
+
+  4 independent sleeves, long only:  lookback 20/55 bars  x  stop 2/3 ATR
+  Entry   a completed 4H candle closes above the highest high of the previous
+          `lookback` candles, AND the previous day's daily close is above its
+          200-day simple moving average (regime filter).
+  Stop    stop_mult x ATR(14) below entry (capped at 1.5% of price, the
+          widest Deriv Multipliers allow), then trailed the same distance
+          below each completed 4H close; it only ever moves up.
+  Exit    price trades at or below the trailing stop, or 360 bars (60 days).
+  Size    each sleeve risks 1/4 of the account's per-trade risk amount
+          (position_sizing.calculate_stake), as a dollar stop_loss on a
+          Multiplier with no take-profit.
+
+Backtest (Deriv Multiplier commission, no swap: Deriv states gold Multipliers
+carry no overnight fees), in R = per-trade risk:
+  2011-15 bear (gold -42%)   -1.7R/yr     2016-22   +3.6R/yr
+  2023-24                    +4.1R/yr     2025-26   +9.7R/yr (final hold-out)
+It loses in falling markets (less than holding gold does) and its win rate is
+only ~30-54%: profits come from a few long trends, so losing streaks are normal.
+
+Deriv's stop_loss is a fixed dollar loss and can't trail into profit, so the
+bot enforces the trailing stop itself every cycle (selling at market) and
+keeps Deriv's stop_loss at the initial stop as a server-side backstop for
+when the bot is down. Open positions live in the trend_positions table, not
+in memory, because they run for days or weeks across Render restarts.
+"""
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+
+import database as db
+from brokers.deriv_trading_service import DerivTradingService
+from position_sizing import calculate_stake, plan_multiplier_trade
+
+logger = logging.getLogger("TrendStrategy")
+
+SYMBOL          = "frxXAUUSD"
+GRAN_4H         = 14400
+GRAN_1D         = 86400
+SLEEVES = [
+    {"id": "L20x2", "lookback": 20, "stop_mult": 2.0},
+    {"id": "L20x3", "lookback": 20, "stop_mult": 3.0},
+    {"id": "L55x2", "lookback": 55, "stop_mult": 2.0},
+    {"id": "L55x3", "lookback": 55, "stop_mult": 3.0},
+]
+ATR_PERIOD      = 14
+REGIME_SMA_DAYS = 200
+MAX_HOLD_BARS   = 360   # 60 days of 4H bars, matching the backtest's time exit
+# Deriv's smallest gold multiplier (x50) stops out at ~2% of price, so a stop
+# wider than that can't exist on a Multiplier. Stops (initial and trailing)
+# are capped at 1.5% of price, which keeps the stake >= 1.31x the risk.
+# Backtested against skipping the too-wide trades instead: the cap did better
+# in every period except 2016-22 (equal), and keeps every entry tradable.
+MAX_STOP_PCT    = 0.015
+# A trend system with a 30-54% win rate routinely strings together 3+ losses,
+# so the confluence strategy's 3-loss daily circuit breaker would keep pausing
+# it and skipping the very entries the backtest depended on. Drawdown-based
+# protection (MAX_DAILY_DRAWDOWN_PCT) still applies unchanged.
+TREND_MAX_CONSECUTIVE_LOSSES = 8
+
+
+# ── Pure signal logic (shared with tests/test_trend_parity.py) ─────────────────
+def atr(df: pd.DataFrame, n: int = ATR_PERIOD) -> np.ndarray:
+    """Wilder ATR, identical to backtest/edge_research.atr."""
+    h, l, c = df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy()
+    pc = np.roll(c, 1); pc[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))
+    return pd.Series(tr).ewm(alpha=1 / n, adjust=False).mean().to_numpy()
+
+
+def stop_distance(atr_values: np.ndarray, closes: np.ndarray, stop_mult: float) -> np.ndarray:
+    """stop_mult x ATR, capped at MAX_STOP_PCT of price (see MAX_STOP_PCT)."""
+    return np.minimum(stop_mult * atr_values, MAX_STOP_PCT * closes)
+
+
+def closed_bars(df: pd.DataFrame, gran: int, now_epoch: int) -> pd.DataFrame:
+    """Drop the still-forming candle: a bar is complete once epoch + gran <= now."""
+    return df[df["epoch"] + gran <= now_epoch].reset_index(drop=True)
+
+
+def entry_signal(h4_closed: pd.DataFrame, lookback: int) -> bool:
+    """Last completed 4H close above the highest high of the `lookback` bars before it."""
+    if len(h4_closed) < lookback + 1:
+        return False
+    highs = h4_closed["high"].to_numpy()
+    return float(h4_closed["close"].iloc[-1]) > float(highs[-1 - lookback:-1].max())
+
+
+def regime_up(daily: pd.DataFrame, bar_epoch: int) -> bool:
+    """Previous day's daily close above its 200-day SMA, as of the 4H bar's day."""
+    day_start = bar_epoch - bar_epoch % GRAN_1D
+    prior = daily[daily["epoch"] < day_start]
+    if len(prior) < REGIME_SMA_DAYS:
+        return False
+    closes = prior["close"].to_numpy()
+    return float(closes[-1]) > float(closes[-REGIME_SMA_DAYS:].mean())
+
+
+def trailing_stop(h4_closed: pd.DataFrame, entry_bar_epoch: int, initial_stop: float,
+                  stop_mult: float, stored_trail: float | None = None) -> float:
+    """Initial stop raised to (close - stop_mult x ATR) of every completed bar
+    after entry; never lowered, and never below a previously stored value."""
+    c = h4_closed["close"].to_numpy()
+    dist = stop_distance(atr(h4_closed), c, stop_mult)
+    after = (h4_closed["epoch"] > entry_bar_epoch).to_numpy()
+    stop = max(initial_stop, stored_trail or initial_stop)
+    if after.any():
+        stop = max(stop, float((c[after] - dist[after]).max()))
+    return stop
+
+
+def bars_held(h4_closed: pd.DataFrame, entry_bar_epoch: int) -> int:
+    return int((h4_closed["epoch"] > entry_bar_epoch).sum())
+
+
+# ── Live trading ───────────────────────────────────────────────────────────────
+async def _fetch(service: DerivTradingService, gran: int, batches: int) -> pd.DataFrame:
+    """Recent candles, stitching `batches` requests back in time (Deriv caps
+    each ticks_history response well below what 60-day trails need)."""
+    raw, end = [], "latest"
+    for _ in range(batches):
+        chunk = await service.get_candles(SYMBOL, count=1000, granularity=gran, end=end)
+        if not chunk:
+            break
+        raw = chunk + raw
+        end = int(chunk[0]["epoch"]) - gran
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return df
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].astype(float)
+    df["epoch"] = df["epoch"].astype(int)
+    return df.drop_duplicates("epoch").sort_values("epoch").reset_index(drop=True)
+
+
+class TrendTrader:
+    def __init__(self, strategy):
+        # The XAUMasterStrategy instance: reused for signal saving and the
+        # shared settlement path (trade_results, circuit breaker, notifications).
+        self.strategy = strategy
+        self._last_bar_evaluated: int | None = None
+
+    async def run_cycle(self, service: DerivTradingService, all_users: list[dict]):
+        now = int(time.time())
+        h4_all = await _fetch(service, GRAN_4H, batches=2)
+        daily  = await _fetch(service, GRAN_1D, batches=1)
+        if h4_all.empty or daily.empty:
+            logger.warning("Trend: no candle data, skipping cycle")
+            return
+        h4    = closed_bars(h4_all, GRAN_4H, now)
+        daily = closed_bars(daily, GRAN_1D, now)
+        if len(h4) < max(s["lookback"] for s in SLEEVES) + ATR_PERIOD + 1:
+            logger.warning(f"Trend: only {len(h4)} closed 4H bars, skipping cycle")
+            return
+        spot     = float(h4_all["close"].iloc[-1])  # latest price, from the forming candle
+        bar      = h4.iloc[-1]
+        bar_ep   = int(bar["epoch"])
+        a_now    = float(atr(h4)[-1])
+        regime   = regime_up(daily, bar_ep)
+        new_bar  = bar_ep != self._last_bar_evaluated
+        signals  = {s["id"]: entry_signal(h4, s["lookback"]) for s in SLEEVES}
+        logger.info(
+            f"📈 Trend | spot={spot:.2f} bar={datetime.fromtimestamp(bar_ep, timezone.utc):%m-%d %H:%M} "
+            f"close={bar['close']:.2f} ATR={a_now:.2f} regime={'UP' if regime else 'down'} "
+            f"signals={[k for k, v in signals.items() if v] or 'none'}"
+        )
+
+        if new_bar:
+            fired = [k for k, v in signals.items() if v]
+            if fired and regime:
+                self.strategy.save_signal(
+                    "BUY", bar["close"], 0, "bullish",
+                    f"4H breakout ({', '.join(fired)}) with daily close above 200-day average", 4)
+            else:
+                why = "no 4H breakout" if not fired else "daily trend below 200-day average"
+                self.strategy.save_signal("NEUTRAL", bar["close"], 0, "bullish" if regime else "bearish",
+                                          f"Trend: waiting ({why})", 0)
+
+        for u in all_users:
+            try:
+                await self._run_user(u, h4, spot, bar_ep, a_now, regime, signals, new_bar, now)
+            except Exception as e:
+                logger.error(f"❌ Trend [{u['username']}] cycle error: {e}")
+
+        self._last_bar_evaluated = bar_ep
+
+    async def _run_user(self, u, h4, spot, bar_ep, a_now, regime, signals, new_bar, now):
+        username = u["username"]
+        positions = db.get_open_trend_positions(username)
+        eligible = u.get("bot_enabled", True) and not u.get("circuit_broken", False)
+        want_entries = new_bar and eligible and regime and any(signals.values())
+        if not positions and not want_entries:
+            return
+
+        svc = DerivTradingService(token=u["deriv_token"],
+                                  account_type=u.get("trade_account_type", "real"), max_retries=2)
+        try:
+            await svc.authenticate()
+            open_sleeves = set()
+            for p in positions:
+                try:
+                    closed = await self._manage_position(svc, p, h4, spot, now)
+                except Exception as e:
+                    # e.g. Deriv rejects a sell while the market is closed:
+                    # keep the position, retry next cycle, manage the others.
+                    logger.warning(f"⚠️  [{username}] {p['sleeve']} {p['contract_id']}: {e}")
+                    closed = False
+                if not closed:
+                    open_sleeves.add(p["sleeve"])
+            if want_entries:
+                await self._enter(svc, username, h4, bar_ep, a_now, signals, open_sleeves, now)
+        finally:
+            await svc.close()
+
+    async def _manage_position(self, svc, p, h4, spot, now) -> bool:
+        """Returns True if the position is now closed."""
+        cid, username = p["contract_id"], p["username"]
+        poc = await svc.get_contract(cid)
+        sold = poc.get("is_sold") in (1, True, "1") or poc.get("status") in ("won", "lost", "sold")
+        reason = "deriv_stop"  # closed server-side: Deriv's stop_loss backstop or stop-out
+        if not sold:
+            trail = trailing_stop(h4, int(p["entry_bar_epoch"]), float(p["initial_stop"]),
+                                  float(p["stop_mult"]), p.get("trail_stop"))
+            if p.get("trail_stop") is None or trail > float(p["trail_stop"]):
+                db.set_trend_trail(cid, username, trail)
+            held = bars_held(h4, int(p["entry_bar_epoch"]))
+            if spot <= trail:
+                reason = "trailing_stop"
+            elif held >= MAX_HOLD_BARS:
+                reason = "max_hold"
+            else:
+                logger.info(f"👁  [{username}] {p['sleeve']} {cid} open | spot={spot:.2f} trail={trail:.2f} bars={held}")
+                return False
+            logger.info(f"💸 [{username}] {p['sleeve']} {cid} exit ({reason}) | spot={spot:.2f} trail={trail:.2f}")
+            await svc.sell_contract(cid)
+            poc = await svc.get_contract(cid)
+        profit = float(poc.get("profit", 0) or 0)
+        db.close_trend_position(cid, username, now, profit, reason)
+        await self.strategy._settle_contract(cid, profit, username, TREND_MAX_CONSECUTIVE_LOSSES)
+        return True
+
+    async def _enter(self, svc, username, h4, bar_ep, a_now, signals, open_sleeves, now):
+        info = await svc.get_account_info()
+        balance = float(info.get("balance", 0.0))
+        db.maybe_set_opening_balance(username, balance)
+        # Fixed fractional sizing, as backtested: no recovery-mode step-down
+        # and no win-rate caution (a 30-54% win rate is expected here, and the
+        # caution threshold was set for a different strategy's break-even).
+        total_risk, tier = calculate_stake(balance=balance)
+        sleeve_risk = round(total_risk / len(SLEEVES), 2)
+        entry = float(h4["close"].iloc[-1])
+        for s in SLEEVES:
+            if not signals[s["id"]] or s["id"] in open_sleeves:
+                continue
+            last_exit = db.get_last_trend_exit(username, s["id"])
+            if last_exit is not None and last_exit >= bar_ep:
+                continue  # exited during this bar; the backtest re-enters from the next bar
+            dist = float(stop_distance(np.array([a_now]), np.array([entry]), s["stop_mult"])[0])
+            try:
+                # Plan with the (capped) stop distance expressed as 1 x "ATR".
+                plan = plan_multiplier_trade(sleeve_risk, dist, entry, stop_atr_mult=1.0, rr=None)
+            except ValueError as e:
+                logger.warning(f"⛔ [{username}] {s['id']} skipped: {e}")
+                continue
+            if plan["stake"] > balance:
+                logger.warning(f"⛔ [{username}] {s['id']} skipped: stake ${plan['stake']:.2f} > balance ${balance:.2f}")
+                continue
+            result = await svc.place_order("MULTUP", plan["stake"], multiplier=plan["multiplier"],
+                                           stop_loss=plan["stop_loss"])
+            buy = result.get("buy", {})
+            cid = str(buy.get("contract_id"))
+            initial_stop = entry - dist
+            try:
+                db.insert_trend_position(cid, username, s["id"], bar_ep, entry, s["stop_mult"],
+                                         initial_stop, plan["stop_loss"], plan["stake"],
+                                         plan["multiplier"], int(buy.get("purchase_time") or now))
+            except Exception as e:
+                # The contract exists on Deriv but we can't track it: close it
+                # rather than leave an unmanaged position running for weeks.
+                logger.error(f"🚨 [{username}] could not record {cid} ({e}), selling it")
+                await svc.sell_contract(cid)
+                continue
+            open_sleeves.add(s["id"])
+            logger.info(f"✅ [{username}] {s['id']} BUY x{plan['multiplier']} stake=${plan['stake']:.2f} "
+                        f"risk=${plan['stop_loss']:.2f} stop={initial_stop:.2f} | contract={cid}")
+            try:
+                from core import notifications as notif
+                await asyncio.to_thread(
+                    notif.notify_user, username, "Trade Placed: Gold trend",
+                    f"XAU/USD  |  Risk ${plan['stop_loss']:.2f}  |  Trailing stop, no fixed target",
+                    {"type": "trade_executed", "direction": "CALL"},
+                )
+            except Exception as e:
+                logger.warning(f"Trade-placed notification failed for {username}: {e}")

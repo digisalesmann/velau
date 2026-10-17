@@ -39,9 +39,12 @@ logging.getLogger("XAUStrategy").setLevel(logging.WARNING)
 
 from core.strategy_engine import (
     XAUMasterStrategy, MIN_CONFLUENCE, MAX_SAFE_ATR, SESSIONS, CALL_ONLY,
-    REQUIRE_1H_CONFIRMATION,
+    REQUIRE_1H_CONFIRMATION, MULT_MAX_HOLD_MINUTES, MULT_DAILY_CLOSE_UTC_MIN,
 )
-from position_sizing import calculate_stake, WINS_TO_EXIT_RECOVERY, MIN_STAKE
+from position_sizing import (
+    calculate_stake, WINS_TO_EXIT_RECOVERY, MIN_STAKE,
+    plan_multiplier_trade, COMMISSION_RATE_EST,
+)
 
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
@@ -52,6 +55,64 @@ PAYOUT_PCT = 0.75   # documented break-even assumption in position_sizing.py
 LOOKBACK   = 250    # matches live _get_candles count
 HTF_COUNT  = 220    # matches live _get_1h_bias / _get_4h_bias count
 STARTING_BALANCE = 100.0
+
+
+MULT_MAX_HOLD_BARS = MULT_MAX_HOLD_MINUTES // 15
+
+
+def _simulate_multiplier(m15: pd.DataFrame, i: int, direction: str, risk: float,
+                         atr: float, max_hold_bars: int, daily_close_utc_min: int | None):
+    """
+    Walk 15M candles forward from entry bar i the way a live Deriv Multiplier
+    with stop_loss=risk / take_profit=RR_RATIO x risk would play out, using
+    the exact contract parameters plan_multiplier_trade() gives the live bot.
+
+    Deriv's stop_loss/take_profit are net P&L including commission, so the
+    stop's PRICE distance is (risk - commission) / notional x entry, and the
+    take-profit's is (tp + commission) / notional x entry.
+
+    Conservative where OHLC can't tell the order of events:
+      - a bar touching both stop and target counts as the stop
+      - a bar that OPENS through the stop (gap) fills at the open, which can
+        lose more than `risk`, floored at the full stake (Deriv stop-out)
+      - a bar that opens through the target is capped at the target
+    Exits at market (bar close) on the max-hold timeout, at the daily
+    force-close time, and before any data gap (weekend/daily break), matching
+    what the live monitor does.
+
+    Returns (pnl, exit_idx, exit_reason).
+    """
+    plan     = plan_multiplier_trade(risk, atr, float(m15["close"].iloc[i]))
+    entry    = float(m15["close"].iloc[i])
+    notional = plan["notional"]
+    comm     = notional * COMMISSION_RATE_EST
+    sign     = 1 if direction == "CALL" else -1
+    sl_px    = entry - sign * (plan["stop_loss"] - comm) / notional * entry
+    tp_px    = entry + sign * (plan["take_profit"] + comm) / notional * entry
+
+    def mkt_pnl(px):
+        return max(-plan["stake"], notional * sign * (px - entry) / entry - comm)
+
+    epochs = m15["epoch"].to_numpy()
+    o, h, l, c = (m15[k].to_numpy() for k in ("open", "high", "low", "close"))
+    last = min(i + max_hold_bars, len(m15) - 1)
+    for j in range(i + 1, last + 1):
+        if epochs[j] - epochs[j - 1] != 900:
+            return mkt_pnl(c[j - 1]), j - 1, "gap_close"
+        adverse_open = o[j] <= sl_px if sign > 0 else o[j] >= sl_px
+        adverse_hit  = l[j] <= sl_px if sign > 0 else h[j] >= sl_px
+        target_hit   = h[j] >= tp_px if sign > 0 else l[j] <= tp_px
+        if adverse_open:
+            return mkt_pnl(o[j]), j, "stop_gap"
+        if adverse_hit:
+            return -plan["stop_loss"], j, "stop_loss"
+        if target_hit:
+            return plan["take_profit"], j, "take_profit"
+        if daily_close_utc_min is not None:
+            bar_end = datetime.datetime.fromtimestamp(int(epochs[j]) + 900, datetime.UTC)
+            if bar_end.hour * 60 + bar_end.minute >= daily_close_utc_min:
+                return mkt_pnl(c[j]), j, "daily_close"
+    return mkt_pnl(c[last]), last, "timeout"
 
 
 def _load(label: str) -> pd.DataFrame:
@@ -143,7 +204,13 @@ def run_backtest(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame,
                   start_idx: int = None, end_idx: int = None, label: str = "full",
                   exclude_factor: str = None, min_confluence: int = None,
                   call_only: bool = None, hold_bars: int = 1,
-                  require_1h_confirmation: bool = None, sessions=None) -> dict:
+                  require_1h_confirmation: bool = None, sessions=None,
+                  exit_mode: str = "expiry", max_hold_bars: int = None,
+                  daily_close_utc_min: int = None) -> dict:
+    """exit_mode="expiry" settles a Rise/Fall contract `hold_bars` candles
+    later at the fixed PAYOUT_PCT. exit_mode="multiplier" simulates the live
+    1:1.5 Multiplier contract instead (see _simulate_multiplier)."""
+    max_hold_bars = max_hold_bars or MULT_MAX_HOLD_BARS
     strat = XAUMasterStrategy()
     required_score = min_confluence if min_confluence is not None else MIN_CONFLUENCE
     call_only = CALL_ONLY if call_only is None else call_only
@@ -239,8 +306,6 @@ def run_backtest(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame,
             continue
 
         entry_price = float(m15["close"].iloc[i])
-        exit_price  = float(m15["close"].iloc[i + hold_bars])
-        won = (exit_price > entry_price) if direction == "CALL" else (exit_price < entry_price)
 
         win_rate = (sum(1 for t in trades if t["won"]) / len(trades)) if trades else 0.0
         stake, tier = calculate_stake(
@@ -249,7 +314,17 @@ def run_backtest(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame,
             trade_count=len(trades),
         )
 
-        pnl = stake * PAYOUT_PCT if won else -stake
+        if exit_mode == "multiplier":
+            pnl, exit_idx, exit_reason = _simulate_multiplier(
+                m15, i, direction, stake, atr, max_hold_bars,
+                daily_close_utc_min if daily_close_utc_min is not None else MULT_DAILY_CLOSE_UTC_MIN,
+            )
+            won = pnl > 0
+        else:
+            exit_price = float(m15["close"].iloc[i + hold_bars])
+            won = (exit_price > entry_price) if direction == "CALL" else (exit_price < entry_price)
+            pnl = stake * PAYOUT_PCT if won else -stake
+            exit_idx, exit_reason = i + hold_bars, "expiry"
         balance += pnl
         balance = max(balance, 0.0)
 
@@ -265,11 +340,11 @@ def run_backtest(m15: pd.DataFrame, h1: pd.DataFrame, h4: pd.DataFrame,
             "time": datetime.datetime.fromtimestamp(row_epoch, datetime.UTC),
             "direction": direction, "score": score, "stake": stake,
             "won": won, "pnl": pnl, "balance": balance, "tier": tier,
-            "votes": votes,
+            "votes": votes, "exit_reason": exit_reason, "bars_held": exit_idx - i,
         })
         equity_curve.append(balance)
 
-        next_free_idx = i + hold_bars + 1  # position occupies bars i..i+hold_bars
+        next_free_idx = exit_idx + 1  # position occupies bars i..exit_idx
         i += 1
 
     return trades, equity_curve

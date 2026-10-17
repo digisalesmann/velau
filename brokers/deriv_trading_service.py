@@ -227,26 +227,53 @@ class DerivTradingService:
         duration: int = CONTRACT_DURATION,
         duration_unit: str = CONTRACT_DURATION_UNIT,
         symbol: str = None,
+        multiplier: int = None,
+        stop_loss: float = None,
+        take_profit: float = None,
     ) -> dict:
+        """
+        Rise/Fall (CALL/PUT): fixed-duration contract, `duration` applies.
+        Multiplier (MULTUP/MULTDOWN): no expiry; `multiplier` is required and
+        stop_loss/take_profit are net dollar P&L levels (commission included)
+        that Deriv closes the contract at server-side.
+        """
         if not self._authorized:
             await self.authenticate()
 
         exec_symbol = symbol or EXECUTION_SYMBOL
+        is_multiplier = contract_type in ("MULTUP", "MULTDOWN")
 
-        logger.info(
-            f"📤 Proposal | {contract_type} ${amount} | {duration}{duration_unit} | {exec_symbol}"
-        )
-
-        await self.ws.send({
-            "proposal":         1,
-            "amount":           amount,
-            "basis":            "stake",
-            "contract_type":    contract_type,
-            "currency":         "USD",
-            "duration":         duration,
-            "duration_unit":    duration_unit,
+        request = {
+            "proposal":          1,
+            "amount":            amount,
+            "basis":             "stake",
+            "contract_type":     contract_type,
+            "currency":          "USD",
             "underlying_symbol": exec_symbol,
-        })
+        }
+        if is_multiplier:
+            if not multiplier:
+                raise ValueError("multiplier is required for MULTUP/MULTDOWN")
+            request["multiplier"] = multiplier
+            limit_order = {}
+            if stop_loss is not None:
+                limit_order["stop_loss"] = stop_loss
+            if take_profit is not None:
+                limit_order["take_profit"] = take_profit
+            if limit_order:
+                request["limit_order"] = limit_order
+            logger.info(
+                f"📤 Proposal | {contract_type} ${amount} x{multiplier} | "
+                f"SL=${stop_loss} TP=${take_profit} | {exec_symbol}"
+            )
+        else:
+            request["duration"]      = duration
+            request["duration_unit"] = duration_unit
+            logger.info(
+                f"📤 Proposal | {contract_type} ${amount} | {duration}{duration_unit} | {exec_symbol}"
+            )
+
+        await self.ws.send(request)
 
         proposal = await self._wait_for("proposal", timeout=20.0)
         if proposal.get("error"):
@@ -254,10 +281,24 @@ class DerivTradingService:
             msg  = proposal["error"].get("message", "Proposal failed")
             self._raise_trade_error(code, msg, "proposal")
 
-        proposal_id = proposal.get("proposal", {}).get("id")
+        quote = proposal.get("proposal", {})
+        proposal_id = quote.get("id")
         if not proposal_id:
             raise Exception(f"Proposal returned no ID: {proposal}")
-        logger.info(f"📋 Proposal OK: id={proposal_id}")
+        # ask_price/payout/commission may arrive as strings on the new API.
+        # The payout actually quoted was never logged before, which is how a
+        # 64.6% payout went unnoticed against a 75% assumption.
+        if is_multiplier:
+            logger.info(
+                f"📋 Proposal OK: id={proposal_id} | ask=${quote.get('ask_price')} "
+                f"commission=${quote.get('commission')}"
+            )
+        else:
+            try:
+                ratio = float(quote.get("payout")) / float(quote.get("ask_price")) - 1
+                logger.info(f"📋 Proposal OK: id={proposal_id} | payout {ratio:.1%} of stake")
+            except (TypeError, ValueError, ZeroDivisionError):
+                logger.info(f"📋 Proposal OK: id={proposal_id}")
 
         await self.ws.send({"buy": proposal_id, "price": amount})
         result = await self._wait_for("buy", timeout=20.0)
@@ -269,6 +310,40 @@ class DerivTradingService:
         contract_id = result.get("buy", {}).get("contract_id")
         logger.info(f"✅ Order placed | contract_id={contract_id}")
         return result
+
+    # ── OPEN CONTRACTS ─────────────────────────────────────────────────────────
+    async def get_contract(self, contract_id) -> dict:
+        """Current state of one contract (proposal_open_contract, no subscription)."""
+        if not self._authorized:
+            await self.authenticate()
+        await self.ws.send({"proposal_open_contract": 1, "contract_id": contract_id})
+        msg = await self._wait_for("proposal_open_contract", timeout=20.0)
+        if msg.get("error"):
+            raise Exception(msg["error"].get("message", "proposal_open_contract failed"))
+        return msg.get("proposal_open_contract") or {}
+
+    async def get_open_contracts(self) -> list[dict]:
+        """All currently open contracts on this account (portfolio)."""
+        if not self._authorized:
+            await self.authenticate()
+        await self.ws.send({"portfolio": 1})
+        msg = await self._wait_for("portfolio", timeout=20.0)
+        if msg.get("error"):
+            raise Exception(msg["error"].get("message", "portfolio failed"))
+        return (msg.get("portfolio") or {}).get("contracts", [])
+
+    async def sell_contract(self, contract_id) -> dict:
+        """Close an open contract at market (price 0 = accept any price)."""
+        if not self._authorized:
+            await self.authenticate()
+        await self.ws.send({"sell": contract_id, "price": 0})
+        msg = await self._wait_for("sell", timeout=20.0)
+        if msg.get("error"):
+            code = msg["error"].get("code", "")
+            raise Exception(f"Sell failed [{code}]: {msg['error'].get('message', '')}")
+        sold = msg.get("sell") or {}
+        logger.info(f"💸 Sold {contract_id} for ${sold.get('sold_for')}")
+        return sold
 
     # ── HELPERS ────────────────────────────────────────────────────────────────
     async def _wait_for(
