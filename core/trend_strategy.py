@@ -182,13 +182,17 @@ class TrendTrader:
         if new_bar:
             fired = [k for k, v in signals.items() if v]
             if fired and regime:
+                lookbacks = sorted({s["lookback"] for s in SLEEVES if s["id"] in fired}, reverse=True)
+                days = round(lookbacks[0] * 4 / 24)
                 self.strategy.save_signal(
                     "BUY", bar["close"], 0, "bullish",
-                    f"4H breakout ({', '.join(fired)}) with daily close above 200-day average", 4)
+                    f"Gold closed at a {days}-day high on the 4H chart | "
+                    f"Gold is above its 200-day average", None)
             else:
-                why = "no 4H breakout" if not fired else "daily trend below 200-day average"
+                why = ("No 4H breakout yet" if regime else
+                       "Gold below its 200-day average, staying in cash")
                 self.strategy.save_signal("NEUTRAL", bar["close"], 0, "bullish" if regime else "bearish",
-                                          f"Trend: waiting ({why})", 0)
+                                          why, None)
 
         for u in all_users:
             try:

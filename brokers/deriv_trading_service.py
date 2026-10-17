@@ -190,10 +190,15 @@ class DerivTradingService:
 
             # Determine direction from shortcode (CALL_... or PUT_...)
             shortcode = c["shortcode"].upper()
+            is_multiplier = shortcode.startswith("MULT")
             if shortcode.startswith("CALL"):
                 direction = "CALL (BUY)"
             elif shortcode.startswith("PUT"):
                 direction = "PUT (SELL)"
+            elif shortcode.startswith("MULTUP"):
+                direction = "BUY (Multiplier)"
+            elif shortcode.startswith("MULTDOWN"):
+                direction = "SELL (Multiplier)"
             else:
                 direction = "Options"
 
@@ -205,7 +210,7 @@ class DerivTradingService:
                 "symbol":        c["symbol"],
                 "contract_id":   cid,
                 "type":          direction,
-                "contract_type": "BINARY",
+                "contract_type": "MULTIPLIER" if is_multiplier else "BINARY",
                 "pnl":           round(net_pnl, 2),
                 "buy_cost":      round(buy_cost, 2),
                 "payout":        round(payout, 2),

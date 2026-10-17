@@ -577,6 +577,13 @@ async def get_open_contracts(user=Depends(get_current_user)):
             if c.get("contract_id")
         ]
 
+        # Trailing stops for the trend strategy's positions live in the DB,
+        # not on Deriv (Deriv's stop_loss stays at the initial backstop).
+        trails = {
+            str(p["contract_id"]): p
+            for p in db.get_open_trend_positions(user.username)
+        }
+
         open_list = []
         for cid in contract_ids:
             try:
@@ -600,6 +607,9 @@ async def get_open_contracts(user=Depends(get_current_user)):
                 "payout":        c.get("payout", 0),
                 "date_start":    c.get("date_start"),
                 "date_expiry":   c.get("date_expiry"),
+                "multiplier":    c.get("multiplier"),
+                "trailing_stop": (trails.get(str(c.get("contract_id"))) or {}).get("trail_stop")
+                                 or (trails.get(str(c.get("contract_id"))) or {}).get("initial_stop"),
             })
         return {"contracts": open_list}
     except Exception as e:

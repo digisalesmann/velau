@@ -142,6 +142,10 @@ def get_session_status() -> dict:
     /dashboard and /signals so the UI never drifts from SESSIONS again the
     way the old hardcoded "London open (07:00 UTC)" copy did."""
     now_utc = datetime.now(timezone.utc)
+    if TRADING_STRATEGY == "trend_4h":
+        # The trend strategy has no session windows: it evaluates every 4H
+        # candle whenever the gold market is open.
+        return {"in_session": True, "session_hours": "Around the clock", "mins_to_session": 0}
     in_session = any(s <= now_utc.hour < e for s, e in SESSIONS)
     session_hours = ", ".join(f"{s:02d}:00-{e:02d}:00" for s, e in SESSIONS) + " UTC"
 
@@ -192,6 +196,8 @@ class XAUMasterStrategy:
         self._placing = bool(value)
 
     def _in_trading_session(self) -> bool:
+        if TRADING_STRATEGY == "trend_4h":
+            return True
         hour = datetime.now(timezone.utc).hour
         return any(s <= hour < e for s, e in SESSIONS)
 
@@ -250,7 +256,9 @@ class XAUMasterStrategy:
             return db.insert_signal(
                 ANALYSIS_SYMBOL, sig_type,
                 float(price), float(rsi), str(bias),
-                f"[{int(score)}/4] {reason}", int(score),
+                # score=None: no confluence score applies (trend strategy),
+                # so no "[n/4]" prefix for the app to render as one.
+                reason if score is None else f"[{int(score)}/4] {reason}", int(score or 0),
                 features_json=json.dumps(features) if features else None,
             )
         except Exception as e:
