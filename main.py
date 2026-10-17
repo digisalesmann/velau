@@ -180,8 +180,8 @@ class SubscriptionCreateRequest(BaseModel):
 
 class SubmitProofRequest(BaseModel):
     payment_id: str
-    reference: str
-    image_base64: Optional[str] = None
+    reference: str = ""                  # optional transfer reference/ID
+    image_base64: Optional[str] = None   # payment screenshot, required
     content_type: str = "image/jpeg"
 
 class CandleRequest(BaseModel):
@@ -994,7 +994,7 @@ def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_current_user
 
 @app.post("/subscription/proof")
 async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current_user)):
-    """User submits a tx hash/reference (+ optional screenshot) for admin review."""
+    """User submits a payment screenshot (+ optional reference/ID) for admin review."""
     from rate_limit import payment_proof_limiter
     payment_proof_limiter.check(user.username.lower())
 
@@ -1005,8 +1005,10 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
         raise HTTPException(status_code=403, detail="Not your payment.")
     if sub["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail=f"Cannot submit proof for a {sub['status']} payment.")
-    if not req.reference.strip():
-        raise HTTPException(status_code=400, detail="A payment reference is required.")
+    # The screenshot is what an admin actually verifies a transfer against;
+    # a typed reference is easy to get wrong and many bank apps don't show one.
+    if not req.image_base64:
+        raise HTTPException(status_code=400, detail="A screenshot of your payment is required.")
 
     image_url = None
     if req.image_base64:
