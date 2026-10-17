@@ -4,6 +4,7 @@ instance. If it ever runs multi-instance, this needs to move to a shared
 store (Redis INCR + EXPIRE) since each process would otherwise count
 attempts separately.
 """
+import threading
 import time
 from collections import defaultdict
 from fastapi import HTTPException
@@ -14,21 +15,27 @@ class RateLimiter:
         self.max_attempts = max_attempts
         self.window = window_seconds
         self._hits: dict[str, list[float]] = defaultdict(list)
+        # The auth routes run as sync handlers in FastAPI's thread pool, so
+        # two attempts for the same key can arrive concurrently; without a
+        # lock both could pass the limit check before either is recorded.
+        self._lock = threading.Lock()
 
     def check(self, key: str):
         """Raises 429 if `key` has hit the limit; otherwise records this attempt."""
         now = time.monotonic()
-        hits = self._hits[key]
-        hits[:] = [t for t in hits if now - t < self.window]
-        if len(hits) >= self.max_attempts:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many attempts. Please wait a few minutes and try again.",
-            )
-        hits.append(now)
+        with self._lock:
+            hits = self._hits[key]
+            hits[:] = [t for t in hits if now - t < self.window]
+            if len(hits) >= self.max_attempts:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many attempts. Please wait a few minutes and try again.",
+                )
+            hits.append(now)
 
     def reset(self, key: str):
-        self._hits.pop(key, None)
+        with self._lock:
+            self._hits.pop(key, None)
 
 
 login_limiter          = RateLimiter(max_attempts=8,  window_seconds=300)    # 8 tries / 5 min per username

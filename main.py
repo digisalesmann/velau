@@ -62,7 +62,7 @@ async def _db_keepalive():
     while True:
         await asyncio.sleep(12 * 3600)
         try:
-            db.fetchone("SELECT 1")
+            (await asyncio.to_thread(db.fetchone, "SELECT 1"))
             logger.info("💓 DB keep-alive ping OK")
         except Exception as e:
             logger.warning(f"💓 DB keep-alive failed: {e}")
@@ -220,12 +220,12 @@ async def root():
     }
 
 @app.post("/notifications/register")
-async def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
+def register_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
     notif.register_token(req.token, username=user.username)
     return {"status": "registered"}
 
 @app.post("/notifications/unregister")
-async def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
+def unregister_fcm(req: FCMTokenRequest, user=Depends(get_current_user)):
     notif.unregister_token(req.token, username=user.username)
     return {"status": "unregistered"}
 
@@ -258,7 +258,7 @@ async def connect_deriv(
             )
 
         # Store token
-        db.save_deriv_token(user.username, req.api_token, account_id)
+        (await asyncio.to_thread(db.save_deriv_token, user.username, req.api_token, account_id))
         logger.info(
             f"{user.username} connected Deriv account "
             f"{account_id} (${balance} {currency})"
@@ -283,7 +283,7 @@ async def connect_deriv(
 
 
 @app.post("/deriv/disconnect")
-async def disconnect_deriv(user=Depends(get_current_user)):
+def disconnect_deriv(user=Depends(get_current_user)):
     """Remove the user's stored Deriv token."""
     db.save_deriv_token(user.username, "", "")
     return {"status": "disconnected"}
@@ -292,11 +292,11 @@ async def disconnect_deriv(user=Depends(get_current_user)):
 @app.get("/deriv/status")
 async def deriv_status(user=Depends(get_current_user)):
     """Check if user has a connected Deriv account."""
-    token = db.get_deriv_token(user.username)
+    token = (await asyncio.to_thread(db.get_deriv_token, user.username))
     if not token:
         return {"connected": False, "account_id": None, "balance": None}
 
-    me = db.get_user(user.username) or {}
+    me = (await asyncio.to_thread(db.get_user, user.username)) or {}
     from brokers.deriv_trading_service import DerivTradingService
     service = DerivTradingService(
         token=token, account_type=me.get("trade_account_type") or "real", max_retries=2
@@ -329,7 +329,7 @@ def _require_admin(user=Depends(get_current_user)):
 
 
 @app.get("/bot/status")
-async def get_bot_status(user=Depends(get_current_user)):
+def get_bot_status(user=Depends(get_current_user)):
     me   = db.get_user(user.username) or {}
     risk = db.get_user_risk_state(user.username)
     return {
@@ -345,14 +345,14 @@ async def get_bot_status(user=Depends(get_current_user)):
     }
 
 @app.post("/bot/my-toggle")
-async def toggle_my_bot(user=Depends(get_current_user)):
+def toggle_my_bot(user=Depends(get_current_user)):
     me = db.get_user(user.username) or {}
     new_val = not bool(me.get("bot_enabled", True))
     db.set_user_bot_enabled(user.username, new_val)
     return {"user_bot_enabled": new_val}
 
 @app.post("/account/trade-mode")
-async def set_trade_mode(req: TradeModeRequest, user=Depends(get_current_user)):
+def set_trade_mode(req: TradeModeRequest, user=Depends(get_current_user)):
     if req.mode not in ("demo", "real"):
         raise HTTPException(status_code=400, detail="mode must be 'demo' or 'real'.")
     db.set_trade_account_type(user.username, req.mode)
@@ -363,12 +363,12 @@ async def toggle_bot(user=Depends(_require_admin)):
     global bot_task
     if trading_bot.is_running:
         trading_bot.is_running = False
-        db.set_global_bot_enabled(False, updated_by=user.username)
+        (await asyncio.to_thread(db.set_global_bot_enabled, False, updated_by=user.username))
         if bot_task:
             bot_task.cancel()
         return {"message": "Bot paused (platform-wide)", "is_running": False}
     else:
-        db.set_global_bot_enabled(True, updated_by=user.username)
+        (await asyncio.to_thread(db.set_global_bot_enabled, True, updated_by=user.username))
         trading_bot.is_running = True
         bot_task = asyncio.create_task(trading_bot.start_bot_loop())
         return {"message": "Bot started (platform-wide)", "is_running": True}
@@ -389,13 +389,13 @@ async def get_dashboard(user=Depends(get_current_user)):
     visibility, and bot-status accuracy on screens that don't even touch
     Deriv data.
     """
-    market_bias = db.get_latest_bias(username=user.username)
-    deriv_token = db.get_deriv_token(user.username)
-    profile     = db.get_user(user.username) or {}
-    risk        = db.get_user_risk_state(user.username)
-    is_admin    = db.is_admin(user.username)
+    market_bias = (await asyncio.to_thread(db.get_latest_bias, username=user.username))
+    deriv_token = (await asyncio.to_thread(db.get_deriv_token, user.username))
+    profile     = (await asyncio.to_thread(db.get_user, user.username)) or {}
+    risk        = (await asyncio.to_thread(db.get_user_risk_state, user.username))
+    is_admin    = (await asyncio.to_thread(db.is_admin, user.username))
 
-    global_enabled   = db.get_global_bot_enabled()
+    global_enabled   = (await asyncio.to_thread(db.get_global_bot_enabled))
     user_enabled     = bool(profile.get("bot_enabled", True))
     effective_active = trading_bot.is_running and global_enabled and user_enabled
 
@@ -412,6 +412,16 @@ async def get_dashboard(user=Depends(get_current_user)):
         account_type = profile.get("trade_account_type") or "real"
         cache_key = f"dashboard:{user.username}:{account_type}"
         cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
+        lock = deriv_cache.lock(cache_key)
+        if cached is None:
+            await lock.acquire()
+            # A concurrent request may have just fetched this (or just failed
+            # to, in which case go straight to the stale fallback below).
+            cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
+            if cached is None and deriv_cache.recently_failed(cache_key):
+                cached = deriv_cache.get_stale(cache_key)
+            if cached is not None:
+                lock.release()
 
         if cached is not None:
             balance, currency, account_id = cached["balance"], cached["currency"], cached["account_id"]
@@ -461,6 +471,7 @@ async def get_dashboard(user=Depends(get_current_user)):
                 })
             except Exception as e:
                 logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
+                deriv_cache.mark_failed(cache_key)
                 # Minutes-old real data beats showing zeros on a transient blip.
                 stale = deriv_cache.get_stale(cache_key)
                 if stale is not None:
@@ -470,6 +481,7 @@ async def get_dashboard(user=Depends(get_current_user)):
                     pnl_percent = stale["pnl_percent"]
             finally:
                 await service.close()
+                lock.release()
 
     return DashboardResponse(
         username=user.username,
@@ -498,7 +510,7 @@ async def get_dashboard(user=Depends(get_current_user)):
 
 
 @app.post("/account/display-name")
-async def set_display_name(req: DisplayNameRequest, user=Depends(get_current_user)):
+def set_display_name(req: DisplayNameRequest, user=Depends(get_current_user)):
     name = req.display_name.strip()
     if not name or len(name) > 40:
         raise HTTPException(
@@ -528,7 +540,7 @@ async def upload_avatar(req: AvatarUploadRequest, user=Depends(get_current_user)
         logger.warning(f"Avatar upload failed for {user.username}: {e}")
         raise HTTPException(status_code=502, detail="Avatar upload failed. Please try again.")
 
-    db.update_avatar_url(user.username, avatar_url)
+    (await asyncio.to_thread(db.update_avatar_url, user.username, avatar_url))
     return {"avatar_url": avatar_url}
 
 
@@ -537,7 +549,7 @@ _RISK_TOLERANCE = {"conservative", "balanced", "aggressive"}
 _CAPITAL_RANGE = {"under_100", "100_1000", "1000_10000", "10000_plus"}
 
 @app.post("/account/survey")
-async def submit_survey(req: SurveyRequest, user=Depends(get_current_user)):
+def submit_survey(req: SurveyRequest, user=Depends(get_current_user)):
     """Post-signup risk/suitability questionnaire — informational only, does
     not affect the trading strategy (that's global, not user-configurable)."""
     if req.trading_experience not in _TRADING_EXPERIENCE:
@@ -557,7 +569,7 @@ async def submit_survey(req: SurveyRequest, user=Depends(get_current_user)):
 @app.get("/open_contracts")
 async def get_open_contracts(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token, account_type = _get_user_deriv_context(user.username)
+    token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
     service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
     try:
         await service.authenticate()
@@ -581,7 +593,7 @@ async def get_open_contracts(user=Depends(get_current_user)):
         # not on Deriv (Deriv's stop_loss stays at the initial backstop).
         trails = {
             str(p["contract_id"]): p
-            for p in db.get_open_trend_positions(user.username)
+            for p in (await asyncio.to_thread(db.get_open_trend_positions, user.username))
         }
 
         open_list = []
@@ -629,7 +641,7 @@ async def get_news():
         raise HTTPException(status_code=500, detail=f"News error: {e}")
 
 @app.get("/signals")
-async def get_signals(user=Depends(get_current_user)):
+def get_signals(user=Depends(get_current_user)):
     try:
         status = get_session_status()
         return {
@@ -645,35 +657,44 @@ async def get_signals(user=Depends(get_current_user)):
 @app.get("/dashboard/history")
 async def get_history(user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token, account_type = _get_user_deriv_context(user.username)
+    token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
 
     cache_key = f"history:{user.username}:{account_type}"
     cached = deriv_cache.get(cache_key, HISTORY_CACHE_TTL)
     if cached is not None:
         return cached
 
-    # Single attempt, no retry — see the /dashboard endpoint's comment above
-    # for why a retry-with-backoff here defeats the stale-cache fallback by
-    # outrunning the mobile client's own request timeout.
-    service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
-    try:
-        await service.authenticate()
-        result = await service.get_statement()
-        deriv_cache.set(cache_key, result)
-        return result
-    except Exception as e:
-        # Minutes-old history beats a hard failure on a transient blip.
+    # Single-flight: concurrent history requests share one Deriv fetch.
+    async with deriv_cache.lock(cache_key):
+        cached = deriv_cache.get(cache_key, HISTORY_CACHE_TTL)
+        if cached is not None:
+            return cached
         stale = deriv_cache.get_stale(cache_key)
-        if stale is not None:
+        if stale is not None and deriv_cache.recently_failed(cache_key):
             return stale
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await service.close()
+
+        # Single attempt, no retry — see the /dashboard endpoint's comment above
+        # for why a retry-with-backoff here defeats the stale-cache fallback by
+        # outrunning the mobile client's own request timeout.
+        service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
+        try:
+            await service.authenticate()
+            result = await service.get_statement()
+            deriv_cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            deriv_cache.mark_failed(cache_key)
+            # Minutes-old history beats a hard failure on a transient blip.
+            if stale is not None:
+                return stale
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            await service.close()
 
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token, account_type = _get_user_deriv_context(user.username)
+    token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
     service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
@@ -686,7 +707,7 @@ async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):
 @app.post("/candles")
 async def get_candles(req: CandleRequest, user=Depends(get_current_user)):
     from brokers.deriv_trading_service import DerivTradingService
-    token, account_type = _get_user_deriv_context(user.username)
+    token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
     service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
@@ -715,14 +736,14 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
 
     # Manual trades must respect the same circuit breaker the bot enforces
     # on itself — otherwise a tripped user could route around it by hand.
-    risk = db.get_user_risk_state(user.username)
+    risk = (await asyncio.to_thread(db.get_user_risk_state, user.username))
     if risk["circuit_broken"]:
         raise HTTPException(
             status_code=403,
             detail="Trading is paused for today after hitting your risk limit. Resumes at midnight UTC.",
         )
 
-    token, account_type = _get_user_deriv_context(user.username)
+    token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
     service = DerivTradingService(token=token, account_type=account_type, max_retries=2)
     try:
         await service.authenticate()
@@ -750,7 +771,7 @@ async def place_trade(req: TradeRequest, user=Depends(get_current_user)):
 # ── Subscription / payments ────────────────────────────────────────────────────
 
 @app.get("/subscription/status")
-async def get_subscription_status(user=Depends(get_current_user)):
+def get_subscription_status(user=Depends(get_current_user)):
     """Return the user's current subscription status."""
     admin = db.is_admin(user.username)
     if admin:
@@ -767,7 +788,7 @@ async def get_subscription_status(user=Depends(get_current_user)):
 
 
 @app.get("/session")
-async def get_session(user=Depends(get_current_user)):
+def get_session(user=Depends(get_current_user)):
     """
     Consolidated post-login info: 2FA status + subscription status in one
     round trip instead of two separate requests. The splash-screen biometric
@@ -798,7 +819,7 @@ async def get_session(user=Depends(get_current_user)):
 
 
 @app.get("/subscription/pending")
-async def get_pending_payment(user=Depends(get_current_user)):
+def get_pending_payment(user=Depends(get_current_user)):
     """Authoritative check for an unresolved order — the mobile dashboard's
     "resume this payment" banner is seeded from this, not only from its own
     local cache, so a cleared app / reinstalled device / a crash before that
@@ -834,7 +855,7 @@ async def get_pending_payment(user=Depends(get_current_user)):
 
 
 @app.get("/subscription/methods")
-async def list_payment_methods(plan: Optional[str] = None, user=Depends(get_current_user)):
+def list_payment_methods(plan: Optional[str] = None, user=Depends(get_current_user)):
     """Enabled payment methods for the checkout picker. If `plan` is given,
     bank_transfer methods get a live-converted preview_amount/preview_currency
     so the user can compare methods before committing to one — omitted (not
@@ -854,7 +875,7 @@ async def list_payment_methods(plan: Optional[str] = None, user=Depends(get_curr
 
 
 @app.post("/subscription/create")
-async def create_subscription(req: SubscriptionCreateRequest,
+def create_subscription(req: SubscriptionCreateRequest,
                               user=Depends(get_current_user)):
     """Create a pending order against an admin-configured payment method.
     No external processor — the user pays externally and submits proof for
@@ -935,7 +956,7 @@ async def create_subscription(req: SubscriptionCreateRequest,
 
 
 @app.get("/subscription/poll/{payment_id}")
-async def poll_payment(payment_id: str, user=Depends(get_current_user)):
+def poll_payment(payment_id: str, user=Depends(get_current_user)):
     """Client polls this every ~15s while a payment is in progress. Returns
     the order's own status — 'pending'|'pending_review'|'active'|'rejected'|'cancelled'."""
     sub = db.get_subscription_by_payment(payment_id)
@@ -956,7 +977,7 @@ class CancelPaymentRequest(BaseModel):
     payment_id: str
 
 @app.post("/subscription/cancel")
-async def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_current_user)):
+def cancel_subscription(req: CancelPaymentRequest, user=Depends(get_current_user)):
     """User-initiated cancel of a pending payment they no longer want to complete.
     Deliberately only works while status=='pending' — once proof is submitted
     (status=='pending_review'), only admin approve/reject should resolve it."""
@@ -977,7 +998,7 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
     from rate_limit import payment_proof_limiter
     payment_proof_limiter.check(user.username.lower())
 
-    sub = db.get_subscription_by_payment(req.payment_id)
+    sub = (await asyncio.to_thread(db.get_subscription_by_payment, req.payment_id))
     if not sub:
         raise HTTPException(status_code=404, detail="Payment not found.")
     if sub["username"] != user.username:
@@ -1003,7 +1024,7 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
             logger.warning(f"Proof upload failed for {req.payment_id}: {e}")
             raise HTTPException(status_code=502, detail="Screenshot upload failed. Please try again.")
 
-    db.submit_payment_proof(req.payment_id, req.reference.strip(), image_url)
+    (await asyncio.to_thread(db.submit_payment_proof, req.payment_id, req.reference.strip(), image_url))
 
     # notify_admins sends a blocking FCM push per admin device — offload it
     # too, and don't let a slow/failed push turn a successful proof
@@ -1024,10 +1045,10 @@ async def submit_payment_proof(req: SubmitProofRequest, user=Depends(get_current
 @app.get("/subscription/proof_image/{payment_id}")
 async def get_payment_proof_image(payment_id: str, user=Depends(get_current_user)):
     """Authorized proxy for a proof screenshot — the storage bucket is private."""
-    sub = db.get_subscription_by_payment(payment_id)
+    sub = (await asyncio.to_thread(db.get_subscription_by_payment, payment_id))
     if not sub:
         raise HTTPException(status_code=404, detail="Payment not found.")
-    if sub["username"] != user.username and not db.is_admin(user.username):
+    if sub["username"] != user.username and not (await asyncio.to_thread(db.is_admin, user.username)):
         raise HTTPException(status_code=403, detail="Not your payment.")
     if not sub.get("proof_image_url"):
         raise HTTPException(status_code=404, detail="No screenshot was submitted for this payment.")
@@ -1086,22 +1107,22 @@ class AdminSubRejectRequest(BaseModel):
 
 
 @app.get("/admin/stats")
-async def admin_stats(user=Depends(_require_admin)):
+def admin_stats(user=Depends(_require_admin)):
     return db.admin_get_stats()
 
 
 @app.get("/admin/users")
-async def admin_users(user=Depends(_require_admin)):
+def admin_users(user=Depends(_require_admin)):
     return {"users": db.admin_get_users()}
 
 
 @app.get("/admin/subscriptions")
-async def admin_subscriptions(user=Depends(_require_admin)):
+def admin_subscriptions(user=Depends(_require_admin)):
     return {"subscriptions": db.admin_get_subscriptions()}
 
 
 @app.post("/admin/grant")
-async def admin_grant(req: AdminGrantRequest, user=Depends(_require_admin)):
+def admin_grant(req: AdminGrantRequest, user=Depends(_require_admin)):
     from payments import PLANS
     if req.plan not in PLANS:
         raise HTTPException(status_code=400, detail="Invalid plan.")
@@ -1113,7 +1134,7 @@ async def admin_grant(req: AdminGrantRequest, user=Depends(_require_admin)):
 
 
 @app.post("/admin/revoke")
-async def admin_revoke(req: AdminRevokeRequest, user=Depends(_require_admin)):
+def admin_revoke(req: AdminRevokeRequest, user=Depends(_require_admin)):
     db.admin_revoke_subscription(req.sub_id)
     logger.info(f"Admin {user.username} revoked subscription {req.sub_id}")
     return {"ok": True}
@@ -1136,7 +1157,7 @@ def _validate_payment_method_fields(req: AdminPaymentMethodRequest):
 
 
 @app.get("/admin/payment_methods")
-async def admin_list_payment_methods(user=Depends(_require_admin)):
+def admin_list_payment_methods(user=Depends(_require_admin)):
     return {"methods": db.get_payment_methods(enabled_only=False)}
 
 
@@ -1147,48 +1168,44 @@ async def admin_create_payment_method(req: AdminPaymentMethodRequest, user=Depen
     # the single-worker event loop (this was the direct cause of the admin
     # panel timing out right after saving a payment method).
     logo_url = await asyncio.to_thread(coingecko.fetch_logo_url, req.crypto_currency) if req.type == "crypto" else None
-    method_id = db.create_payment_method(
-        type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
+    method_id = (await asyncio.to_thread(db.create_payment_method, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
         crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
         bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
         bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
-        bank_currency=req.bank_currency, logo_url=logo_url,
-    )
+        bank_currency=req.bank_currency, logo_url=logo_url,))
     return {"id": method_id}
 
 
 @app.post("/admin/payment_methods/update")
 async def admin_update_payment_method(req: AdminPaymentMethodUpdateRequest, user=Depends(_require_admin)):
-    if not db.get_payment_method(req.id):
+    if not (await asyncio.to_thread(db.get_payment_method, req.id)):
         raise HTTPException(status_code=404, detail="Payment method not found.")
     _validate_payment_method_fields(req)
     logo_url = await asyncio.to_thread(coingecko.fetch_logo_url, req.crypto_currency) if req.type == "crypto" else None
-    db.update_payment_method(
-        req.id, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
+    (await asyncio.to_thread(db.update_payment_method, req.id, type=req.type, label=req.label, enabled=req.enabled, sort_order=req.sort_order,
         instructions=req.instructions,
         crypto_address=req.crypto_address, crypto_network=req.crypto_network, crypto_currency=req.crypto_currency,
         bank_name=req.bank_name, bank_account_name=req.bank_account_name, bank_account_number=req.bank_account_number,
         bank_routing_number=req.bank_routing_number, bank_swift=req.bank_swift, bank_iban=req.bank_iban,
-        bank_currency=req.bank_currency, logo_url=logo_url,
-    )
+        bank_currency=req.bank_currency, logo_url=logo_url,))
     return {"ok": True}
 
 
 @app.post("/admin/payment_methods/delete")
-async def admin_delete_payment_method(req: AdminPaymentMethodDeleteRequest, user=Depends(_require_admin)):
+def admin_delete_payment_method(req: AdminPaymentMethodDeleteRequest, user=Depends(_require_admin)):
     db.delete_payment_method(req.id)
     return {"ok": True}
 
 
 @app.post("/admin/subscriptions/approve")
 async def admin_approve_subscription(req: AdminSubActionRequest, user=Depends(_require_admin)):
-    sub = db.get_subscription_by_id(req.sub_id)
+    sub = (await asyncio.to_thread(db.get_subscription_by_id, req.sub_id))
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found.")
     if sub["status"] != "pending_review":
         raise HTTPException(status_code=400, detail=f"Cannot approve a {sub['status']} payment.")
-    db.admin_approve_subscription(req.sub_id, sub["plan"], user.username)
+    (await asyncio.to_thread(db.admin_approve_subscription, req.sub_id, sub["plan"], user.username))
     logger.info(f"Admin {user.username} approved subscription {req.sub_id} ({sub['username']}, {sub['plan']})")
     try:
         await asyncio.to_thread(
@@ -1204,14 +1221,14 @@ async def admin_approve_subscription(req: AdminSubActionRequest, user=Depends(_r
 
 @app.post("/admin/subscriptions/reject")
 async def admin_reject_subscription(req: AdminSubRejectRequest, user=Depends(_require_admin)):
-    sub = db.get_subscription_by_id(req.sub_id)
+    sub = (await asyncio.to_thread(db.get_subscription_by_id, req.sub_id))
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found.")
     if sub["status"] != "pending_review":
         raise HTTPException(status_code=400, detail=f"Cannot reject a {sub['status']} payment.")
     if not req.reason.strip():
         raise HTTPException(status_code=400, detail="A rejection reason is required.")
-    db.admin_reject_subscription(req.sub_id, user.username, req.reason.strip())
+    (await asyncio.to_thread(db.admin_reject_subscription, req.sub_id, user.username, req.reason.strip()))
     logger.info(f"Admin {user.username} rejected subscription {req.sub_id} ({sub['username']}): {req.reason}")
     try:
         await asyncio.to_thread(
@@ -1226,7 +1243,7 @@ async def admin_reject_subscription(req: AdminSubRejectRequest, user=Depends(_re
 
 
 @app.post("/admin/set_admin")
-async def admin_set_admin(req: AdminSetAdminRequest, user=Depends(_require_admin)):
+def admin_set_admin(req: AdminSetAdminRequest, user=Depends(_require_admin)):
     if not db.get_user(req.username):
         raise HTTPException(status_code=404, detail="User not found.")
     db.set_admin(req.username, req.value)
@@ -1238,7 +1255,7 @@ class AdminResetCircuitBreakerRequest(BaseModel):
 
 
 @app.post("/admin/reset_circuit_breaker")
-async def admin_reset_circuit_breaker(
+def admin_reset_circuit_breaker(
     req: AdminResetCircuitBreakerRequest, user=Depends(_require_admin)
 ):
     if not db.get_user(req.username):
@@ -1255,13 +1272,13 @@ class TwoFACodeRequest(BaseModel):
 
 
 @app.get("/2fa/status")
-async def get_2fa_status(user=Depends(get_current_user)):
+def get_2fa_status(user=Depends(get_current_user)):
     data = db.get_totp_data(user.username)
     return {"enabled": bool(data and data.get("totp_enabled"))}
 
 
 @app.get("/2fa/setup")
-async def setup_2fa(user=Depends(get_current_user)):
+def setup_2fa(user=Depends(get_current_user)):
     import pyotp
     data = db.get_totp_data(user.username)
     # Refuse to overwrite an already-active secret — user must disable first
@@ -1277,7 +1294,7 @@ async def setup_2fa(user=Depends(get_current_user)):
 
 
 @app.post("/2fa/enable")
-async def enable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+def enable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     import pyotp
     twofa_limiter.check(user.username)
     data = db.get_totp_data(user.username)
@@ -1291,7 +1308,7 @@ async def enable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
 
 
 @app.post("/2fa/verify")
-async def verify_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+def verify_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     import pyotp
     data = db.get_totp_data(user.username)
     if not data or not data.get("totp_enabled"):
@@ -1304,7 +1321,7 @@ async def verify_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
 
 
 @app.post("/2fa/disable")
-async def disable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
+def disable_2fa(req: TwoFACodeRequest, user=Depends(get_current_user)):
     import pyotp
     twofa_limiter.check(user.username)
     data = db.get_totp_data(user.username)

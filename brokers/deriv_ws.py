@@ -28,6 +28,9 @@ Solution:
   internal cancellation handling.
 """
 import asyncio
+import hashlib
+import threading
+import time
 import websockets
 import json
 import logging
@@ -36,6 +39,19 @@ from brokers.deriv_rest import DerivREST
 from env_config import DERIV_APP_ID
 
 logger = logging.getLogger("DerivWebSocket")
+
+# A token's account list (demo/real ids) doesn't change minute to minute, but
+# fetching it is a full REST round trip on every login. Cached per token for
+# ACCOUNTS_TTL; dropped whenever a login with it fails, so a revoked or
+# expired token is never served from cache. OTPs are single-use and are never
+# cached. Keyed by a hash so raw tokens aren't held as dict keys.
+ACCOUNTS_TTL = 600
+_accounts_cache: dict[str, tuple[float, list]] = {}
+_accounts_lock = threading.Lock()
+
+
+def _token_key(app_id: str, token: str) -> str:
+    return hashlib.sha256(f"{app_id}:{token}".encode()).hexdigest()
 
 
 class DerivWebSocket:
@@ -59,7 +75,16 @@ class DerivWebSocket:
     def _fetch_ws_url(self) -> str:
         """Blocking REST calls (accounts -> OTP) run off the event loop via asyncio.to_thread."""
         rest = DerivREST(app_id=self.app_id, token=self.token)
-        accounts = rest.get_accounts()
+        key = _token_key(self.app_id, self.token)
+        with _accounts_lock:
+            hit = _accounts_cache.get(key)
+        if hit and time.monotonic() - hit[0] < ACCOUNTS_TTL:
+            accounts = hit[1]
+        else:
+            accounts = rest.get_accounts()
+            if accounts:
+                with _accounts_lock:
+                    _accounts_cache[key] = (time.monotonic(), accounts)
         if not accounts:
             raise ConnectionError("Deriv token has no accessible trading accounts.")
 
@@ -75,7 +100,13 @@ class DerivWebSocket:
         self.account_id   = chosen.get("account_id")
         self.account_info = chosen
 
-        otp = rest.generate_otp(self.account_id)
+        try:
+            otp = rest.generate_otp(self.account_id)
+        except Exception:
+            # Possibly a revoked token or a changed account: re-fetch next time.
+            with _accounts_lock:
+                _accounts_cache.pop(key, None)
+            raise
         return otp["data"]["url"]
 
     async def connect(self):

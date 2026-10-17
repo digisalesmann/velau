@@ -96,7 +96,7 @@ def user_exists_in_db(username: str) -> bool:
 
 
 # ── Auth dependency ────────────────────────────────────────────────────────────
-async def get_current_user(
+def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
     exc = HTTPException(
@@ -122,7 +122,7 @@ async def get_current_user(
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @router.post("/register", response_model=Token)
-async def register(user_in: UserIn, request: Request):
+def register(user_in: UserIn, request: Request):
     register_limiter.check(request.client.host if request.client else "unknown")
     if len(user_in.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
@@ -141,7 +141,7 @@ async def register(user_in: UserIn, request: Request):
 
 
 @router.post("/login", response_model=Token)
-async def login(user_in: UserIn):
+def login(user_in: UserIn):
     login_limiter.check(user_in.username.lower())
     try:
         user = get_user_from_db(user_in.username)
@@ -159,7 +159,7 @@ async def login(user_in: UserIn):
 
 
 @router.post("/auth/forgot-password")
-async def forgot_password(req: ForgotPasswordRequest):
+def forgot_password(req: ForgotPasswordRequest):
     """
     Always returns the same generic response regardless of whether the
     account exists — a distinguishable response here would let anyone probe
@@ -188,7 +188,7 @@ async def forgot_password(req: ForgotPasswordRequest):
 
 
 @router.post("/auth/reset-password")
-async def reset_password(req: ResetPasswordRequest):
+def reset_password(req: ResetPasswordRequest):
     import hashlib
     from datetime import datetime
 
@@ -209,7 +209,7 @@ async def reset_password(req: ResetPasswordRequest):
 
 
 @router.post("/auth/change-password")
-async def change_password(req: ChangePasswordRequest, user: User = Depends(get_current_user)):
+def change_password(req: ChangePasswordRequest, user: User = Depends(get_current_user)):
     """
     For a logged-in user who knows their current password — distinct from
     /auth/reset-password, which is for a logged-out user proving identity
@@ -243,7 +243,7 @@ def _get_firebase_app():
 
 
 @router.post("/auth/firebase", response_model=Token)
-async def auth_firebase(req: FirebaseAuthRequest):
+def auth_firebase(req: FirebaseAuthRequest):
     """
     Verify a Firebase ID token and return a backend JWT.
     Creates the backend user on first login — no password sync needed.
