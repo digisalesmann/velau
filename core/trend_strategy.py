@@ -9,7 +9,9 @@ The rules here are exactly the ones validated in backtest/trend_candidate.py
 (run with --regime), and tests/test_trend_parity.py replays these functions
 over the same history to confirm they take the same trades:
 
-  4 independent sleeves, long only:  lookback 20/55 bars  x  stop 2/3 ATR
+  8 independent sleeves: 4 long + 4 short, lookback 20/55 bars x stop 2/3 ATR
+  (short sleeves mirror the long rules below: breakdown below the lowest
+  low, stacked-DOWN averages, stop above price trailed down)
   Entry   a completed 4H candle closes above the highest high of the previous
           `lookback` candles, AND on the previous day's daily close the moving
           averages are stacked: close > 50-day SMA > 200-day SMA (regime
@@ -55,12 +57,22 @@ logger = logging.getLogger("TrendStrategy")
 SYMBOL          = "frxXAUUSD"
 GRAN_4H         = 14400
 GRAN_1D         = 86400
+# Long sleeves ("L") buy breakouts in a stacked-up market; short sleeves ("S")
+# are the exact mirror, selling breakdowns in a stacked-down market (added
+# 2026-10-19, backtest/short_side.py). Each side's 4 sleeves risk 1/4 of the
+# per-trade amount each, as backtested.
 SLEEVES = [
-    {"id": "L20x2", "lookback": 20, "stop_mult": 2.0},
-    {"id": "L20x3", "lookback": 20, "stop_mult": 3.0},
-    {"id": "L55x2", "lookback": 55, "stop_mult": 2.0},
-    {"id": "L55x3", "lookback": 55, "stop_mult": 3.0},
+    {"id": f"{p}{lb}x{int(sm)}", "lookback": lb, "stop_mult": sm, "side": side}
+    for p, side in (("L", 1), ("S", -1))
+    for lb in (20, 55)
+    for sm in (2.0, 3.0)
 ]
+SLEEVES_PER_SIDE = 4
+
+
+def sleeve_side(sleeve_id: str) -> int:
+    """+1 long, -1 short. Derived from the id so trend_positions needs no column."""
+    return -1 if sleeve_id.startswith("S") else 1
 ATR_PERIOD      = 14
 REGIME_SMA_DAYS = 200
 REGIME_FAST_SMA_DAYS = 50
@@ -99,37 +111,53 @@ def closed_bars(df: pd.DataFrame, gran: int, now_epoch: int) -> pd.DataFrame:
     return df[df["epoch"] + gran <= now_epoch].reset_index(drop=True)
 
 
-def entry_signal(h4_closed: pd.DataFrame, lookback: int) -> bool:
-    """Last completed 4H close above the highest high of the `lookback` bars before it."""
+def entry_signal(h4_closed: pd.DataFrame, lookback: int, side: int = 1) -> bool:
+    """Long: last completed 4H close above the highest high of the `lookback`
+    bars before it. Short: close below the lowest low of those bars."""
     if len(h4_closed) < lookback + 1:
         return False
-    highs = h4_closed["high"].to_numpy()
-    return float(h4_closed["close"].iloc[-1]) > float(highs[-1 - lookback:-1].max())
+    close = float(h4_closed["close"].iloc[-1])
+    if side > 0:
+        return close > float(h4_closed["high"].to_numpy()[-1 - lookback:-1].max())
+    return close < float(h4_closed["low"].to_numpy()[-1 - lookback:-1].min())
 
 
-def regime_up(daily: pd.DataFrame, bar_epoch: int) -> bool:
-    """As of the 4H bar's day, the previous daily close has stacked moving
-    averages: close > 50-day SMA > 200-day SMA."""
+def regime(daily: pd.DataFrame, bar_epoch: int) -> int:
+    """As of the 4H bar's day, the previous daily close's moving averages:
+    +1 stacked up (close > SMA50 > SMA200), -1 stacked down (close < SMA50 <
+    SMA200), 0 neither (mixed: no new trades on either side)."""
     day_start = bar_epoch - bar_epoch % GRAN_1D
     prior = daily[daily["epoch"] < day_start]
     if len(prior) < REGIME_SMA_DAYS:
-        return False
+        return 0
     closes = prior["close"].to_numpy()
+    close = float(closes[-1])
     sma_fast = float(closes[-REGIME_FAST_SMA_DAYS:].mean())
     sma_slow = float(closes[-REGIME_SMA_DAYS:].mean())
-    return float(closes[-1]) > sma_fast > sma_slow
+    if close > sma_fast > sma_slow:
+        return 1
+    if close < sma_fast < sma_slow:
+        return -1
+    return 0
+
+
+def regime_up(daily: pd.DataFrame, bar_epoch: int) -> bool:
+    return regime(daily, bar_epoch) == 1
 
 
 def trailing_stop(h4_closed: pd.DataFrame, entry_bar_epoch: int, initial_stop: float,
-                  stop_mult: float, stored_trail: float | None = None) -> float:
-    """Initial stop raised to (close - stop_mult x ATR) of every completed bar
-    after entry; never lowered, and never below a previously stored value."""
+                  stop_mult: float, stored_trail: float | None = None, side: int = 1) -> float:
+    """Long: initial stop raised to (close - distance) of every completed bar
+    after entry, never lowered. Short: lowered to (close + distance), never
+    raised. Never looser than a previously stored value either."""
     c = h4_closed["close"].to_numpy()
     dist = stop_distance(atr(h4_closed), c, stop_mult)
     after = (h4_closed["epoch"] > entry_bar_epoch).to_numpy()
-    stop = max(initial_stop, stored_trail or initial_stop)
+    tighter = max if side > 0 else min
+    stop = tighter(initial_stop, stored_trail if stored_trail is not None else initial_stop)
     if after.any():
-        stop = max(stop, float((c[after] - dist[after]).max()))
+        trail = (c[after] - dist[after]).max() if side > 0 else (c[after] + dist[after]).min()
+        stop = tighter(stop, float(trail))
     return stop
 
 
@@ -180,43 +208,52 @@ class TrendTrader:
         bar      = h4.iloc[-1]
         bar_ep   = int(bar["epoch"])
         a_now    = float(atr(h4)[-1])
-        regime   = regime_up(daily, bar_ep)
+        trend    = regime(daily, bar_ep)
         new_bar  = bar_ep != self._last_bar_evaluated
-        signals  = {s["id"]: entry_signal(h4, s["lookback"]) for s in SLEEVES}
+        # A sleeve's signal only counts when the market is stacked its way.
+        signals  = {s["id"]: trend == s["side"] and entry_signal(h4, s["lookback"], s["side"])
+                    for s in SLEEVES}
         logger.info(
             f"📈 Trend | spot={spot:.2f} bar={datetime.fromtimestamp(bar_ep, timezone.utc):%m-%d %H:%M} "
-            f"close={bar['close']:.2f} ATR={a_now:.2f} regime={'UP' if regime else 'down'} "
+            f"close={bar['close']:.2f} ATR={a_now:.2f} regime={ {1: 'UP', -1: 'DOWN', 0: 'mixed'}[trend] } "
             f"signals={[k for k, v in signals.items() if v] or 'none'}"
         )
 
         if new_bar:
             fired = [k for k, v in signals.items() if v]
-            if fired and regime:
+            if fired:
                 lookbacks = sorted({s["lookback"] for s in SLEEVES if s["id"] in fired}, reverse=True)
                 days = round(lookbacks[0] * 4 / 24)
-                self.strategy.save_signal(
-                    "BUY", bar["close"], 0, "bullish",
-                    f"Gold closed at a {days}-day high on the 4H chart | "
-                    f"Gold's 50-day and 200-day averages both point up", None)
+                if trend > 0:
+                    self.strategy.save_signal(
+                        "BUY", bar["close"], 0, "bullish",
+                        f"Gold closed at a {days}-day high on the 4H chart | "
+                        f"Gold's 50-day and 200-day averages both point up", None)
+                else:
+                    self.strategy.save_signal(
+                        "SELL", bar["close"], 0, "bearish",
+                        f"Gold closed at a {days}-day low on the 4H chart | "
+                        f"Gold's 50-day and 200-day averages both point down", None)
             else:
-                why = ("No 4H breakout yet" if regime else
-                       "Gold isn't in an uptrend, staying in cash")
-                self.strategy.save_signal("NEUTRAL", bar["close"], 0, "bullish" if regime else "bearish",
-                                          why, None)
+                why = {1: "Uptrend, waiting for a 4H breakout",
+                       -1: "Downtrend, waiting for a 4H breakdown",
+                       0: "No clear trend, staying in cash"}[trend]
+                self.strategy.save_signal("NEUTRAL", bar["close"], 0,
+                                          {1: "bullish", -1: "bearish", 0: "neutral"}[trend], why, None)
 
         for u in all_users:
             try:
-                await self._run_user(u, h4, spot, bar_ep, a_now, regime, signals, new_bar, now)
+                await self._run_user(u, h4, spot, bar_ep, a_now, signals, new_bar, now)
             except Exception as e:
                 logger.error(f"❌ Trend [{u['username']}] cycle error: {e}")
 
         self._last_bar_evaluated = bar_ep
 
-    async def _run_user(self, u, h4, spot, bar_ep, a_now, regime, signals, new_bar, now):
+    async def _run_user(self, u, h4, spot, bar_ep, a_now, signals, new_bar, now):
         username = u["username"]
         positions = db.get_open_trend_positions(username)
         eligible = u.get("bot_enabled", True) and not u.get("circuit_broken", False)
-        want_entries = new_bar and eligible and regime and any(signals.values())
+        want_entries = new_bar and eligible and any(signals.values())
         if not positions and not want_entries:
             return
 
@@ -247,12 +284,14 @@ class TrendTrader:
         sold = poc.get("is_sold") in (1, True, "1") or poc.get("status") in ("won", "lost", "sold")
         reason = "deriv_stop"  # closed server-side: Deriv's stop_loss backstop or stop-out
         if not sold:
+            side = sleeve_side(p["sleeve"])
+            stored = float(p["trail_stop"]) if p.get("trail_stop") is not None else None
             trail = trailing_stop(h4, int(p["entry_bar_epoch"]), float(p["initial_stop"]),
-                                  float(p["stop_mult"]), p.get("trail_stop"))
-            if p.get("trail_stop") is None or trail > float(p["trail_stop"]):
+                                  float(p["stop_mult"]), stored, side)
+            if stored is None or (trail > stored if side > 0 else trail < stored):
                 db.set_trend_trail(cid, username, trail)
             held = bars_held(h4, int(p["entry_bar_epoch"]))
-            if spot <= trail:
+            if (spot <= trail) if side > 0 else (spot >= trail):
                 reason = "trailing_stop"
             elif held >= MAX_HOLD_BARS:
                 reason = "max_hold"
@@ -275,7 +314,7 @@ class TrendTrader:
         # and no win-rate caution (a 30-54% win rate is expected here, and the
         # caution threshold was set for a different strategy's break-even).
         total_risk, tier = calculate_stake(balance=balance)
-        sleeve_risk = round(total_risk / len(SLEEVES), 2)
+        sleeve_risk = round(total_risk / SLEEVES_PER_SIDE, 2)
         entry = float(h4["close"].iloc[-1])
         for s in SLEEVES:
             if not signals[s["id"]] or s["id"] in open_sleeves:
@@ -293,11 +332,12 @@ class TrendTrader:
             if plan["stake"] > balance:
                 logger.warning(f"⛔ [{username}] {s['id']} skipped: stake ${plan['stake']:.2f} > balance ${balance:.2f}")
                 continue
-            result = await svc.place_order("MULTUP", plan["stake"], multiplier=plan["multiplier"],
-                                           stop_loss=plan["stop_loss"])
+            side = s["side"]
+            result = await svc.place_order("MULTUP" if side > 0 else "MULTDOWN", plan["stake"],
+                                           multiplier=plan["multiplier"], stop_loss=plan["stop_loss"])
             buy = result.get("buy", {})
             cid = str(buy.get("contract_id"))
-            initial_stop = entry - dist
+            initial_stop = entry - side * dist
             try:
                 db.insert_trend_position(cid, username, s["id"], bar_ep, entry, s["stop_mult"],
                                          initial_stop, plan["stop_loss"], plan["stake"],
@@ -309,14 +349,15 @@ class TrendTrader:
                 await svc.sell_contract(cid)
                 continue
             open_sleeves.add(s["id"])
-            logger.info(f"✅ [{username}] {s['id']} BUY x{plan['multiplier']} stake=${plan['stake']:.2f} "
+            logger.info(f"✅ [{username}] {s['id']} {'BUY' if side > 0 else 'SELL'} x{plan['multiplier']} stake=${plan['stake']:.2f} "
                         f"risk=${plan['stop_loss']:.2f} stop={initial_stop:.2f} | contract={cid}")
             try:
                 from core import notifications as notif
                 await asyncio.to_thread(
-                    notif.notify_user, username, "Trade Placed: Gold trend",
+                    notif.notify_user, username,
+                    f"Trade Placed: Gold {'uptrend (buy)' if side > 0 else 'downtrend (sell)'}",
                     f"XAU/USD  |  Risk ${plan['stop_loss']:.2f}  |  Trailing stop, no fixed target",
-                    {"type": "trade_executed", "direction": "CALL"},
+                    {"type": "trade_executed", "direction": "CALL" if side > 0 else "PUT"},
                 )
             except Exception as e:
                 logger.warning(f"Trade-placed notification failed for {username}: {e}")

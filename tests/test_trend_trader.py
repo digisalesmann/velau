@@ -13,15 +13,19 @@ H4, D1 = ts.GRAN_4H, ts.GRAN_1D
 T0 = 1_780_000_000 - 1_780_000_000 % D1   # a UTC midnight
 
 
-def _h4_frame(n=200, breakout=True, spot=None):
+def _h4_frame(n=200, breakout=True, spot=None, breakdown=False):
     """Gently rising 4H bars; the last closed bar breaks above every prior
-    high when `breakout`. A forming bar follows it, closing at `spot`."""
+    high when `breakout`, or below every prior low when `breakdown`. A
+    forming bar follows it, closing at `spot`."""
     rng = np.random.default_rng(1)
     close = 4000 + np.cumsum(rng.normal(0.3, 4, n))
     high, low = close + 3, close - 3
     if breakout:
         close[-1] = high[:-1].max() + 10
         high[-1] = close[-1] + 1
+    if breakdown:
+        close[-1] = low[:-1].min() - 10
+        low[-1] = close[-1] - 1
     ep = T0 + np.arange(n) * H4
     df = pd.DataFrame({"epoch": ep, "open": close - 1, "high": high, "low": low, "close": close})
     forming = {"epoch": ep[-1] + H4, "open": close[-1], "high": close[-1],
@@ -127,12 +131,12 @@ def test_breakout_in_uptrend_opens_all_sleeves():
     trader, strat, db = _setup(_h4_frame())
     asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
     from position_sizing import calculate_stake
-    sleeve_risk = round(calculate_stake(balance=1000.0)[0] / len(ts.SLEEVES), 2)
-    assert len(FakeDeriv.orders) == len(ts.SLEEVES)
+    sleeve_risk = round(calculate_stake(balance=1000.0)[0] / ts.SLEEVES_PER_SIDE, 2)
+    assert len(FakeDeriv.orders) == ts.SLEEVES_PER_SIDE
     for o in FakeDeriv.orders:
         assert o["type"] == "MULTUP" and o["take_profit"] is None
         assert o["stop_loss"] == sleeve_risk
-    assert len(db.rows) == len(ts.SLEEVES)
+    assert len(db.rows) == ts.SLEEVES_PER_SIDE
     assert strat.signals[0][0] == "BUY"
 
 
@@ -142,7 +146,7 @@ def test_same_bar_never_entered_twice():
     asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
     trader2 = ts.TrendTrader(strat)                  # simulated restart: memory gone, DB kept
     asyncio.run(trader2.run_cycle(FakeDeriv(), [USER]))
-    assert len(FakeDeriv.orders) == len(ts.SLEEVES)
+    assert len(FakeDeriv.orders) == ts.SLEEVES_PER_SIDE
 
 
 def test_downtrend_regime_blocks_entries():
@@ -160,7 +164,7 @@ def test_trailing_stop_exit_sells_and_settles():
     asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
     assert sorted(FakeDeriv.sold) == sorted(r["contract_id"] for r in db.rows.values())
     assert all(r["status"] == "closed" and r["exit_reason"] == "trailing_stop" for r in db.rows.values())
-    assert len(strat.settled) == len(ts.SLEEVES) and all(p < 0 for _, p, _ in strat.settled)
+    assert len(strat.settled) == ts.SLEEVES_PER_SIDE and all(p < 0 for _, p, _ in strat.settled)
 
 
 def test_deriv_side_close_is_recorded_without_selling():
@@ -179,7 +183,42 @@ def test_paused_user_still_gets_exits_managed():
     paused = {**USER, "bot_enabled": False}
     FakeDeriv.h4 = _h4_frame(spot=3000.0)
     asyncio.run(trader.run_cycle(FakeDeriv(), [paused]))
-    assert len(FakeDeriv.sold) == len(ts.SLEEVES)
+    assert len(FakeDeriv.sold) == ts.SLEEVES_PER_SIDE
+
+
+def test_breakdown_in_downtrend_opens_short_sleeves():
+    trader, strat, db = _setup(_h4_frame(breakout=False, breakdown=True), uptrend=False)
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    assert len(FakeDeriv.orders) == ts.SLEEVES_PER_SIDE
+    assert all(o["type"] == "MULTDOWN" and o["take_profit"] is None for o in FakeDeriv.orders)
+    assert all(r["sleeve"].startswith("S") for r in db.rows.values())
+    # A short's stop sits ABOVE entry.
+    assert all(r["initial_stop"] > r["entry_price"] for r in db.rows.values())
+    assert strat.signals[0][0] == "SELL"
+
+
+def test_breakdown_in_uptrend_is_ignored():
+    trader, strat, db = _setup(_h4_frame(breakout=False, breakdown=True), uptrend=True)
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    assert FakeDeriv.orders == []
+
+
+def test_short_trailing_stop_exit_when_price_rises():
+    trader, strat, db = _setup(_h4_frame(breakout=False, breakdown=True), uptrend=False)
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    FakeDeriv.h4 = _h4_frame(breakout=False, breakdown=True, spot=6000.0)   # price jumps up
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    assert sorted(FakeDeriv.sold) == sorted(r["contract_id"] for r in db.rows.values())
+    assert all(r["exit_reason"] == "trailing_stop" for r in db.rows.values())
+
+
+def test_short_not_stopped_while_price_keeps_falling():
+    trader, strat, db = _setup(_h4_frame(breakout=False, breakdown=True), uptrend=False)
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    FakeDeriv.h4 = _h4_frame(breakout=False, breakdown=True, spot=3500.0)   # falls further
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    assert FakeDeriv.sold == []
+    assert all(r["status"] == "open" for r in db.rows.values())
 
 
 if __name__ == "__main__":

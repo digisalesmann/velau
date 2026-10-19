@@ -186,7 +186,7 @@ def f2_ny_breakout(m15, venue, stop_mode, rr, longs_only):
 
 
 def f3_swing_trend(h4, venue, lookback, stop_mult, longs_only, regime_ok=None,
-                   max_stop_pct=None, stop_mode="skip"):
+                   max_stop_pct=None, stop_mode="skip", shorts_only=False):
     """4H Donchian breakout: enter when close > prior `lookback`-bar high (or
     < low); initial stop stop_mult x ATR(14, 4H), then an ATR chandelier
     trailing stop at the same multiple; no target, so winners can run for
@@ -203,7 +203,8 @@ def f3_swing_trend(h4, venue, lookback, stop_mult, longs_only, regime_ok=None,
     out, k = [], lookback + 15
     while k < len(h4) - 1:
         side = 1 if c[k] > hh[k] else -1 if c[k] < ll[k] else 0
-        if side == 0 or (longs_only and side < 0) or (regime_ok is not None and not regime_ok[k]):
+        if side == 0 or (longs_only and side < 0) or (shorts_only and side > 0) or \
+                (regime_ok is not None and not regime_ok[k]):
             k += 1
             continue
         risk = stop_mult * a[k]
