@@ -1,6 +1,7 @@
 """
 Deriv Trading Service — Python 3.14 compatible, Render-tuned timeouts.
 """
+import asyncio
 import logging
 
 from brokers.deriv_ws import DerivWebSocket
@@ -337,12 +338,22 @@ class DerivTradingService:
             raise Exception(msg["error"].get("message", "portfolio failed"))
         return (msg.get("portfolio") or {}).get("contracts", [])
 
-    async def sell_contract(self, contract_id) -> dict:
-        """Close an open contract at market (price 0 = accept any price)."""
+    async def sell_contract(self, contract_id, attempts: int = 5) -> dict:
+        """Close an open contract at market (price 0 = accept any price).
+
+        Deriv rejects a sell placed before the contract's entry tick with
+        InvalidtoSell "Waiting for entry tick" (seen on a demo buy/sell on
+        2026-10-19), so that one error is retried briefly."""
         if not self._authorized:
             await self.authenticate()
-        await self.ws.send({"sell": contract_id, "price": 0})
-        msg = await self._wait_for("sell", timeout=20.0)
+        for attempt in range(attempts):
+            await self.ws.send({"sell": contract_id, "price": 0})
+            msg = await self._wait_for("sell", timeout=20.0)
+            err = msg.get("error")
+            if err and "entry tick" in err.get("message", "").lower() and attempt < attempts - 1:
+                await asyncio.sleep(2)
+                continue
+            break
         if msg.get("error"):
             code = msg["error"].get("code", "")
             raise Exception(f"Sell failed [{code}]: {msg['error'].get('message', '')}")

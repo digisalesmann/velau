@@ -13,18 +13,19 @@ over the same history to confirm they take the same trades:
   Entry   a completed 4H candle closes above the highest high of the previous
           `lookback` candles, AND the previous day's daily close is above its
           200-day simple moving average (regime filter).
-  Stop    stop_mult x ATR(14) below entry (capped at 1.5% of price, the
-          widest Deriv Multipliers allow), then trailed the same distance
-          below each completed 4H close; it only ever moves up.
+  Stop    stop_mult x ATR(14) below entry (capped at 0.75% of price, the
+          widest Deriv Multipliers allow with a safety margin), then trailed
+          the same distance below each completed 4H close; it only moves up.
   Exit    price trades at or below the trailing stop, or 360 bars (60 days).
   Size    each sleeve risks 1/4 of the account's per-trade risk amount
           (position_sizing.calculate_stake), as a dollar stop_loss on a
           Multiplier with no take-profit.
 
 Backtest (Deriv Multiplier commission, no swap: Deriv states gold Multipliers
-carry no overnight fees), in R = per-trade risk:
-  2011-15 bear (gold -42%)   -1.7R/yr     2016-22   +3.6R/yr
-  2023-24                    +4.1R/yr     2025-26   +9.7R/yr (final hold-out)
+carry no overnight fees; stops capped at 0.75%), in R = per-trade risk:
+  2011-15 bear (gold -42%)   -1.0R/yr     2016-22   +4.8R/yr
+  2023-24                    +3.3R/yr     2025-26   +22.0R/yr (flattered by a
+                                          strong trend; tighter stops = more R)
 It loses in falling markets (less than holding gold does) and its win rate is
 only ~30-54%: profits come from a few long trends, so losing streaks are normal.
 
@@ -60,12 +61,14 @@ SLEEVES = [
 ATR_PERIOD      = 14
 REGIME_SMA_DAYS = 200
 MAX_HOLD_BARS   = 360   # 60 days of 4H bars, matching the backtest's time exit
-# Deriv's smallest gold multiplier (x50) stops out at ~2% of price, so a stop
-# wider than that can't exist on a Multiplier. Stops (initial and trailing)
-# are capped at 1.5% of price, which keeps the stake >= 1.31x the risk.
-# Backtested against skipping the too-wide trades instead: the cap did better
-# in every period except 2016-22 (equal), and keeps every entry tradable.
-MAX_STOP_PCT    = 0.015
+# Deriv's smallest gold multiplier for real accounts is x100 (a demo buy on
+# 2026-10-19 rejected x50, though the public quote endpoint accepts it), and
+# x100 stops out after ~1% of price. Stops (initial and trailing) are capped
+# at 0.75% of price, which keeps the stake ~1.29x the risk, above the 1.25x
+# floor in plan_multiplier_trade. Backtested with this cap
+# (backtest/trend_candidate.py --regime --stop-limit=cap:0.0075):
+# 2011-15 bear -1.0R/yr, 2016-22 +4.8, 2023-24 +3.3, 2025-26 +22.0R/yr.
+MAX_STOP_PCT    = 0.0075
 # A trend system with a 30-54% win rate routinely strings together 3+ losses,
 # so the confluence strategy's 3-loss daily circuit breaker would keep pausing
 # it and skipping the very entries the backtest depended on. Drawdown-based

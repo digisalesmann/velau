@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import core.strategy_engine as se
 from position_sizing import (
-    plan_multiplier_trade, RR_RATIO, MIN_STAKE_TO_RISK, MULTIPLIER_CHOICES,
+    plan_multiplier_trade, RR_RATIO, MIN_FEASIBLE_STAKE_TO_RISK, MULTIPLIER_CHOICES,
     COMMISSION_RATE_EST,
 )
 
@@ -21,7 +21,9 @@ def test_plan_multiplier_trade():
         assert plan["stop_loss"] == round(risk, 2)
         assert plan["take_profit"] == round(risk * RR_RATIO, 2)
         assert plan["multiplier"] in MULTIPLIER_CHOICES
-        assert plan["stake"] >= MIN_STAKE_TO_RISK * risk - 0.01
+        # Deriv's x100 minimum can't always leave the preferred 2x headroom;
+        # the hard guarantee is the feasibility floor (else the plan raises).
+        assert plan["stake"] >= MIN_FEASIBLE_STAKE_TO_RISK * risk - 0.01
         # Stop price distance (commission included) lands at ~1x ATR.
         comm = plan["notional"] * COMMISSION_RATE_EST
         stop_dist = (plan["stop_loss"] - comm) / plan["notional"] * 4185.0

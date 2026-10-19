@@ -192,7 +192,13 @@ def calculate_stake(
 # MIN_STAKE_TO_RISK x R and that gap exposure is capped at ~2-3.5R.
 RR_RATIO             = 1.5    # take_profit = RR_RATIO x stop_loss
 SL_ATR_MULT          = 1.0    # stop distance in price = 1x ATR(15M), backtested
-MULTIPLIER_CHOICES   = (50, 100, 150, 250, 500)  # what Deriv accepted for frxXAUUSD on 2026-10-16
+# Multipliers a real (demo or live) account may buy on frxXAUUSD, from
+# contracts_for and confirmed by a demo buy on 2026-10-19. Deriv's public
+# no-auth endpoint *quotes* x50 too, but real accounts reject it ("Accepts
+# 100,200,300,500,800"), so never trust public-endpoint quotes for this.
+# At x100 a position stops out after ~1% of price, which caps how wide a
+# stop can be (see plan_multiplier_trade's feasibility check).
+MULTIPLIER_CHOICES   = (100, 200, 300, 500, 800)
 MIN_STAKE_TO_RISK    = 2.0    # stake >= 2x risk, so the stop sits well clear of stop-out
 COMMISSION_RATE_EST  = 0.00026  # of notional; measured from live frxXAUUSD quotes
                                 # ($0.25 on $1000 notional, $0.13 on $500)
