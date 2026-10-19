@@ -11,8 +11,9 @@ over the same history to confirm they take the same trades:
 
   4 independent sleeves, long only:  lookback 20/55 bars  x  stop 2/3 ATR
   Entry   a completed 4H candle closes above the highest high of the previous
-          `lookback` candles, AND the previous day's daily close is above its
-          200-day simple moving average (regime filter).
+          `lookback` candles, AND on the previous day's daily close the moving
+          averages are stacked: close > 50-day SMA > 200-day SMA (regime
+          filter; trades only when gold's short and long-term trends are up).
   Stop    stop_mult x ATR(14) below entry (capped at 0.75% of price, the
           widest Deriv Multipliers allow with a safety margin), then trailed
           the same distance below each completed 4H close; it only moves up.
@@ -21,13 +22,15 @@ over the same history to confirm they take the same trades:
           (position_sizing.calculate_stake), as a dollar stop_loss on a
           Multiplier with no take-profit.
 
-Backtest (Deriv Multiplier commission, no swap: Deriv states gold Multipliers
-carry no overnight fees; stops capped at 0.75%), in R = per-trade risk:
-  2011-15 bear (gold -42%)   -1.0R/yr     2016-22   +4.8R/yr
-  2023-24                    +3.3R/yr     2025-26   +22.0R/yr (flattered by a
-                                          strong trend; tighter stops = more R)
-It loses in falling markets (less than holding gold does) and its win rate is
-only ~30-54%: profits come from a few long trends, so losing streaks are normal.
+Backtest 2011-2026 (Deriv Multiplier commission, no swap: Deriv states gold
+Multipliers carry no overnight fees; stops capped at 0.75%), R = per-trade
+risk, from backtest/regime_filters.py:
+  bull years +8.8R/yr   sideways years +1.5R/yr   bear years 0.0R/yr
+  average +5.0R/yr, worst drawdown 11.3R, 4 losing years of 16
+The stacked-average filter replaced "close > 200-day SMA" alone, which had
+the same total return but a 21.9R worst drawdown, 7 losing years, and lost
+money in sideways (-0.3R/yr) and bear (-1.0R/yr) years. Win rate is only
+~30-55%: profits come from a few long trends, so losing streaks are normal.
 
 Deriv's stop_loss is a fixed dollar loss and can't trail into profit, so the
 bot enforces the trailing stop itself every cycle (selling at market) and
@@ -60,6 +63,7 @@ SLEEVES = [
 ]
 ATR_PERIOD      = 14
 REGIME_SMA_DAYS = 200
+REGIME_FAST_SMA_DAYS = 50
 MAX_HOLD_BARS   = 360   # 60 days of 4H bars, matching the backtest's time exit
 # Deriv's smallest gold multiplier for real accounts is x100 (a demo buy on
 # 2026-10-19 rejected x50, though the public quote endpoint accepts it), and
@@ -104,13 +108,16 @@ def entry_signal(h4_closed: pd.DataFrame, lookback: int) -> bool:
 
 
 def regime_up(daily: pd.DataFrame, bar_epoch: int) -> bool:
-    """Previous day's daily close above its 200-day SMA, as of the 4H bar's day."""
+    """As of the 4H bar's day, the previous daily close has stacked moving
+    averages: close > 50-day SMA > 200-day SMA."""
     day_start = bar_epoch - bar_epoch % GRAN_1D
     prior = daily[daily["epoch"] < day_start]
     if len(prior) < REGIME_SMA_DAYS:
         return False
     closes = prior["close"].to_numpy()
-    return float(closes[-1]) > float(closes[-REGIME_SMA_DAYS:].mean())
+    sma_fast = float(closes[-REGIME_FAST_SMA_DAYS:].mean())
+    sma_slow = float(closes[-REGIME_SMA_DAYS:].mean())
+    return float(closes[-1]) > sma_fast > sma_slow
 
 
 def trailing_stop(h4_closed: pd.DataFrame, entry_bar_epoch: int, initial_stop: float,
@@ -190,10 +197,10 @@ class TrendTrader:
                 self.strategy.save_signal(
                     "BUY", bar["close"], 0, "bullish",
                     f"Gold closed at a {days}-day high on the 4H chart | "
-                    f"Gold is above its 200-day average", None)
+                    f"Gold's 50-day and 200-day averages both point up", None)
             else:
                 why = ("No 4H breakout yet" if regime else
-                       "Gold below its 200-day average, staying in cash")
+                       "Gold isn't in an uptrend, staying in cash")
                 self.strategy.save_signal("NEUTRAL", bar["close"], 0, "bullish" if regime else "bearish",
                                           why, None)
 

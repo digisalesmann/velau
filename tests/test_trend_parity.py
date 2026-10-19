@@ -1,8 +1,8 @@
 # Parity test: the live trend strategy's functions (core/trend_strategy.py),
 # replayed bar by bar with only a recent window of candles the way the live
 # bot sees them, must take the same trades as the backtest that validated the
-# strategy (backtest/edge_research.f3_swing_trend + the daily 200-SMA regime
-# filter from backtest/trend_candidate.py).
+# strategy (backtest/edge_research.f3_swing_trend + the daily stacked-average
+# regime filter, close > SMA50 > SMA200, from backtest/regime_filters.py).
 #
 # Needs the gitignored history in backtest/data/hist_xau_{4h,1d}.csv (build
 # with python3 -m backtest.build_hist); skipped if absent.
@@ -58,9 +58,9 @@ def _replay_live(h4, d1, sleeve, k0, k1):
 
 def _backtest_entries(h4, sleeve, k0, k1):
     import backtest.edge_research as er
-    import backtest.trend_candidate as tc
+    import backtest.regime_filters as rf
     er.COSTS["deriv_mult_noswap"] = {"fixed": 0.10, "pct": 0.00026, "swap_long": 0.0, "swap_short": 0.0}
-    regime = tc.daily_uptrend(h4)
+    regime = rf.regime_array(h4, rf.daily_features(), rf.FILTERS["+ stacked_mas"])
     trades = er.f3_swing_trend(h4, "deriv_mult_noswap", lookback=sleeve["lookback"],
                                stop_mult=sleeve["stop_mult"], longs_only=True, regime_ok=regime,
                                max_stop_pct=ts.MAX_STOP_PCT, stop_mode="cap")
