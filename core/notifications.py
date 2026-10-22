@@ -58,6 +58,27 @@ def unregister_token(token: str, username: str = ""):
 
 # ── Send ──────────────────────────────────────────────────────────────────────
 
+def _is_dead_token(err: dict) -> bool:
+    """True when FCM says the device token itself is gone (app uninstalled,
+    token rotated), so it should be deleted instead of retried forever.
+
+    FCM v1 reports this as HTTP 404, status NOT_FOUND, message
+    "NotRegistered", with errorCode UNREGISTERED in `details`; the old check
+    only looked at `status` for "UNREGISTERED", which never matched, so dead
+    tokens piled up (~14 on one account by 2026-10, adding ~15s to every
+    notification). INVALID_ARGUMENT only counts when it's about the token:
+    it also covers malformed payloads, where deleting a valid token would
+    silently cut the user off from notifications.
+    """
+    codes = {d.get("errorCode") for d in err.get("details", []) if isinstance(d, dict)}
+    message = (err.get("message") or "").lower()
+    if "UNREGISTERED" in codes or err.get("status") in ("NOT_FOUND", "UNREGISTERED"):
+        return True
+    if "notregistered" in message or "not a valid fcm registration token" in message:
+        return True
+    return err.get("status") == "INVALID_ARGUMENT" and "token" in message
+
+
 def _send_to(tokens: list[str], title: str, body: str, data: dict = None):
     """Send a push notification to a specific set of device tokens."""
     if not tokens:
@@ -94,9 +115,11 @@ def _send_to(tokens: list[str], title: str, body: str, data: dict = None):
                 logger.info(f"📲 Push sent: '{title}' → {token[:12]}…")
             else:
                 err = result.get("error", {})
-                if err.get("status") in ("UNREGISTERED", "INVALID_ARGUMENT"):
+                if _is_dead_token(err):
                     db.delete_fcm_token(token)
-                logger.warning(f"FCM error for token {token[:12]}…: {err.get('message')}")
+                    logger.info(f"🧹 Removed dead FCM token {token[:12]}… ({err.get('message')})")
+                else:
+                    logger.warning(f"FCM error for token {token[:12]}…: {err.get('message')}")
         except Exception as e:
             logger.warning(f"FCM send error: {e}")
 
