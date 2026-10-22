@@ -122,6 +122,27 @@ def test_lock_held_while_placing_or_open():
     assert not bot._trade_in_progress
 
 
+def test_contract_ids_are_sent_to_deriv_as_integers():
+    # trend_positions stores contract_id as TEXT, but Deriv rejects string
+    # ids ("Input validation failed: contract_id"), found live 2026-10-22.
+    from brokers.deriv_trading_service import DerivTradingService
+    sent = []
+
+    class FakeWS:
+        async def send(self, msg):
+            sent.append(msg)
+
+    async def fake_wait(expected, timeout=20.0):
+        return {expected: {"contract_id": 1, "sold_for": 1.0, "status": "sold"}}
+
+    svc = DerivTradingService.__new__(DerivTradingService)
+    svc.ws, svc._authorized, svc._wait_for = FakeWS(), True, fake_wait
+    asyncio.run(svc.get_contract("17856120979"))
+    asyncio.run(svc.sell_contract("17856120979"))
+    assert sent[0]["contract_id"] == 17856120979 and isinstance(sent[0]["contract_id"], int)
+    assert sent[1]["sell"] == 17856120979 and isinstance(sent[1]["sell"], int)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

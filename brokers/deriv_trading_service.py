@@ -318,11 +318,19 @@ class DerivTradingService:
         return result
 
     # ── OPEN CONTRACTS ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _contract_id(contract_id) -> int:
+        """Deriv rejects a contract_id sent as a string ("Input validation
+        failed: contract_id"), but trend_positions stores it as TEXT. Found
+        live on 2026-10-22: the bot couldn't read, trail or close its first two
+        positions until this cast. Always send the integer."""
+        return int(str(contract_id).strip())
+
     async def get_contract(self, contract_id) -> dict:
         """Current state of one contract (proposal_open_contract, no subscription)."""
         if not self._authorized:
             await self.authenticate()
-        await self.ws.send({"proposal_open_contract": 1, "contract_id": contract_id})
+        await self.ws.send({"proposal_open_contract": 1, "contract_id": self._contract_id(contract_id)})
         msg = await self._wait_for("proposal_open_contract", timeout=20.0)
         if msg.get("error"):
             raise Exception(msg["error"].get("message", "proposal_open_contract failed"))
@@ -347,7 +355,7 @@ class DerivTradingService:
         if not self._authorized:
             await self.authenticate()
         for attempt in range(attempts):
-            await self.ws.send({"sell": contract_id, "price": 0})
+            await self.ws.send({"sell": self._contract_id(contract_id), "price": 0})
             msg = await self._wait_for("sell", timeout=20.0)
             err = msg.get("error")
             if err and "entry tick" in err.get("message", "").lower() and attempt < attempts - 1:
