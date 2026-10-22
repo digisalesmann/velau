@@ -516,7 +516,8 @@ class XAUMasterStrategy:
                 logger.info("🔓 Position lock released")
 
     async def _settle_contract(self, contract_id, profit: float, username: str,
-                               max_consecutive_losses: int):
+                               max_consecutive_losses: int,
+                               max_daily_drawdown_pct: float = MAX_DAILY_DRAWDOWN_PCT):
         """Record a closed contract: trade_results row, per-user risk state
         (circuit breaker), win/loss notification, and the global stake-sizing
         streak counters. Shared by the contract monitor and the trend strategy."""
@@ -524,7 +525,7 @@ class XAUMasterStrategy:
         self.save_trade_result(contract_id, won, profit, username=username)
 
         state = db.record_trade_settlement(
-            username, won, profit, max_consecutive_losses, MAX_DAILY_DRAWDOWN_PCT
+            username, won, profit, max_consecutive_losses, max_daily_drawdown_pct
         )
 
         try:

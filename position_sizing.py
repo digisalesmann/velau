@@ -261,6 +261,24 @@ def plan_multiplier_trade(risk: float, atr: float, price: float,
     }
 
 
+# ── Trend strategy sizing ──────────────────────────────────────────────────────
+# Fixed-fractional: each trend signal risks TREND_RISK_PCT of the current
+# balance (split across the side's 4 sleeves), capped at TREND_MAX_RISK_USD so
+# very large accounts don't put outsized positions on Deriv's gold
+# Multipliers. Chosen 2026-10-21 from backtest/risk_rules.py: 1% risk took
+# $8,247 to ~$22,900 over 2011-2026 (+6.8%/yr compounded, worst drawdown
+# -12.9%) vs ~+3.3%/yr under the old tiers' $50 cap (~0.6% risk at $8k).
+TREND_RISK_PCT     = 0.01
+TREND_MAX_RISK_USD = 500.0
+
+
+def trend_risk_amount(balance: float) -> float:
+    """Dollar risk for one trend signal (all 4 sleeves of one side together)."""
+    if balance <= 0:
+        return 0.0
+    return round(min(balance * TREND_RISK_PCT, TREND_MAX_RISK_USD), 2)
+
+
 def _round_stake(amount: float) -> float:
     """Floor to nearest ROUND_TO increment."""
     return max(MIN_STAKE, math.floor(amount / ROUND_TO) * ROUND_TO)

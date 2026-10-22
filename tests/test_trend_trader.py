@@ -79,6 +79,7 @@ class FakeDeriv:
 class FakeDB:
     def __init__(self):
         self.rows = {}
+        self.opening = {}
 
     def install(self):
         ts.db.get_open_trend_positions = lambda u=None: [r for r in self.rows.values()
@@ -89,7 +90,7 @@ class FakeDB:
         ts.db.get_last_trend_exit = lambda u, s: max([r["closed_at"] for r in self.rows.values()
                                                       if r["username"] == u and r["sleeve"] == s
                                                       and r["status"] == "closed"], default=None)
-        ts.db.maybe_set_opening_balance = lambda *a: None
+        ts.db.maybe_set_opening_balance = lambda u, b: self.opening.setdefault(u, b)
 
     def insert(self, cid, u, sleeve, bar, entry, sm, init, risk, stake, mult, opened):
         self.rows[cid] = dict(contract_id=cid, username=u, sleeve=sleeve, entry_bar_epoch=bar,
@@ -107,8 +108,9 @@ class FakeStrategy:
     def save_signal(self, *a, **kw):
         self.signals.append(a)
 
-    async def _settle_contract(self, cid, profit, username, max_losses):
+    async def _settle_contract(self, cid, profit, username, max_losses, max_daily_pct=None):
         self.settled.append((cid, profit, username))
+        self.daily_limits = getattr(self, "daily_limits", []) + [max_daily_pct]
 
 
 USER = {"username": "alice", "deriv_token": "tok", "trade_account_type": "demo",
@@ -130,8 +132,7 @@ def _setup(h4, uptrend=True):
 def test_breakout_in_uptrend_opens_all_sleeves():
     trader, strat, db = _setup(_h4_frame())
     asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
-    from position_sizing import calculate_stake
-    sleeve_risk = round(calculate_stake(balance=1000.0)[0] / ts.SLEEVES_PER_SIDE, 2)
+    sleeve_risk = round(1000.0 * 0.01 / ts.SLEEVES_PER_SIDE, 2)       # 1% of the $1,000 balance
     assert len(FakeDeriv.orders) == ts.SLEEVES_PER_SIDE
     for o in FakeDeriv.orders:
         assert o["type"] == "MULTUP" and o["take_profit"] is None
@@ -219,6 +220,24 @@ def test_short_not_stopped_while_price_keeps_falling():
     asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
     assert FakeDeriv.sold == []
     assert all(r["status"] == "open" for r in db.rows.values())
+
+
+def test_exit_only_day_still_stamps_opening_balance_and_uses_3pct_limit():
+    trader, strat, db = _setup(_h4_frame())
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))          # entries on "day 1"
+    db.opening.clear()                                         # midnight reset
+    FakeDeriv.h4 = _h4_frame(spot=3000.0)                      # day 2: exits only
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    assert db.opening.get("alice") == 1000.0, "daily loss limit needs the opening balance"
+    assert strat.daily_limits and all(p == ts.TREND_MAX_DAILY_LOSS_PCT == 3.0 for p in strat.daily_limits)
+
+
+def test_trend_risk_amount_is_1pct_capped():
+    from position_sizing import trend_risk_amount
+    assert trend_risk_amount(8247.18) == 82.47
+    assert trend_risk_amount(1000) == 10.0
+    assert trend_risk_amount(200000) == 500.0                  # $500 safety cap
+    assert trend_risk_amount(0) == 0.0
 
 
 if __name__ == "__main__":

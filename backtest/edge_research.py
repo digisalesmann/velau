@@ -186,7 +186,7 @@ def f2_ny_breakout(m15, venue, stop_mode, rr, longs_only):
 
 
 def f3_swing_trend(h4, venue, lookback, stop_mult, longs_only, regime_ok=None,
-                   max_stop_pct=None, stop_mode="skip", shorts_only=False):
+                   max_stop_pct=None, stop_mode="skip", shorts_only=False, with_exit=False):
     """4H Donchian breakout: enter when close > prior `lookback`-bar high (or
     < low); initial stop stop_mult x ATR(14, 4H), then an ATR chandelier
     trailing stop at the same multiple; no target, so winners can run for
@@ -214,7 +214,10 @@ def f3_swing_trend(h4, venue, lookback, stop_mult, longs_only, regime_ok=None,
             continue
         stop = c[k] - side * risk
         j, px, why = simulate(h4, k, side, stop, None, k + 6 * 60, trail_atr=a, trail_mult=stop_mult)
-        out.append((h4["t"].iloc[k], trade_r(h4, k, j, side, c[k], px, risk, venue)))
+        r = trade_r(h4, k, j, side, c[k], px, risk, venue)
+        # with_exit: also the exit bar's time, for rules that act on when a
+        # loss is realised (e.g. a daily loss limit).
+        out.append((h4["t"].iloc[k], r, h4["t"].iloc[j]) if with_exit else (h4["t"].iloc[k], r))
         k = j + 1
     return out
 

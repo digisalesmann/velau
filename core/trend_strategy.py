@@ -20,9 +20,11 @@ over the same history to confirm they take the same trades:
           widest Deriv Multipliers allow with a safety margin), then trailed
           the same distance below each completed 4H close; it only moves up.
   Exit    price trades at or below the trailing stop, or 360 bars (60 days).
-  Size    each sleeve risks 1/4 of the account's per-trade risk amount
-          (position_sizing.calculate_stake), as a dollar stop_loss on a
-          Multiplier with no take-profit.
+  Size    a signal risks 1% of the balance (capped at $500,
+          position_sizing.trend_risk_amount), split across its side's 4
+          sleeves, each as a dollar stop_loss on a Multiplier with no
+          take-profit. New trades stop for the day once realised losses
+          reach 3% of the day's opening balance (TREND_MAX_DAILY_LOSS_PCT).
 
 Backtest 2011-2026 (Deriv Multiplier commission, no swap: Deriv states gold
 Multipliers carry no overnight fees; stops capped at 0.75%), R = per-trade
@@ -50,7 +52,7 @@ import pandas as pd
 
 import database as db
 from brokers.deriv_trading_service import DerivTradingService
-from position_sizing import calculate_stake, plan_multiplier_trade
+from position_sizing import trend_risk_amount, plan_multiplier_trade
 
 logger = logging.getLogger("TrendStrategy")
 
@@ -90,6 +92,12 @@ MAX_STOP_PCT    = 0.0075
 # it and skipping the very entries the backtest depended on. Drawdown-based
 # protection (MAX_DAILY_DRAWDOWN_PCT) still applies unchanged.
 TREND_MAX_CONSECUTIVE_LOSSES = 8
+# Daily loss limit: once realised losses reach this % of the day's opening
+# balance, no new trend trades open until midnight UTC (open positions keep
+# being managed). In backtest/risk_rules.py the strategy's worst day was
+# -2.1% at 1% risk, so this never triggered in 2011-2026: it's a safety net
+# for abnormal days (crisis gaps through stops, a broker glitch, a bug).
+TREND_MAX_DAILY_LOSS_PCT = 3.0
 
 
 # ── Pure signal logic (shared with tests/test_trend_parity.py) ─────────────────
@@ -261,6 +269,14 @@ class TrendTrader:
                                   account_type=u.get("trade_account_type", "real"), max_retries=2)
         try:
             await svc.authenticate()
+            info = await svc.get_account_info()
+            balance = float(info.get("balance", 0.0))
+            # Stamp the day's opening balance on ANY day the bot touches this
+            # account (no-op once set). Trend positions often close days after
+            # they open; stamping only on entry days would leave exit-only days
+            # without an opening balance, so the daily loss limit could never
+            # trip on exactly the days losses get realised.
+            db.maybe_set_opening_balance(username, balance)
             open_sleeves = set()
             for p in positions:
                 try:
@@ -273,7 +289,7 @@ class TrendTrader:
                 if not closed:
                     open_sleeves.add(p["sleeve"])
             if want_entries:
-                await self._enter(svc, username, h4, bar_ep, a_now, signals, open_sleeves, now)
+                await self._enter(svc, username, balance, h4, bar_ep, a_now, signals, open_sleeves, now)
         finally:
             await svc.close()
 
@@ -303,17 +319,15 @@ class TrendTrader:
             poc = await svc.get_contract(cid)
         profit = float(poc.get("profit", 0) or 0)
         db.close_trend_position(cid, username, now, profit, reason)
-        await self.strategy._settle_contract(cid, profit, username, TREND_MAX_CONSECUTIVE_LOSSES)
+        await self.strategy._settle_contract(cid, profit, username, TREND_MAX_CONSECUTIVE_LOSSES,
+                                             TREND_MAX_DAILY_LOSS_PCT)
         return True
 
-    async def _enter(self, svc, username, h4, bar_ep, a_now, signals, open_sleeves, now):
-        info = await svc.get_account_info()
-        balance = float(info.get("balance", 0.0))
-        db.maybe_set_opening_balance(username, balance)
-        # Fixed fractional sizing, as backtested: no recovery-mode step-down
-        # and no win-rate caution (a 30-54% win rate is expected here, and the
-        # caution threshold was set for a different strategy's break-even).
-        total_risk, tier = calculate_stake(balance=balance)
+    async def _enter(self, svc, username, balance, h4, bar_ep, a_now, signals, open_sleeves, now):
+        # Fixed fractional sizing, as backtested: 1% of the current balance per
+        # signal (capped, see position_sizing.trend_risk_amount), no recovery
+        # step-down and no win-rate caution.
+        total_risk = trend_risk_amount(balance)
         sleeve_risk = round(total_risk / SLEEVES_PER_SIDE, 2)
         entry = float(h4["close"].iloc[-1])
         for s in SLEEVES:
