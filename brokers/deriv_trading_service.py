@@ -109,88 +109,45 @@ class DerivTradingService:
             if any(x in s.get("underlying_symbol", "") for x in ["XAU", "frx", "R_", "1HZ", "BOOM", "CRASH"])
         ]
 
-    # ── STATEMENT ──────────────────────────────────────────────────────────────
+    # ── TRADE HISTORY ──────────────────────────────────────────────────────────
+    SYMBOL_NAMES = {"frxXAUUSD": "Gold/USD"}
+    PROFIT_TABLE_PAGE = 500
+    PROFIT_TABLE_MAX_PAGES = 20   # 10,000 contracts: far beyond any real account
+
     async def get_statement(self) -> dict:
         """
-        Fetch transaction history for binary options account.
+        Every closed contract on the account, most recent first, from Deriv's
+        profit_table (one row per contract), paged until exhausted.
 
-        Deriv's statement API returns different fields for binary options
-        vs CFD trades. For binary options (tick contracts on 1HZ100V):
-
-        Raw transaction fields:
-          action_type      — "buy" or "sell" (sell = contract settled)
-          amount           — net P&L (negative for buy cost, positive for payout)
-          balance_after    — account balance after transaction
-          contract_id      — the contract ID
-          display_name     — symbol display name e.g. "Volatility 100 (1s) Index"
-          purchase_time    — epoch timestamp of purchase
-          transaction_time — epoch timestamp of this transaction
-          shortcode        — e.g. "CALL_1HZ100V_10.00_1234567_5T"
-
-        We pair buy+sell transactions by contract_id to show net P&L per trade.
+        Replaces the old `statement` call with limit=100: that returned raw
+        buy/sell transactions, two per contract, so it could never show more
+        than ~50 trades. The dashboard's Total and Win Rate were computed from
+        that window (49 of 105 trades on the demo account, 2026-10-22).
         """
         if not self._authorized:
             await self.authenticate()
 
-        await self.ws.send({
-            "statement": 1,
-            "description": 1,
-            "limit": 100,          # fetch more to get full pairs
-        })
-        response = await self.ws.receive(timeout=20.0)
-        if response.get("error"):
-            raise Exception(response["error"].get("message", "Statement fetch failed"))
+        rows, offset = [], 0
+        for _ in range(self.PROFIT_TABLE_MAX_PAGES):
+            await self.ws.send({
+                "profit_table": 1, "description": 1, "sort": "DESC",
+                "limit": self.PROFIT_TABLE_PAGE, "offset": offset,
+            })
+            response = await self._wait_for("profit_table", timeout=30.0)
+            if response.get("error"):
+                raise Exception(response["error"].get("message", "Trade history fetch failed"))
+            page = (response.get("profit_table") or {}).get("transactions", [])
+            rows += page
+            if len(page) < self.PROFIT_TABLE_PAGE:
+                break
+            offset += self.PROFIT_TABLE_PAGE
 
-        raw_txns = response.get("statement", {}).get("transactions", [])
-        logger.info(f"Raw statement: {len(raw_txns)} transactions")
-
-        # ── Pair buy/sell transactions by contract_id ──────────────────────────
-        # Each binary options trade creates TWO transactions:
-        #   1. Buy  — negative amount (cost of contract e.g. -$10)
-        #   2. Sell — positive amount (payout e.g. +$17.50 win, +$0 loss)
-        # We combine them to show net P&L per contract.
-
-        contracts: dict = {}
-
-        for tx in raw_txns:
-            contract_id  = str(tx.get("contract_id", ""))
-            action       = tx.get("action_type", "")
-            amount       = float(tx.get("amount", 0))
-            symbol       = tx.get("display_name", "Volatility 100 (1s) Index")
-            tx_time      = tx.get("transaction_time", 0)
-            purchase_time= tx.get("purchase_time", tx_time)
-            shortcode    = tx.get("shortcode", "")
-
-            if not contract_id or contract_id == "None":
-                continue
-
-            if contract_id not in contracts:
-                contracts[contract_id] = {
-                    "contract_id":   contract_id,
-                    "symbol":        symbol,
-                    "buy_amount":    0.0,
-                    "sell_amount":   0.0,
-                    "time":          purchase_time or tx_time,
-                    "shortcode":     shortcode,
-                    "settled":       False,
-                }
-
-            if action == "buy":
-                contracts[contract_id]["buy_amount"]  = amount   # negative
-                contracts[contract_id]["time"]        = tx_time
-            elif action == "sell":
-                contracts[contract_id]["sell_amount"] = amount   # positive
-                contracts[contract_id]["settled"]     = True
-
-        # ── Build trade list ───────────────────────────────────────────────────
         trades = []
-        for cid, c in contracts.items():
-            buy_cost = abs(c["buy_amount"])   # e.g. 10.00
-            payout   = c["sell_amount"]        # e.g. 17.50 or 0.0
-            net_pnl  = payout - buy_cost       # e.g. +7.50 or -10.00
-
-            # Determine direction from shortcode (CALL_... or PUT_...)
-            shortcode = c["shortcode"].upper()
+        for t in rows:
+            buy_cost = float(t.get("buy_price") or 0)
+            returned = float(t.get("sell_price") or 0)
+            net_pnl  = returned - buy_cost
+            shortcode = (t.get("shortcode") or t.get("contract_type") or "").upper()
             is_multiplier = shortcode.startswith("MULT")
             if shortcode.startswith("CALL"):
                 direction = "CALL (BUY)"
@@ -202,27 +159,22 @@ class DerivTradingService:
                 direction = "SELL (Multiplier)"
             else:
                 direction = "Options"
-
-            # Only show settled contracts
-            if not c["settled"] and payout == 0.0:
-                continue
-
+            symbol = t.get("underlying_symbol") or ""
             trades.append({
-                "symbol":        c["symbol"],
-                "contract_id":   cid,
+                "symbol":        self.SYMBOL_NAMES.get(symbol, symbol or "Unknown"),
+                "contract_id":   str(t.get("contract_id", "")),
                 "type":          direction,
                 "contract_type": "MULTIPLIER" if is_multiplier else "BINARY",
                 "pnl":           round(net_pnl, 2),
                 "buy_cost":      round(buy_cost, 2),
-                "payout":        round(payout, 2),
-                "time":          c["time"],
+                "payout":        round(returned, 2),
+                "time":          int(t.get("purchase_time") or 0),
+                "sell_time":     int(t.get("sell_time") or 0),
                 "won":           net_pnl > 0,
             })
 
-        # Sort by time descending (most recent first)
         trades.sort(key=lambda x: x["time"], reverse=True)
-        logger.info(f"Parsed {len(trades)} completed contracts from {len(contracts)} total")
-
+        logger.info(f"Trade history: {len(trades)} closed contracts")
         return {"history": trades}
 
     # ── PLACE ORDER ────────────────────────────────────────────────────────────

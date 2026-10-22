@@ -9,6 +9,7 @@ Tables:
   trade_results — trade outcomes per user
 """
 import os
+import json
 import logging
 from contextlib import contextmanager
 
@@ -927,6 +928,35 @@ def insert_signal(symbol, sig_type, price, rsi, bias, reason,
             )
             return cur.lastrowid
 
+def get_latest_trend_signal() -> tuple[int, int] | None:
+    """(id, bar_epoch) of the newest trend-strategy signal (they carry the
+    4H bar they were saved for in features_json), so a restarted bot knows
+    which bar it already recorded instead of saving it again."""
+    row = fetchone(
+        "SELECT id, features_json FROM signals WHERE features_json LIKE ? "
+        "ORDER BY timestamp DESC LIMIT 1",
+        ('%"bar_epoch"%',),
+    )
+    if not row:
+        return None
+    try:
+        return int(row["id"]), int(json.loads(row["features_json"])["bar_epoch"])
+    except Exception:
+        return None
+
+
+def get_trend_positions_by_bar(username: str) -> dict[int, list[dict]]:
+    """This user's trend positions (open and closed), grouped by the 4H bar
+    whose signal opened them."""
+    out: dict[int, list[dict]] = {}
+    for r in fetchall(
+        "SELECT sleeve, status, pnl, entry_bar_epoch FROM trend_positions WHERE username = ?",
+        (username,),
+    ):
+        out.setdefault(int(r["entry_bar_epoch"]), []).append(r)
+    return out
+
+
 def update_signal_executed(signal_id: int, executed: bool):
     execute("UPDATE signals SET executed = ? WHERE id = ?", (bool(executed), signal_id))
 
@@ -987,6 +1017,22 @@ def insert_trade_result(contract_id, won, pnl,
             (str(contract_id), int(won), float(pnl),
              str(symbol), str(username) if username else None),
         )
+
+def get_bot_contract_ids(username: str) -> set[str]:
+    """Contract ids the bot itself placed for this user: every settled bot
+    trade (trade_results) plus every trend position, open or closed. Used to
+    keep the app's stats to the bot's own trades, so trades a user places by
+    hand on Deriv (or test trades) don't mix into the bot's win rate.
+
+    trade_results rows from the single-user era have no username; they're
+    included because ids are then intersected with this user's own Deriv
+    history, and a contract id only exists on the account that bought it."""
+    rows = fetchall(
+        "SELECT contract_id FROM trade_results WHERE username = ? OR username IS NULL",
+        (username,),
+    ) + fetchall("SELECT contract_id FROM trend_positions WHERE username = ?", (username,))
+    return {str(r["contract_id"]) for r in rows if r.get("contract_id")}
+
 
 def get_trade_stats(username: str = None) -> dict:
     if username:

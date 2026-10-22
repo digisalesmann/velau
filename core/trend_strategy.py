@@ -198,7 +198,14 @@ class TrendTrader:
         # The XAUMasterStrategy instance: reused for signal saving and the
         # shared settlement path (trade_results, circuit breaker, notifications).
         self.strategy = strategy
-        self._last_bar_evaluated: int | None = None
+        self._last_bar_evaluated: int | None = None     # entries: in memory on purpose
+        # Signals: the bar last recorded and its row id, loaded from the DB on
+        # the first cycle so a restart doesn't save the same bar's signal again
+        # (every redeploy used to add a duplicate row).
+        self._signal_bar: int | None = None
+        self._signal_id: int | None = None
+        self._signal_loaded = False
+        self._placed_this_cycle = 0
 
     async def run_cycle(self, service: DerivTradingService, all_users: list[dict]):
         now = int(time.time())
@@ -227,33 +234,48 @@ class TrendTrader:
             f"signals={[k for k, v in signals.items() if v] or 'none'}"
         )
 
-        if new_bar:
-            fired = [k for k, v in signals.items() if v]
+        if not self._signal_loaded:
+            latest = db.get_latest_trend_signal()
+            if latest:
+                self._signal_id, self._signal_bar = latest
+            self._signal_loaded = True
+
+        fired = [k for k, v in signals.items() if v]
+        if bar_ep != self._signal_bar:
+            features = {"bar_epoch": bar_ep, "regime": trend, "fired": fired, "atr": round(a_now, 2)}
             if fired:
                 lookbacks = sorted({s["lookback"] for s in SLEEVES if s["id"] in fired}, reverse=True)
                 days = round(lookbacks[0] * 4 / 24)
                 if trend > 0:
-                    self.strategy.save_signal(
+                    sig_id = self.strategy.save_signal(
                         "BUY", bar["close"], 0, "bullish",
                         f"Gold closed at a {days}-day high on the 4H chart | "
-                        f"Gold's 50-day and 200-day averages both point up", None)
+                        f"Gold's 50-day and 200-day averages both point up", None, features)
                 else:
-                    self.strategy.save_signal(
+                    sig_id = self.strategy.save_signal(
                         "SELL", bar["close"], 0, "bearish",
                         f"Gold closed at a {days}-day low on the 4H chart | "
-                        f"Gold's 50-day and 200-day averages both point down", None)
+                        f"Gold's 50-day and 200-day averages both point down", None, features)
             else:
                 why = {1: "Uptrend, waiting for a 4H breakout",
                        -1: "Downtrend, waiting for a 4H breakdown",
                        0: "No clear trend, staying in cash"}[trend]
-                self.strategy.save_signal("NEUTRAL", bar["close"], 0,
-                                          {1: "bullish", -1: "bearish", 0: "neutral"}[trend], why, None)
+                sig_id = self.strategy.save_signal("NEUTRAL", bar["close"], 0,
+                                                   {1: "bullish", -1: "bearish", 0: "neutral"}[trend],
+                                                   why, None, features)
+            self._signal_bar, self._signal_id = bar_ep, sig_id
 
+        self._placed_this_cycle = 0
         for u in all_users:
             try:
                 await self._run_user(u, h4, spot, bar_ep, a_now, signals, new_bar, now)
             except Exception as e:
                 logger.error(f"❌ Trend [{u['username']}] cycle error: {e}")
+
+        # Record that this bar's BUY/SELL signal produced trades. (/signals also
+        # works this out per user from trend_positions; this is the global flag.)
+        if fired and self._placed_this_cycle and self._signal_id and self._signal_bar == bar_ep:
+            db.update_signal_executed(self._signal_id, True)
 
         self._last_bar_evaluated = bar_ep
 
@@ -363,6 +385,7 @@ class TrendTrader:
                 await svc.sell_contract(cid)
                 continue
             open_sleeves.add(s["id"])
+            self._placed_this_cycle += 1
             logger.info(f"✅ [{username}] {s['id']} {'BUY' if side > 0 else 'SELL'} x{plan['multiplier']} stake=${plan['stake']:.2f} "
                         f"risk=${plan['stop_loss']:.2f} stop={initial_stop:.2f} | contract={cid}")
             try:

@@ -39,6 +39,9 @@ class FakeDeriv:
     async def get_statement(self):
         return {"history": []}
 
+    async def get_open_contracts(self):
+        return []
+
     async def close(self):
         pass
 

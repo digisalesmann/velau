@@ -1,10 +1,11 @@
 import os
+import json
 import uuid
 import base64
 import logging
 import asyncio
 import traceback
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -377,7 +378,7 @@ async def toggle_bot(user=Depends(_require_admin)):
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
 @app.get("/dashboard", response_model=DashboardResponse)
-async def get_dashboard(user=Depends(get_current_user)):
+async def get_dashboard(user=Depends(get_current_user), tz_offset: int = 0):
     """
     Profile/admin/bot-status data is DB-only and has nothing to do with
     Deriv connectivity — it must always be returned even if the broker
@@ -410,7 +411,10 @@ async def get_dashboard(user=Depends(get_current_user)):
 
     if deriv_token:
         account_type = profile.get("trade_account_type") or "real"
-        cache_key = f"dashboard:{user.username}:{account_type}"
+        # tz_offset: the app's UTC offset in minutes, so "today" means the
+        # user's own day rather than the server's (UTC).
+        tz_offset = max(-720, min(840, int(tz_offset)))
+        cache_key = f"dashboard:{user.username}:{account_type}:{tz_offset}"
         cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
         lock = deriv_cache.lock(cache_key)
         if cached is None:
@@ -444,24 +448,33 @@ async def get_dashboard(user=Depends(get_current_user)):
             try:
                 await service.authenticate()
                 account_info = await service.get_account_info()
-                history_data = await service.get_statement()
-                trades_list  = history_data.get("history", [])
+                history_data = await service.get_statement()       # full closed-trade history
+                open_list    = await service.get_open_contracts()
+                # Only trades the bot placed: see _bot_trades.
+                bot_ids      = await asyncio.to_thread(db.get_bot_contract_ids, user.username)
+                trades_list  = _bot_trades(history_data.get("history", []), bot_ids)
+                open_list    = [c for c in open_list if str(c.get("contract_id")) in bot_ids]
 
                 balance    = account_info.get("balance", 0.0)
                 currency   = account_info.get("currency", "USD")
                 account_id = account_info.get("account_id")
-                total_trades = len(trades_list)
+                total_trades = len(trades_list)                    # closed trades, all time
                 wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
                 win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
 
-                today_trades = [
-                    t for t in trades_list
-                    if t.get("time") and
-                    datetime.fromtimestamp(int(t["time"])).date() == date.today()
-                ]
-                daily_pnl    = sum(float(t.get("pnl", 0)) for t in today_trades)
-                pnl_percent  = (daily_pnl / balance * 100) if balance > 0 else 0.0
-                trades_today = len(today_trades)
+                shift = timedelta(minutes=tz_offset)
+                today = (datetime.now(timezone.utc) + shift).date()
+                local_day = lambda epoch: (datetime.fromtimestamp(int(epoch), timezone.utc) + shift).date()
+                # Today = trades OPENED today, including ones still running
+                # (a trend position can stay open for days).
+                trades_today = (
+                    sum(1 for t in trades_list if t.get("time") and local_day(t["time"]) == today)
+                    + sum(1 for c in open_list if c.get("purchase_time") and local_day(c["purchase_time"]) == today)
+                )
+                # Today's P&L = trades CLOSED today, whenever they opened.
+                daily_pnl   = sum(float(t.get("pnl", 0)) for t in trades_list
+                                  if t.get("sell_time") and local_day(t["sell_time"]) == today)
+                pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
 
                 deriv_cache.set(cache_key, {
                     "balance": balance, "currency": currency, "account_id": account_id,
@@ -640,12 +653,71 @@ async def get_news():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"News error: {e}")
 
+# The trend strategy's first deploy (commit 99a61d5); signals before this are
+# the 15-minute confluence strategy's and keep their own executed flag.
+TREND_LAUNCH_EPOCH = int(datetime(2026, 10, 17, 13, 23, tzinfo=timezone.utc).timestamp())
+TREND_BAR_SECONDS = 4 * 3600
+
+
+def _signal_epoch(row) -> int | None:
+    ts = row.get("timestamp")
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace(" ", "T"))
+        except ValueError:
+            return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)        # stored as naive UTC
+    return int(ts.timestamp())
+
+
+def _signal_bar(row) -> int | None:
+    """The 4H bar a trend-era signal was saved for: from features_json when
+    present, else derived from its timestamp (a signal is saved during the
+    4H window after its bar closes, so bar = window start - 4h)."""
+    try:
+        f = json.loads(row.get("features_json") or "{}")
+        if "bar_epoch" in f:
+            return int(f["bar_epoch"])
+    except Exception:
+        pass
+    t = _signal_epoch(row)
+    if t is None or t < TREND_LAUNCH_EPOCH:
+        return None
+    return t - t % TREND_BAR_SECONDS - TREND_BAR_SECONDS
+
+
+def _signals_for_user(rows: list[dict], positions_by_bar: dict, limit: int) -> list[dict]:
+    """Trend-era signals, per user: one row per 4H bar (restarts used to save
+    the same bar more than once), and a BUY/SELL marked executed with the
+    number of trades it opened when THIS user's account opened positions
+    from that bar. Signals are shared by everyone, but whether one was
+    executed depends on the account. Older (confluence) signals unchanged."""
+    out, seen = [], set()
+    for r in rows:
+        bar = _signal_bar(r)
+        if bar is not None:
+            if bar in seen:
+                continue
+            seen.add(bar)
+            if r.get("type") in ("BUY", "SELL"):
+                opened = positions_by_bar.get(bar, [])
+                r = {**r, "executed": bool(opened), "trades_opened": len(opened)}
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
 @app.get("/signals")
 def get_signals(user=Depends(get_current_user)):
     try:
         status = get_session_status()
+        rows = db.get_signals(limit=60, username=user.username)
         return {
-            "signals":         db.get_signals(limit=30, username=user.username),
+            "signals":         _signals_for_user(rows, db.get_trend_positions_by_bar(user.username), 30),
             "in_session":      status["in_session"],
             "session_hours":   status["session_hours"],
             "mins_to_session": status["mins_to_session"],
@@ -653,6 +725,40 @@ def get_signals(user=Depends(get_current_user)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+HISTORY_LIST_LIMIT = 300
+
+
+def _bot_trades(trades: list, bot_ids: set[str]) -> list:
+    """The account's closed trades that the bot placed, each labelled with
+    the strategy that placed it. Stats are lifetime and never reset when the
+    strategy changes; the label shows which strategy each trade came from.
+    15-minute Rise/Fall contracts (CALL/PUT) were the confluence strategy,
+    retired 2026-10-17; Multipliers are the 4H trend strategy."""
+    out = []
+    for t in trades:
+        if str(t.get("contract_id")) not in bot_ids:
+            continue
+        retired = t.get("contract_type") != "MULTIPLIER"
+        out.append({**t, "strategy": "15min_retired" if retired else "trend"})
+    return out
+
+
+def _history_payload(trades: list) -> dict:
+    """The list (most recent HISTORY_LIST_LIMIT) plus an exact all-time
+    summary, so the app's Trades / Win Rate / P&L never depend on how much of
+    the list it was sent."""
+    wins = sum(1 for t in trades if float(t.get("pnl", 0)) > 0)
+    return {
+        "history": trades[:HISTORY_LIST_LIMIT],
+        "summary": {
+            "total_trades": len(trades),
+            "wins": wins,
+            "win_rate": round(wins / len(trades) * 100, 1) if trades else 0.0,
+            "total_pnl": round(sum(float(t.get("pnl", 0)) for t in trades), 2),
+        },
+    }
+
 
 @app.get("/dashboard/history")
 async def get_history(user=Depends(get_current_user)):
@@ -679,7 +785,11 @@ async def get_history(user=Depends(get_current_user)):
         service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
         try:
             await service.authenticate()
-            result = await service.get_statement()
+            bot_ids = await asyncio.to_thread(db.get_bot_contract_ids, user.username)
+            all_trades = (await service.get_statement()).get("history", [])
+            bot = _bot_trades(all_trades, bot_ids)
+            logger.info(f"History [{user.username}]: {len(bot)} bot trades of {len(all_trades)} on the account")
+            result = _history_payload(bot)
             deriv_cache.set(cache_key, result)
             return result
         except Exception as e:

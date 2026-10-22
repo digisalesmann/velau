@@ -80,6 +80,8 @@ class FakeDB:
     def __init__(self):
         self.rows = {}
         self.opening = {}
+        self.latest_signal = None
+        self.executed = {}
 
     def install(self):
         ts.db.get_open_trend_positions = lambda u=None: [r for r in self.rows.values()
@@ -91,6 +93,8 @@ class FakeDB:
                                                       if r["username"] == u and r["sleeve"] == s
                                                       and r["status"] == "closed"], default=None)
         ts.db.maybe_set_opening_balance = lambda u, b: self.opening.setdefault(u, b)
+        ts.db.get_latest_trend_signal = lambda: self.latest_signal
+        ts.db.update_signal_executed = lambda sid, ex: self.executed.__setitem__(sid, ex)
 
     def insert(self, cid, u, sleeve, bar, entry, sm, init, risk, stake, mult, opened):
         self.rows[cid] = dict(contract_id=cid, username=u, sleeve=sleeve, entry_bar_epoch=bar,
@@ -107,6 +111,7 @@ class FakeStrategy:
 
     def save_signal(self, *a, **kw):
         self.signals.append(a)
+        return len(self.signals)                     # row id
 
     async def _settle_contract(self, cid, profit, username, max_losses, max_daily_pct=None):
         self.settled.append((cid, profit, username))
@@ -238,6 +243,23 @@ def test_trend_risk_amount_is_1pct_capped():
     assert trend_risk_amount(1000) == 10.0
     assert trend_risk_amount(200000) == 500.0                  # $500 safety cap
     assert trend_risk_amount(0) == 0.0
+
+
+def test_signal_records_bar_and_is_marked_executed():
+    trader, strat, db = _setup(_h4_frame())
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    sig = strat.signals[0]
+    assert sig[0] == "BUY" and sig[6]["bar_epoch"] == int(FakeDeriv.h4["epoch"].iloc[-2])
+    assert db.executed == {1: True}
+
+
+def test_restart_does_not_save_the_same_bars_signal_again():
+    trader, strat, db = _setup(_h4_frame())
+    asyncio.run(trader.run_cycle(FakeDeriv(), [USER]))
+    db.latest_signal = (1, strat.signals[0][6]["bar_epoch"])  # what the DB now holds
+    restarted = ts.TrendTrader(strat)
+    asyncio.run(restarted.run_cycle(FakeDeriv(), [USER]))
+    assert len(strat.signals) == 1
 
 
 if __name__ == "__main__":
