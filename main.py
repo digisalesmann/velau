@@ -136,11 +136,51 @@ def _memory_snapshot() -> str:
     )
 
 
+# Temporary allocation tracing (2026-10-24): the memory snapshots showed the
+# leak is in-use heap growing ~35 MB/hour while GC-tracked object counts stay
+# flat, i.e. untracked blocks (numpy/pandas buffers, bytes, str). tracemalloc
+# names the allocating lines. Set TRACEMALLOC_FRAMES=0 on Render to disable;
+# remove once the leak is fixed.
+TRACEMALLOC_FRAMES = int(os.getenv("TRACEMALLOC_FRAMES", "8"))
+
+
+def _trace_stats() -> dict:
+    import tracemalloc
+    snap = tracemalloc.take_snapshot().filter_traces([
+        tracemalloc.Filter(False, tracemalloc.__file__),
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap*>"),
+    ])
+    stats = {st.traceback: (st.size, st.count) for st in snap.statistics("traceback")}
+    del snap
+    return stats
+
+
+def _log_trace_growth(baseline: dict, top: int = 6):
+    current = _trace_stats()
+    growth = sorted(
+        ((size - baseline.get(tb, (0, 0))[0], count - baseline.get(tb, (0, 0))[1], tb)
+         for tb, (size, count) in current.items()),
+        key=lambda x: x[0], reverse=True,
+    )[:top]
+    for size, count, tb in growth:
+        frames = " <- ".join(f"{f.filename.split('/src/')[-1].split('site-packages/')[-1]}:{f.lineno}"
+                             for f in reversed(tb))
+        logger.info(f"🧠 GROWTH +{size / 1048576:.1f}MB +{count} blocks | {frames}")
+    del current
+
+
 async def _memory_diagnostics(interval: int = 1800):
     await asyncio.sleep(120)
+    baseline = None
     while True:
         try:
             logger.info(_memory_snapshot())
+            if TRACEMALLOC_FRAMES:
+                if baseline is None:
+                    baseline = await asyncio.to_thread(_trace_stats)
+                    logger.info(f"🧠 tracemalloc baseline taken ({len(baseline)} allocation sites)")
+                else:
+                    await asyncio.to_thread(_log_trace_growth, baseline)
         except Exception as e:
             logger.warning(f"🧠 MEM snapshot failed: {e}")
         await asyncio.sleep(interval)
@@ -150,6 +190,10 @@ async def _memory_diagnostics(interval: int = 1800):
 async def lifespan(app: FastAPI):
     global bot_task
     logger.info("🚀 FastAPI startup — queueing bot")
+    if TRACEMALLOC_FRAMES:
+        import tracemalloc
+        tracemalloc.start(TRACEMALLOC_FRAMES)
+        logger.info(f"🧠 tracemalloc on ({TRACEMALLOC_FRAMES} frames)")
     bot_task = asyncio.create_task(_bot_runner(delay=10))
     asyncio.create_task(_db_keepalive())
     asyncio.create_task(_server_keepalive())
