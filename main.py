@@ -125,10 +125,11 @@ def _memory_snapshot() -> str:
     del objs
     try:
         tasks = len(asyncio.all_tasks())
+        loop_kind = type(asyncio.get_running_loop()).__module__.split(".")[0]
     except RuntimeError:
-        tasks = -1
+        tasks, loop_kind = -1, "?"
     return (
-        f"🧠 MEM rss={status.get('VmRSS')} peak={status.get('VmHWM')} "
+        f"🧠 MEM loop={loop_kind} rss={status.get('VmRSS')} peak={status.get('VmHWM')} "
         f"threads={status.get('Threads')}/{threading.active_count()} tasks={tasks} "
         f"{heap} gc_counts={gc.get_count()} objects={sum(c for _, c in top)}+ "
         f"caches=deriv:{len(deriv_cache._store)} locks:{len(deriv_cache._locks)} "

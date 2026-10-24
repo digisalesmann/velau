@@ -29,6 +29,7 @@ Solution:
 """
 import asyncio
 import hashlib
+import ssl
 import threading
 import time
 import websockets
@@ -45,6 +46,13 @@ logger = logging.getLogger("DerivWebSocket")
 # ACCOUNTS_TTL; dropped whenever a login with it fails, so a revoked or
 # expired token is never served from cache. OTPs are single-use and are never
 # cached. Keyed by a hash so raw tokens aren't held as dict keys.
+# One TLS context for every Deriv connection. Creating one per connection
+# (websockets' default) loads the CA store each time, and under uvloop those
+# per-connection allocations were never fully freed: ~62 KB leaked per
+# connection, which OOM-killed the server at 512 MB every 1-2 days from
+# 2026-09 on (pinpointed with tracemalloc, websockets/asyncio/client.py:470).
+_SSL_CONTEXT = ssl.create_default_context()
+
 ACCOUNTS_TTL = 600
 _accounts_cache: dict[str, tuple[float, list]] = {}
 _accounts_lock = threading.Lock()
@@ -116,6 +124,7 @@ class DerivWebSocket:
                 ws_url = await asyncio.to_thread(self._fetch_ws_url)
                 self.connection = await websockets.connect(
                     ws_url,
+                    ssl=_SSL_CONTEXT,
                     ping_interval=20,
                     ping_timeout=15,
                     close_timeout=10,
