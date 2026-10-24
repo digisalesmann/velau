@@ -87,6 +87,65 @@ async def _server_keepalive():
         await asyncio.sleep(10 * 60)
 
 
+def _memory_snapshot() -> str:
+    """One-line memory diagnostic. The server has been OOM-killed at Render's
+    512 MB about every 1-2 days since at least 2026-09-04 (memory climbs
+    ~10-15 MB/hour, only while Deriv sessions succeed). This separates a
+    Python-object leak (object counts / top types grow) from glibc heap
+    fragmentation (process RSS grows while malloc's in-use bytes stay flat,
+    which MALLOC_ARENA_MAX targets)."""
+    import gc, collections, threading, ctypes
+    import deriv_cache
+    from brokers import deriv_ws
+    status = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("VmRSS", "VmHWM", "Threads"):
+                    status[k] = v.strip()
+    except OSError:
+        pass
+    heap = ""
+    try:
+        class _MallInfo2(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_size_t) for n in (
+                "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+                "fsmblks", "uordblks", "fordblks", "keepcost")]
+        libc = ctypes.CDLL("libc.so.6")
+        libc.mallinfo2.restype = _MallInfo2
+        mi = libc.mallinfo2()
+        mb = lambda n: f"{n / 1048576:.0f}MB"
+        heap = (f"heap_in_use={mb(mi.uordblks)} heap_free={mb(mi.fordblks)} "
+                f"heap_arena={mb(mi.arena)} mmap={mb(mi.hblkhd)}")
+    except Exception as e:
+        heap = f"mallinfo unavailable ({e})"
+    objs = gc.get_objects()
+    top = collections.Counter(type(o).__name__ for o in objs).most_common(10)
+    del objs
+    try:
+        tasks = len(asyncio.all_tasks())
+    except RuntimeError:
+        tasks = -1
+    return (
+        f"🧠 MEM rss={status.get('VmRSS')} peak={status.get('VmHWM')} "
+        f"threads={status.get('Threads')}/{threading.active_count()} tasks={tasks} "
+        f"{heap} gc_counts={gc.get_count()} objects={sum(c for _, c in top)}+ "
+        f"caches=deriv:{len(deriv_cache._store)} locks:{len(deriv_cache._locks)} "
+        f"accounts:{len(deriv_ws._accounts_cache)} top={top}"
+    )
+
+
+async def _memory_diagnostics(interval: int = 1800):
+    await asyncio.sleep(120)
+    while True:
+        try:
+            logger.info(_memory_snapshot())
+        except Exception as e:
+            logger.warning(f"🧠 MEM snapshot failed: {e}")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_task
@@ -94,6 +153,7 @@ async def lifespan(app: FastAPI):
     bot_task = asyncio.create_task(_bot_runner(delay=10))
     asyncio.create_task(_db_keepalive())
     asyncio.create_task(_server_keepalive())
+    asyncio.create_task(_memory_diagnostics())
     yield
     logger.info("🛑 FastAPI shutdown — stopping bot")
     trading_bot.is_running = False
