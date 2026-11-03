@@ -1380,4 +1380,26 @@ def get_admin_usernames() -> list[str]:
     return [r["username"] for r in rows]
 
 
+# ── Account deletion (Play Store requirement) ─────────────────────────────────
+
+# Tables whose rows belong to one user and are deleted with the account.
+_USER_TABLES = ("fcm_tokens", "user_risk_state", "password_resets",
+                "trend_positions", "trade_results", "signals")
+
+def delete_user_account(username: str):
+    """Delete a user and all their personal data in one transaction.
+
+    Payment records are kept for accounting with the email replaced, as the
+    privacy policy discloses. Everything else is removed.
+    """
+    p = _ph()
+    anon = "deleted-user"
+    with get_conn() as (conn, cur):
+        for table in _USER_TABLES:
+            cur.execute(f"DELETE FROM {table} WHERE username = {p}", (username,))
+        cur.execute(f"UPDATE subscriptions SET username = {p} WHERE username = {p}",
+                    (anon, username))
+        cur.execute(f"DELETE FROM users WHERE username = {p}", (username,))
+
+
 init_db()

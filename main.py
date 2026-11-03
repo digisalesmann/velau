@@ -171,6 +171,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
+from public_pages import router as public_router
+app.include_router(public_router)
 
 from fastapi.staticfiles import StaticFiles
 # Serves static/velau-logo.png at /static/velau-logo.png — used as a stable,
@@ -584,6 +586,33 @@ async def get_dashboard(user=Depends(get_current_user), tz_offset: int = 0):
         user_bot_enabled=user_enabled,
         is_admin=is_admin,
     )
+
+
+class DeleteAccountRequest(BaseModel):
+    confirm: str
+
+
+@app.post("/account/delete")
+def delete_account(req: DeleteAccountRequest, user=Depends(get_current_user)):
+    """Permanently delete the signed-in user's account and data."""
+    if req.confirm.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail='Type DELETE to confirm.')
+    if db.get_open_trend_positions(user.username):
+        raise HTTPException(
+            status_code=409,
+            detail="You have open trades. Wait for them to close, or close them on Deriv, then try again.",
+        )
+    db.delete_user_account(user.username)
+    # Google sign-in users also have a Firebase account; remove it too.
+    try:
+        from firebase_admin import auth as fb_auth
+        from user_models import _get_firebase_app
+        _get_firebase_app()
+        fb_auth.delete_user(fb_auth.get_user_by_email(user.username).uid)
+    except Exception as e:
+        logger.info(f"No Firebase account removed for deleted user: {type(e).__name__}")
+    logger.info("🗑️ Account deleted on user request")
+    return {"status": "deleted"}
 
 
 @app.post("/account/display-name")
