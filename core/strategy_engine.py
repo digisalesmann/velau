@@ -137,6 +137,23 @@ def multiplier_close_by(purchase_epoch: int) -> int:
     return min(purchase_epoch + MULT_MAX_HOLD_MINUTES * 60, int(daily.timestamp()))
 
 
+def gold_weekend_reopen(now_utc: datetime):
+    """Return when gold reopens (UTC) if it's closed for the weekend, else None.
+
+    Spot gold trades from Sunday 17:00 to Friday 17:00 New York time, so the
+    UTC times shift by an hour with US daylight saving.
+    """
+    from zoneinfo import ZoneInfo
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    wd, h = ny.weekday(), ny.hour          # Monday = 0
+    closed = (wd == 4 and h >= 17) or wd == 5 or (wd == 6 and h < 17)
+    if not closed:
+        return None
+    days = (6 - wd) % 7
+    reopen = (ny + timedelta(days=days)).replace(hour=17, minute=0, second=0, microsecond=0)
+    return reopen.astimezone(timezone.utc)
+
+
 def get_session_status() -> dict:
     """Single source of truth for session-status display — used by both
     /dashboard and /signals so the UI never drifts from SESSIONS again the
@@ -144,8 +161,16 @@ def get_session_status() -> dict:
     now_utc = datetime.now(timezone.utc)
     if TRADING_STRATEGY == "trend_4h":
         # The trend strategy has no session windows: it evaluates every 4H
-        # candle whenever the gold market is open.
-        return {"in_session": True, "session_hours": "Around the clock", "mins_to_session": 0}
+        # candle whenever the gold market is open. Only the weekend closure
+        # is reported, so the app can say why nothing is happening.
+        reopen = gold_weekend_reopen(now_utc)
+        if reopen is None:
+            return {"in_session": True, "session_hours": "Around the clock", "mins_to_session": 0}
+        return {
+            "in_session": False,
+            "session_hours": reopen.strftime("Sunday %H:%M UTC"),
+            "mins_to_session": int((reopen - now_utc).total_seconds() // 60),
+        }
     in_session = any(s <= now_utc.hour < e for s, e in SESSIONS)
     session_hours = ", ".join(f"{s:02d}:00-{e:02d}:00" for s, e in SESSIONS) + " UTC"
 

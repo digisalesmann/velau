@@ -208,6 +208,13 @@ COMMISSION_RATE_EST  = 0.00026  # of notional; measured from live frxXAUUSD quot
 # stop-loss and Deriv's stop-out (loss = whole stake) for a price gap.
 MIN_FEASIBLE_STAKE_TO_RISK = 1.25
 
+# Funding guidance shown in the app. With 1% risk split over 4 sleeves and
+# Deriv's $1 minimum stake, the trend bot can't size a trade below about $280
+# at normal gold volatility, so $300 is the floor. $500 leaves room for a
+# losing streak without dropping under it.
+MIN_TREND_BALANCE         = 300.0
+RECOMMENDED_TREND_BALANCE = 500.0
+
 
 def plan_multiplier_trade(risk: float, atr: float, price: float,
                           stop_atr_mult: float = SL_ATR_MULT,

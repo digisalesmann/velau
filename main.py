@@ -25,6 +25,7 @@ from user_models import User, router as users_router, get_current_user
 from rate_limit import twofa_limiter
 from news.news_pipeline import get_news_and_sentiment
 from core.strategy_engine import XAUMasterStrategy, get_session_status
+from position_sizing import MIN_TREND_BALANCE, RECOMMENDED_TREND_BALANCE
 import database as db
 import deriv_cache
 from core import notifications as notif
@@ -209,6 +210,8 @@ class DashboardResponse(BaseModel):
     global_bot_enabled:  bool = True
     user_bot_enabled:    bool = True
     is_admin:            bool = False
+    min_balance:         float = MIN_TREND_BALANCE
+    recommended_balance: float = RECOMMENDED_TREND_BALANCE
 
 class DisplayNameRequest(BaseModel):
     display_name: str
@@ -395,6 +398,16 @@ def _require_admin(user=Depends(get_current_user)):
     return user
 
 
+def _user_trade_open(username: str) -> bool:
+    """Whether this user has a position open. Trend positions are per user and
+    last days; the engine's _trade_in_progress flag only covers the old
+    15-minute strategy."""
+    from core.strategy_engine import TRADING_STRATEGY
+    if TRADING_STRATEGY == "trend_4h":
+        return bool(db.get_open_trend_positions(username))
+    return trading_bot._trade_in_progress
+
+
 @app.get("/bot/status")
 def get_bot_status(user=Depends(get_current_user)):
     me   = db.get_user(user.username) or {}
@@ -405,9 +418,9 @@ def get_bot_status(user=Depends(get_current_user)):
         "user_bot_enabled":   bool(me.get("bot_enabled", True)),
         "circuit_broken":     bool(risk["circuit_broken"]),
         "consecutive_losses": int(risk["consecutive_losses"]),
-        "trade_in_progress":  trading_bot._trade_in_progress,
+        "trade_in_progress":  _user_trade_open(user.username),
         "daily_pnl":          float(risk["daily_pnl"]),
-        "in_session":         trading_bot._in_trading_session(),
+        "in_session":         get_session_status()["in_session"],
         "trade_account_type": me.get("trade_account_type") or "real",
     }
 
@@ -562,6 +575,8 @@ async def get_dashboard(user=Depends(get_current_user), tz_offset: int = 0):
                 await service.close()
                 lock.release()
 
+    session = get_session_status()
+    trade_open = await asyncio.to_thread(_user_trade_open, user.username)
     return DashboardResponse(
         username=user.username,
         bot_status="active" if effective_active else "paused",
@@ -576,9 +591,9 @@ async def get_dashboard(user=Depends(get_current_user), tz_offset: int = 0):
         market_bias=market_bias,
         circuit_broken=bool(risk["circuit_broken"]),
         consecutive_losses=int(risk["consecutive_losses"]),
-        trade_in_progress=trading_bot._trade_in_progress,
-        in_session=trading_bot._in_trading_session(),
-        session_hours=get_session_status()["session_hours"],
+        trade_in_progress=trade_open,
+        in_session=session["in_session"],
+        session_hours=session["session_hours"],
         deriv_connected=bool(deriv_token),
         display_name=profile.get("display_name"),
         avatar_url=profile.get("avatar_url"),
