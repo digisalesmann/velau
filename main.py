@@ -60,7 +60,14 @@ async def _bot_runner(delay: int = 10):
 
 
 async def _db_keepalive():
-    """Ping the database every 12 hours so Supabase never pauses."""
+    """Open a few pooled DB connections at startup so the first users after a
+    deploy don't each wait on a new connection, then ping the database every
+    12 hours so Supabase never pauses."""
+    try:
+        await asyncio.gather(*(asyncio.to_thread(db.fetchone, "SELECT 1") for _ in range(4)))
+        logger.info("💓 DB pool warmed")
+    except Exception as e:
+        logger.warning(f"💓 DB pool warm-up failed: {e}")
     while True:
         await asyncio.sleep(12 * 3600)
         try:
@@ -155,6 +162,10 @@ async def _memory_diagnostics(interval: int = 3 * 3600):
 async def lifespan(app: FastAPI):
     global bot_task
     logger.info("🚀 FastAPI startup — queueing bot")
+    # asyncio.to_thread's default pool is sized from the CPU count (about 5
+    # threads on this instance), too few for concurrent DB reads.
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=32))
     bot_task = asyncio.create_task(_bot_runner(delay=10))
     asyncio.create_task(_db_keepalive())
     asyncio.create_task(_server_keepalive())

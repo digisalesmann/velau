@@ -23,20 +23,28 @@ if _USE_POSTGRES:
     import psycopg2.extras
     from psycopg2.pool import ThreadedConnectionPool
     logger.info("✅ Using PostgreSQL (persistent)")
-    # Reused across requests. Opening a fresh TCP+TLS+auth connection to
-    # Supabase on every single query (the previous behavior) blocks the
-    # single-worker event loop for the full handshake each time — under any
-    # burst of concurrent requests (e.g. the admin panel firing 5 endpoints
-    # at once on refresh) those blocking connects serialize one after
-    # another and can pile up past a client's request timeout.
+    import threading
+    # Connections are reused across requests: opening one means TCP + TLS +
+    # auth from Render (Oregon) to Supabase (Ireland), about a second.
     #
-    # minconn=0 — Supabase has paused/slept on this project before (see the
-    # keepalive cron). A nonzero minconn opens connections immediately at
-    # import time, which would crash the entire app on startup if Supabase
-    # happened to be unreachable at that exact moment. With 0, the pool only
-    # connects lazily on first use, same failure mode as before (one request
-    # fails, not the whole process) but with pooling for every call after.
-    _pool = ThreadedConnectionPool(0, 10, DATABASE_URL)
+    # minconn must be raised AFTER construction. psycopg2 only keeps a
+    # returned connection while fewer than `minconn` are idle, so with the
+    # old ThreadedConnectionPool(0, 10) every connection was closed on return
+    # and every query paid the full handshake. Passing minconn to the
+    # constructor would instead open connections at import time and crash
+    # startup if Supabase were briefly unreachable; setting it afterwards
+    # keeps lazy connects while still retaining idle ones.
+    _POOL_MAX = 10
+    _pool = ThreadedConnectionPool(
+        0, _POOL_MAX, DATABASE_URL,
+        # Detect connections dropped while idle instead of hanging on them.
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+        connect_timeout=10,
+    )
+    _pool.minconn = _POOL_MAX
+    # psycopg2 raises "connection pool exhausted" when all are in use; wait
+    # for a free one instead.
+    _pool_slots = threading.BoundedSemaphore(_POOL_MAX)
 else:
     import sqlite3
     logger.warning("⚠️  DATABASE_URL not set — falling back to SQLite")
@@ -48,24 +56,59 @@ def get_conn(autocommit: bool = False):
     every statement in BEGIN ... COMMIT, which costs two extra round trips to
     the database (Render in Oregon, Supabase in Ireland: ~140 ms each)."""
     if _USE_POSTGRES:
-        conn = _pool.getconn()
-        conn.autocommit = autocommit
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        _pool_slots.acquire()
+        try:
+            conn = _pool.getconn()
+            if conn.closed:
+                _pool.putconn(conn, close=True)
+                conn = _pool.getconn()
+            conn.autocommit = autocommit
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        except Exception:
+            _pool_slots.release()
+            raise
     else:
         conn = _sqlite_conn()
         cur  = conn.cursor()
+    broken = False
     try:
         yield conn, cur
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except Exception as e:
+        if _USE_POSTGRES and isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            broken = True  # dead connection: discard it rather than reuse
+        else:
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
         raise
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
         if _USE_POSTGRES:
-            _pool.putconn(conn)
+            try:
+                _pool.putconn(conn, close=broken or bool(conn.closed))
+            finally:
+                _pool_slots.release()
         else:
             conn.close()
+
+
+def _retry_dead_connection(fn):
+    """Reads only: retry once if a pooled connection turned out to be dead
+    (dropped by the server while idle). Safe because a read has no effects."""
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if _USE_POSTGRES and isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+                logger.warning(f"DB connection dropped, retrying read: {type(e).__name__}")
+                return fn(*args, **kwargs)
+            raise
+    return wrapper
 
 
 def _sqlite_conn():
@@ -465,11 +508,13 @@ def _add_col(cur, table, col, defn):
         pass
 
 
+@_retry_dead_connection
 def fetchall(sql: str, params: tuple = ()) -> list[dict]:
     with get_conn(autocommit=True) as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
         return [dict(r) for r in cur.fetchall()]
 
+@_retry_dead_connection
 def fetchone(sql: str, params: tuple = ()) -> dict | None:
     with get_conn(autocommit=True) as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
