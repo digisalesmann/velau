@@ -11,6 +11,7 @@ Tables:
 import os
 import json
 import logging
+import time
 from contextlib import contextmanager
 
 logger = logging.getLogger("Database")
@@ -45,9 +46,34 @@ if _USE_POSTGRES:
     # psycopg2 raises "connection pool exhausted" when all are in use; wait
     # for a free one instead.
     _pool_slots = threading.BoundedSemaphore(_POOL_MAX)
+    # Connections idle longer than this are checked with a cheap query before
+    # use, so a write (e.g. recording a newly opened trade) never lands on a
+    # connection the server dropped while it sat idle.
+    _PING_AFTER_IDLE = 30.0
+    _last_used: dict[int, float] = {}
 else:
     import sqlite3
     logger.warning("⚠️  DATABASE_URL not set — falling back to SQLite")
+
+
+def _checkout():
+    """Get a live pooled connection, replacing any that died while idle."""
+    for _ in range(3):
+        conn = _pool.getconn()
+        if conn.closed:
+            _pool.putconn(conn, close=True)
+            continue
+        if time.monotonic() - _last_used.get(id(conn), 0.0) > _PING_AFTER_IDLE:
+            try:
+                conn.autocommit = True
+                with conn.cursor() as c:
+                    c.execute("SELECT 1")
+            except Exception:
+                _last_used.pop(id(conn), None)
+                _pool.putconn(conn, close=True)
+                continue
+        return conn
+    return _pool.getconn()
 
 
 @contextmanager
@@ -58,10 +84,7 @@ def get_conn(autocommit: bool = False):
     if _USE_POSTGRES:
         _pool_slots.acquire()
         try:
-            conn = _pool.getconn()
-            if conn.closed:
-                _pool.putconn(conn, close=True)
-                conn = _pool.getconn()
+            conn = _checkout()
             conn.autocommit = autocommit
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         except Exception:
@@ -90,7 +113,12 @@ def get_conn(autocommit: bool = False):
             pass
         if _USE_POSTGRES:
             try:
-                _pool.putconn(conn, close=broken or bool(conn.closed))
+                dead = broken or bool(conn.closed)
+                if dead:
+                    _last_used.pop(id(conn), None)
+                else:
+                    _last_used[id(conn)] = time.monotonic()
+                _pool.putconn(conn, close=dead)
             finally:
                 _pool_slots.release()
         else:
