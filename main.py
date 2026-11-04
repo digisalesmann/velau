@@ -172,6 +172,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(users_router)
+
+
+@app.middleware("http")
+async def _log_slow_requests(request, call_next):
+    """Log any request slower than 1s, so slowness shows up in the logs."""
+    import time as _time
+    t0 = _time.perf_counter()
+    response = await call_next(request)
+    ms = (_time.perf_counter() - t0) * 1000
+    if ms > 1000:
+        logger.warning(f"🐢 {request.method} {request.url.path} {response.status_code} {ms:.0f}ms")
+    return response
+
 from public_pages import router as public_router
 app.include_router(public_router)
 
@@ -456,127 +469,140 @@ async def toggle_bot(user=Depends(_require_admin)):
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
+# Display data from Deriv is served stale-while-revalidate: anything cached
+# within DERIV_MAX_STALE is returned at once, and if it's older than the
+# fresh TTL a background task refreshes it for the next request. Only a
+# user's first load after a restart (or after long inactivity) waits on Deriv.
+DERIV_MAX_STALE = 15 * 60
+_bg_refreshes: set = set()
+
+
+async def _swr(cache_key: str, fresh_ttl: float, fetch):
+    """Return cached data for cache_key, refreshing it via `fetch` (an async
+    callable returning the value) without making the caller wait when
+    possible. Raises only if there is no cached value and the fetch fails."""
+    cached = deriv_cache.get(cache_key, fresh_ttl)
+    if cached is not None:
+        return cached
+    lock = deriv_cache.lock(cache_key)
+    age = deriv_cache.age(cache_key)
+    if age is not None and age < DERIV_MAX_STALE:
+        if not lock.locked() and not deriv_cache.recently_failed(cache_key):
+            async def refresh():
+                async with lock:
+                    try:
+                        deriv_cache.set(cache_key, await fetch())
+                    except Exception as e:
+                        deriv_cache.mark_failed(cache_key)
+                        logger.warning(f"Background refresh failed for {cache_key}: {e}")
+            task = asyncio.create_task(refresh())
+            _bg_refreshes.add(task)
+            task.add_done_callback(_bg_refreshes.discard)
+        return deriv_cache.get_stale(cache_key)
+
+    async with lock:
+        # A concurrent request may have just fetched this, or just failed to.
+        cached = deriv_cache.get(cache_key, fresh_ttl)
+        if cached is not None:
+            return cached
+        stale = deriv_cache.get_stale(cache_key)
+        if stale is not None and deriv_cache.recently_failed(cache_key):
+            return stale
+        try:
+            value = await fetch()
+            deriv_cache.set(cache_key, value)
+            return value
+        except Exception:
+            deriv_cache.mark_failed(cache_key)
+            if stale is not None:
+                return stale
+            raise
+
+
+async def _fetch_dashboard_stats(username: str, deriv_token: str, account_type: str, tz_offset: int) -> dict:
+    from brokers.deriv_trading_service import DerivTradingService
+    # Single attempt, no retry: a retry-with-backoff can take ~30s, longer
+    # than the app's own 20s request timeout.
+    service = DerivTradingService(token=deriv_token, account_type=account_type, max_retries=1)
+    try:
+        await service.authenticate()
+        account_info = await service.get_account_info()
+        history_data = await service.get_statement()       # full closed-trade history
+        open_list    = await service.get_open_contracts()
+    finally:
+        await service.close()
+    # Only trades the bot placed: see _bot_trades.
+    bot_ids     = await asyncio.to_thread(db.get_bot_contract_ids, username)
+    trades_list = _bot_trades(history_data.get("history", []), bot_ids)
+    open_list   = [c for c in open_list if str(c.get("contract_id")) in bot_ids]
+
+    balance = account_info.get("balance", 0.0)
+    total_trades = len(trades_list)                        # closed trades, all time
+    wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
+
+    shift = timedelta(minutes=tz_offset)
+    today = (datetime.now(timezone.utc) + shift).date()
+    local_day = lambda epoch: (datetime.fromtimestamp(int(epoch), timezone.utc) + shift).date()
+    # Today = trades OPENED today, including ones still running
+    # (a trend position can stay open for days).
+    trades_today = (
+        sum(1 for t in trades_list if t.get("time") and local_day(t["time"]) == today)
+        + sum(1 for c in open_list if c.get("purchase_time") and local_day(c["purchase_time"]) == today)
+    )
+    # Today's P&L = trades CLOSED today, whenever they opened.
+    daily_pnl = sum(float(t.get("pnl", 0)) for t in trades_list
+                    if t.get("sell_time") and local_day(t["sell_time"]) == today)
+    return {
+        "balance": balance,
+        "currency": account_info.get("currency", "USD"),
+        "account_id": account_info.get("account_id"),
+        "win_rate": round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0,
+        "total_trades": total_trades,
+        "trades_today": trades_today,
+        "daily_pnl": daily_pnl,
+        "pnl_percent": (daily_pnl / balance * 100) if balance > 0 else 0.0,
+    }
+
+
 @app.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(user=Depends(get_current_user), tz_offset: int = 0):
     """
-    Profile/admin/bot-status data is DB-only and has nothing to do with
-    Deriv connectivity — it must always be returned even if the broker
-    connection is missing, disabled, or erroring. Only the Deriv-dependent
-    fields (balance, trade history, win rate) degrade to defaults on
-    failure instead of taking down the whole response. Previously a single
-    Deriv auth failure (no token connected, or a disabled account) 500'd
-    the entire endpoint, silently breaking profile display, admin-section
-    visibility, and bot-status accuracy on screens that don't even touch
-    Deriv data.
+    Profile/admin/bot-status data is DB-only and is always returned; only the
+    Deriv-dependent fields (balance, trade stats) fall back to defaults if
+    Deriv is unreachable and nothing is cached.
     """
-    market_bias = (await asyncio.to_thread(db.get_latest_bias, username=user.username))
-    deriv_token = (await asyncio.to_thread(db.get_deriv_token, user.username))
-    profile     = (await asyncio.to_thread(db.get_user, user.username)) or {}
-    risk        = (await asyncio.to_thread(db.get_user_risk_state, user.username))
-    is_admin    = (await asyncio.to_thread(db.is_admin, user.username))
-
-    global_enabled   = (await asyncio.to_thread(db.get_global_bot_enabled))
+    # Independent reads, run concurrently: each is a round trip to the DB.
+    (market_bias, deriv_token, profile, risk, is_admin, global_enabled, trade_open) = await asyncio.gather(
+        asyncio.to_thread(db.get_latest_bias, username=user.username),
+        asyncio.to_thread(db.get_deriv_token, user.username),
+        asyncio.to_thread(db.get_user, user.username),
+        asyncio.to_thread(db.get_user_risk_state, user.username),
+        asyncio.to_thread(db.is_admin, user.username),
+        asyncio.to_thread(db.get_global_bot_enabled),
+        asyncio.to_thread(_user_trade_open, user.username),
+    )
+    profile = profile or {}
     user_enabled     = bool(profile.get("bot_enabled", True))
     effective_active = trading_bot.is_running and global_enabled and user_enabled
 
-    balance = 0.0
-    currency = "USD"
-    account_id = None
-    win_rate = 0.0
-    trades_today = 0
-    total_trades = 0
-    daily_pnl = 0.0
-    pnl_percent = 0.0
-
+    stats = {"balance": 0.0, "currency": "USD", "account_id": None, "win_rate": 0.0,
+             "total_trades": 0, "trades_today": 0, "daily_pnl": 0.0, "pnl_percent": 0.0}
     if deriv_token:
         account_type = profile.get("trade_account_type") or "real"
         # tz_offset: the app's UTC offset in minutes, so "today" means the
         # user's own day rather than the server's (UTC).
         tz_offset = max(-720, min(840, int(tz_offset)))
         cache_key = f"dashboard:{user.username}:{account_type}:{tz_offset}"
-        cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
-        lock = deriv_cache.lock(cache_key)
-        if cached is None:
-            await lock.acquire()
-            # A concurrent request may have just fetched this (or just failed
-            # to, in which case go straight to the stale fallback below).
-            cached = deriv_cache.get(cache_key, DASHBOARD_CACHE_TTL)
-            if cached is None and deriv_cache.recently_failed(cache_key):
-                cached = deriv_cache.get_stale(cache_key)
-            if cached is not None:
-                lock.release()
-
-        if cached is not None:
-            balance, currency, account_id = cached["balance"], cached["currency"], cached["account_id"]
-            win_rate, total_trades   = cached["win_rate"], cached["total_trades"]
-            trades_today, daily_pnl = cached["trades_today"], cached["daily_pnl"]
-            pnl_percent = cached["pnl_percent"]
-        else:
-            from brokers.deriv_trading_service import DerivTradingService
-            # Single attempt, no retry — this is a screen someone's waiting
-            # on. A retry-with-backoff here can itself take ~30s (open_timeout
-            # + backoff + open_timeout again), which blows past the mobile
-            # app's own 20s request timeout — so the client hits its timeout
-            # and shows a hard error before this function ever gets to fall
-            # back to the stale cache below. Failing fast lets that fallback
-            # actually reach the user instead of racing (and losing) against
-            # the client's own timeout. See deriv_ws.py's default of 7 for
-            # why a higher retry budget is right for unattended jobs but
-            # wrong here.
-            service = DerivTradingService(token=deriv_token, account_type=account_type, max_retries=1)
-            try:
-                await service.authenticate()
-                account_info = await service.get_account_info()
-                history_data = await service.get_statement()       # full closed-trade history
-                open_list    = await service.get_open_contracts()
-                # Only trades the bot placed: see _bot_trades.
-                bot_ids      = await asyncio.to_thread(db.get_bot_contract_ids, user.username)
-                trades_list  = _bot_trades(history_data.get("history", []), bot_ids)
-                open_list    = [c for c in open_list if str(c.get("contract_id")) in bot_ids]
-
-                balance    = account_info.get("balance", 0.0)
-                currency   = account_info.get("currency", "USD")
-                account_id = account_info.get("account_id")
-                total_trades = len(trades_list)                    # closed trades, all time
-                wins = len([t for t in trades_list if float(t.get("pnl", 0)) > 0])
-                win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
-
-                shift = timedelta(minutes=tz_offset)
-                today = (datetime.now(timezone.utc) + shift).date()
-                local_day = lambda epoch: (datetime.fromtimestamp(int(epoch), timezone.utc) + shift).date()
-                # Today = trades OPENED today, including ones still running
-                # (a trend position can stay open for days).
-                trades_today = (
-                    sum(1 for t in trades_list if t.get("time") and local_day(t["time"]) == today)
-                    + sum(1 for c in open_list if c.get("purchase_time") and local_day(c["purchase_time"]) == today)
-                )
-                # Today's P&L = trades CLOSED today, whenever they opened.
-                daily_pnl   = sum(float(t.get("pnl", 0)) for t in trades_list
-                                  if t.get("sell_time") and local_day(t["sell_time"]) == today)
-                pnl_percent = (daily_pnl / balance * 100) if balance > 0 else 0.0
-
-                deriv_cache.set(cache_key, {
-                    "balance": balance, "currency": currency, "account_id": account_id,
-                    "win_rate": win_rate, "total_trades": total_trades,
-                    "trades_today": trades_today, "daily_pnl": daily_pnl,
-                    "pnl_percent": pnl_percent,
-                })
-            except Exception as e:
-                logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
-                deriv_cache.mark_failed(cache_key)
-                # Minutes-old real data beats showing zeros on a transient blip.
-                stale = deriv_cache.get_stale(cache_key)
-                if stale is not None:
-                    balance, currency, account_id = stale["balance"], stale["currency"], stale["account_id"]
-                    win_rate, total_trades   = stale["win_rate"], stale["total_trades"]
-                    trades_today, daily_pnl = stale["trades_today"], stale["daily_pnl"]
-                    pnl_percent = stale["pnl_percent"]
-            finally:
-                await service.close()
-                lock.release()
+        try:
+            stats = await _swr(cache_key, DASHBOARD_CACHE_TTL, lambda: _fetch_dashboard_stats(
+                user.username, deriv_token, account_type, tz_offset))
+        except Exception as e:
+            logger.warning(f"Dashboard: Deriv fetch failed for {user.username}: {e}")
+    balance, currency, account_id = stats["balance"], stats["currency"], stats["account_id"]
+    win_rate, total_trades = stats["win_rate"], stats["total_trades"]
+    trades_today, daily_pnl, pnl_percent = stats["trades_today"], stats["daily_pnl"], stats["pnl_percent"]
 
     session = get_session_status()
-    trade_open = await asyncio.to_thread(_user_trade_open, user.username)
     return DashboardResponse(
         username=user.username,
         bot_status="active" if effective_active else "paused",
@@ -868,46 +894,30 @@ def _history_payload(trades: list) -> dict:
     }
 
 
+async def _fetch_history(username: str, token: str, account_type: str) -> dict:
+    from brokers.deriv_trading_service import DerivTradingService
+    # Single attempt, no retry: see _fetch_dashboard_stats.
+    service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
+    try:
+        await service.authenticate()
+        all_trades = (await service.get_statement()).get("history", [])
+    finally:
+        await service.close()
+    bot_ids = await asyncio.to_thread(db.get_bot_contract_ids, username)
+    bot = _bot_trades(all_trades, bot_ids)
+    logger.info(f"History [{username}]: {len(bot)} bot trades of {len(all_trades)} on the account")
+    return _history_payload(bot)
+
+
 @app.get("/dashboard/history")
 async def get_history(user=Depends(get_current_user)):
-    from brokers.deriv_trading_service import DerivTradingService
     token, account_type = (await asyncio.to_thread(_get_user_deriv_context, user.username))
-
     cache_key = f"history:{user.username}:{account_type}"
-    cached = deriv_cache.get(cache_key, HISTORY_CACHE_TTL)
-    if cached is not None:
-        return cached
-
-    # Single-flight: concurrent history requests share one Deriv fetch.
-    async with deriv_cache.lock(cache_key):
-        cached = deriv_cache.get(cache_key, HISTORY_CACHE_TTL)
-        if cached is not None:
-            return cached
-        stale = deriv_cache.get_stale(cache_key)
-        if stale is not None and deriv_cache.recently_failed(cache_key):
-            return stale
-
-        # Single attempt, no retry — see the /dashboard endpoint's comment above
-        # for why a retry-with-backoff here defeats the stale-cache fallback by
-        # outrunning the mobile client's own request timeout.
-        service = DerivTradingService(token=token, account_type=account_type, max_retries=1)
-        try:
-            await service.authenticate()
-            bot_ids = await asyncio.to_thread(db.get_bot_contract_ids, user.username)
-            all_trades = (await service.get_statement()).get("history", [])
-            bot = _bot_trades(all_trades, bot_ids)
-            logger.info(f"History [{user.username}]: {len(bot)} bot trades of {len(all_trades)} on the account")
-            result = _history_payload(bot)
-            deriv_cache.set(cache_key, result)
-            return result
-        except Exception as e:
-            deriv_cache.mark_failed(cache_key)
-            # Minutes-old history beats a hard failure on a transient blip.
-            if stale is not None:
-                return stale
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            await service.close()
+    try:
+        return await _swr(cache_key, HISTORY_CACHE_TTL,
+                          lambda: _fetch_history(user.username, token, account_type))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ticks")
 async def subscribe_ticks(req: TickRequest, user=Depends(get_current_user)):

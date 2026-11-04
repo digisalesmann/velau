@@ -43,10 +43,13 @@ else:
 
 
 @contextmanager
-def get_conn():
+def get_conn(autocommit: bool = False):
+    """autocommit=True is for single read queries: psycopg2 otherwise wraps
+    every statement in BEGIN ... COMMIT, which costs two extra round trips to
+    the database (Render in Oregon, Supabase in Ireland: ~140 ms each)."""
     if _USE_POSTGRES:
         conn = _pool.getconn()
-        conn.autocommit = False
+        conn.autocommit = autocommit
         cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     else:
         conn = _sqlite_conn()
@@ -463,12 +466,12 @@ def _add_col(cur, table, col, defn):
 
 
 def fetchall(sql: str, params: tuple = ()) -> list[dict]:
-    with get_conn() as (conn, cur):
+    with get_conn(autocommit=True) as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
         return [dict(r) for r in cur.fetchall()]
 
 def fetchone(sql: str, params: tuple = ()) -> dict | None:
-    with get_conn() as (conn, cur):
+    with get_conn(autocommit=True) as (conn, cur):
         cur.execute(sql.replace("?", _ph()), params)
         r = cur.fetchone()
         return dict(r) if r else None

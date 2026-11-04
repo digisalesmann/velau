@@ -26,6 +26,12 @@ def get(key: str, ttl: float):
     return None
 
 
+def age(key: str) -> float | None:
+    """Seconds since `key` was last set, or None if never set."""
+    entry = _store.get(key)
+    return time.monotonic() - entry[0] if entry else None
+
+
 def get_stale(key: str):
     """Returns the last known value regardless of age, or None if never set.
     Used as a fallback when a live Deriv fetch fails — showing minutes-old
